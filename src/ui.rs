@@ -569,7 +569,9 @@ impl App {
             });
         }
 
-        section(ui, "Riot recommended runes");
+        self.meta_build(ui, s);
+
+        section(ui, "Recommended runes");
         if cs.my_champion().is_none() {
             ui.colored_label(MUTED, "Hover or lock a champion to see Riot's recommended pages.");
         } else if s.rec_pages.is_empty() {
@@ -623,6 +625,46 @@ impl App {
             }
         }
         suggestions(ui, s, history);
+    }
+
+    /// OP.GG's build for the current pick (Settings → "Use OP.GG builds").
+    fn meta_build(&mut self, ui: &mut Ui, s: &Snapshot) {
+        if !self.settings.meta_builds {
+            return;
+        }
+        section(ui, "OP.GG build");
+        let Some(m) = &s.meta else {
+            return void(ui.colored_label(MUTED, "Hover or lock a champion to load OP.GG's most played build for it."));
+        };
+        let name = s.data.champion_name(m.champion_id);
+        let build = match (&m.query, &m.build) {
+            (Err(e), _) => return void(ui.colored_label(MUTED, format!("OP.GG: {e}; the lock-in item set uses your own games."))),
+            (Ok(q), None) => return void(ui.colored_label(MUTED, format!("Loading OP.GG {} build for {name}…", q.label()))),
+            (_, Some(Err(e))) => return void(ui.colored_label(LOSS, format!("{e}; the lock-in item set uses your own games."))),
+            (_, Some(Ok(b))) => b,
+        };
+        let names = |ids: &[i64], sep: &str| ids.iter().map(|&i| s.data.item_name(i)).collect::<Vec<_>>().join(sep);
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(format!("{name} · OP.GG {} · core {}", build.query.label(), build.core.stats())).strong());
+            if let Some(st) = &build.starter {
+                ui.label(format!("Starting: {}", names(&st.ids, ", ")));
+            }
+            ui.label(format!("Core: {}", names(&build.core.ids, " → ")));
+            if let Some(b) = &build.boots {
+                ui.label(format!("Boots: {} ({})", names(&b.ids, ", "), b.stats()));
+            }
+            ui.label(format!("Full build: {}", names(&build.full_build(), ", ")));
+            let situational = build.situational();
+            if !situational.is_empty() {
+                ui.label(RichText::new(format!("Situational: {}", names(&situational, ", "))).color(MUTED));
+            }
+            if let Some(sk) = &build.skills {
+                let max = if build.skill_priority.is_empty() { String::new() } else { format!("max {} · ", build.skill_priority.join(" > ")) };
+                ui.label(format!("Skills: {max}{}", sk.order.join(" ")));
+            }
+            ui.label(RichText::new("Data: OP.GG (op.gg), all ranks, current patch").color(MUTED).small());
+        });
     }
 
     fn post_game(&mut self, ui: &mut Ui, s: &Snapshot) {
@@ -859,7 +901,17 @@ impl App {
                 .color(MUTED),
         );
         changed |= ui.checkbox(&mut self.settings.auto_spells, "On lock-in, apply Riot's recommended summoner spells (Flash keeps its key)").changed();
-        changed |= ui.checkbox(&mut self.settings.auto_item_set, "On lock-in, write an item set from your best recent game on the champion").changed();
+        changed |= ui.checkbox(&mut self.settings.auto_item_set, "On lock-in, write an item set for the champion").changed();
+        changed |= ui.checkbox(&mut self.settings.meta_builds, "Use OP.GG builds (aggregated from many players' games)").changed();
+        ui.label(
+            RichText::new(
+                "On: the item set is OP.GG's most played build for your mode and lane (Starting, Core, Boots, Full build, Situational) \
+                 plus your best recent game as an extra block, and OP.GG's rune page is offered next to Riot's. \
+                 Only the champion id, mode and lane are sent to mcp-api.op.gg. \
+                 Off, or when OP.GG is unreachable or has too few games: the build from your best recent game.",
+            )
+            .color(MUTED),
+        );
         section(ui, "Overlay");
         changed |= ui.checkbox(&mut self.settings.overlay_enabled, "Show the in-game overlay during League games").changed();
         ui.label(

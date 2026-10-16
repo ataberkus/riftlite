@@ -27,8 +27,12 @@ pub struct Settings {
     pub auto_runes: bool,
     /// On lock-in, set Riot's recommended summoner spells (Flash stays on its key).
     pub auto_spells: bool,
-    /// On lock-in, write the item set from your best recent game on the champion.
+    /// On lock-in, write an item set: OP.GG's build when `meta_builds` is on and it has
+    /// one, otherwise the build from your best recent game on the champion.
     pub auto_item_set: bool,
+    /// Fetch OP.GG's aggregated build for the pick: written as the lock-in item set
+    /// (with your best game as an extra block) and offered as a rune page.
+    pub meta_builds: bool,
     /// League install folder chosen by hand; empty = detect automatically.
     pub league_folder: String,
 }
@@ -44,6 +48,7 @@ impl Default for Settings {
             auto_runes: true,
             auto_spells: false,
             auto_item_set: true,
+            meta_builds: true,
             league_folder: String::new(),
         }
     }

@@ -1,56 +1,123 @@
 //! Writes League item sets as JSON files in
 //! `<League>/Config/Champions/<ChampionId>/Recommended/`, the same location and
-//! schema the client reads for recommended sets. Contents come only from the
-//! player's own match history (local LCU data).
+//! schema the client reads for recommended sets. Contents come from the player's
+//! own match history (local LCU data) and, optionally, OP.GG's aggregated builds
+//! (`meta.rs`). Every file riftlite writes starts with `riftlite_`.
 
 use std::path::{Path, PathBuf};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::ddragon::StaticData;
 use crate::lcu::LolGame;
+use crate::meta::MetaBuild;
 
 const PREFIX: &str = "riftlite_";
 
 pub fn write_from_game(league_root: &Path, data: &StaticData, game: &LolGame) -> Result<PathBuf, String> {
-    let champ = data.champions.get(&game.champion_id).ok_or("unknown champion (Data Dragon not loaded?)")?;
-    let build: Vec<_> = game.items[..6].iter().filter(|&&i| i > 0).map(|i| json!({"id": i.to_string(), "count": 1})).collect();
-    if build.is_empty() {
-        return Err("that game has no completed items".into());
+    let mut blocks = vec![personal_block(game).ok_or("that game has no completed items")?];
+    if game.items[6] > 0 {
+        blocks.push(block("Trinket".into(), &[game.items[6]]));
     }
-    let mut blocks = vec![json!({
-        "type": format!(
+    let title = format!("riftlite · {} ({})", data.champion_name(game.champion_id), crate::ui::date(game.created_ms));
+    write_set(league_root, data, game.champion_id, &game.game_id.to_string(), &title, &[], blocks)
+}
+
+/// OP.GG's build split into Starting / Core / Boots / Full build / Situational blocks,
+/// plus the player's own best game on the champion when there is one. One file per
+/// champion and OP.GG mode, shown by the client only on that mode's map.
+pub fn write_meta(league_root: &Path, data: &StaticData, build: &MetaBuild, personal: Option<&LolGame>) -> Result<PathBuf, String> {
+    let q = build.query;
+    let mut blocks = Vec::new();
+    if let Some(s) = &build.starter {
+        let skills = match build.skill_priority.as_slice() {
+            [] => String::new(),
+            p => format!("max {} · ", p.join(" > ")),
+        };
+        blocks.push(block(format!("Starting · {skills}OP.GG {}", s.stats()), &s.ids));
+    }
+    blocks.push(block(format!("Core, in order · OP.GG {}", build.core.stats()), &build.core.ids));
+    if let Some(b) = &build.boots {
+        blocks.push(block(format!("Boots · OP.GG {}", b.stats()), &b.ids));
+    }
+    blocks.push(block("Full build · core, boots, most played 4th–6th".into(), &build.full_build()));
+    let situational = build.situational();
+    if !situational.is_empty() {
+        blocks.push(block("Situational · OP.GG 4th–6th item options".into(), &situational));
+    }
+    blocks.extend(personal.and_then(personal_block));
+    let title = format!("riftlite · {} · OP.GG {}", data.champion_name(build.champion_id), q.label());
+    let maps: &[i64] = match q.mode {
+        "aram" => &[12],
+        "nexus_blitz" => &[21],
+        _ => &[11],
+    };
+    write_set(league_root, data, build.champion_id, &format!("meta_{}_{}", build.champion_id, q.mode), &title, maps, blocks)
+}
+
+fn personal_block(game: &LolGame) -> Option<Value> {
+    let items: Vec<i64> = game.items[..6].iter().copied().filter(|&i| i > 0).collect();
+    (!items.is_empty()).then(|| {
+        let title = format!(
             "Your build · {} {}/{}/{} · {}",
-            if game.win { "Win" } else { "Loss" }, game.kills, game.deaths, game.assists, crate::ui::date(game.created_ms)
-        ),
-        "items": build,
+            if game.win { "Win" } else { "Loss" },
+            game.kills,
+            game.deaths,
+            game.assists,
+            crate::ui::date(game.created_ms)
+        );
+        block(title, &items)
+    })
+}
+
+/// A block with repeated ids folded into a count (two potions → one entry, count 2), order kept.
+fn block(title: String, ids: &[i64]) -> Value {
+    let mut items: Vec<(i64, u32)> = Vec::new();
+    for &id in ids {
+        match items.iter_mut().find(|(i, _)| *i == id) {
+            Some((_, n)) => *n += 1,
+            None => items.push((id, 1)),
+        }
+    }
+    json!({
+        "type": title,
+        "items": items.iter().map(|(id, n)| json!({"id": id.to_string(), "count": n})).collect::<Vec<_>>(),
         "showIfSummonerSpell": "",
         "hideIfSummonerSpell": ""
-    })];
-    if game.items[6] > 0 {
-        blocks.push(json!({
-            "type": "Trinket",
-            "items": [{"id": game.items[6].to_string(), "count": 1}],
-            "showIfSummonerSpell": "",
-            "hideIfSummonerSpell": ""
-        }));
-    }
-    let set = json!({
-        "title": format!("riftlite · {} ({})", champ.name, crate::ui::date(game.created_ms)),
+    })
+}
+
+/// The item-set document the client reads.
+fn item_set_json(champion_id: i64, title: &str, maps: &[i64], blocks: Vec<Value>) -> Value {
+    json!({
+        "title": title,
         "type": "custom",
         "map": "any",
         "mode": "any",
         "priority": false,
         "sortrank": 0,
         "startedFrom": "blank",
-        "associatedChampions": [game.champion_id],
-        "associatedMaps": [],
+        "associatedChampions": [champion_id],
+        "associatedMaps": maps,
         "preferredItemSlots": [],
         "blocks": blocks
-    });
+    })
+}
+
+fn write_set(
+    league_root: &Path,
+    data: &StaticData,
+    champion_id: i64,
+    stem: &str,
+    title: &str,
+    maps: &[i64],
+    blocks: Vec<Value>,
+) -> Result<PathBuf, String> {
+    let champ = data.champions.get(&champion_id).ok_or("unknown champion (Data Dragon not loaded?)")?;
+    let set = item_set_json(champion_id, title, maps, blocks);
     let dir = league_root.join("Config").join("Champions").join(&champ.id).join("Recommended");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = dir.join(format!("{PREFIX}{}.json", game.game_id));
+    let path = dir.join(format!("{PREFIX}{stem}.json"));
     std::fs::write(&path, serde_json::to_vec_pretty(&set).expect("item set serializes"))
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)

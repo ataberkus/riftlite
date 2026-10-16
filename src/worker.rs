@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -21,7 +22,11 @@ use crate::live::{self, LiveGame};
 use crate::riot::{self, Installs, Running};
 use crate::settings::Settings;
 use crate::skills::{Recorder, SkillHint};
+use crate::meta::{self, MetaBuild, Query};
 use crate::{itemset, net, win};
+
+/// How long a lock-in item set waits for OP.GG before falling back to your own build.
+const META_WAIT: Duration = Duration::from_secs(20);
 
 const PAGE: usize = 20;
 
@@ -71,6 +76,16 @@ pub struct Lookup {
     pub mastery: Vec<Mastery>,
 }
 
+/// OP.GG's build for the current pick.
+#[derive(Clone, PartialEq, Debug)]
+pub struct MetaState {
+    pub champion_id: i64,
+    /// `Err` when OP.GG has no table for this queue or no lane is known.
+    pub query: Result<Query, String>,
+    /// `None` while the request is in flight.
+    pub build: Option<Result<MetaBuild, String>>,
+}
+
 pub struct Snapshot {
     pub installs: Installs,
     pub running: Running,
@@ -96,6 +111,8 @@ pub struct Snapshot {
     pub pickable: Vec<i64>,
     /// Champion browser: recommended pages per position for one champion.
     pub browse: Option<(i64, Result<Vec<RecPage>, String>)>,
+    /// OP.GG build for the picked/hovered champion (when enabled in settings).
+    pub meta: Option<MetaState>,
     /// What champ-select automation did this session (message, ok).
     pub champ_log: Vec<(String, bool)>,
     /// Ranked queues per puuid (champ select and game scouting, cached).
@@ -134,6 +151,7 @@ impl Default for Snapshot {
             rec_pages: Vec::new(),
             pickable: Vec::new(),
             browse: None,
+            meta: None,
             champ_log: Vec::new(),
             ranks: HashMap::new(),
             post_game: None,
@@ -223,6 +241,13 @@ struct Auto {
     rec_for: Option<i64>,
     /// Champion automation last ran for (re-runs after an ARAM swap/reroll).
     applied: Option<i64>,
+    /// Lane used for the pick's recommendations (`lcu::perk_position` form).
+    position: String,
+    /// OP.GG answers for this session by champion; requests run on their own threads.
+    meta_cache: HashMap<i64, Result<MetaBuild, String>>,
+    meta_chan: Option<(mpsc::Sender<(i64, Result<MetaBuild, String>)>, mpsc::Receiver<(i64, Result<MetaBuild, String>)>)>,
+    /// Locked champion whose lock-in item set waits for OP.GG, and since when.
+    items_pending: Option<(i64, Instant)>,
 }
 
 struct State {
@@ -474,10 +499,11 @@ fn log(shared: &Shared, msg: String, ok: bool) {
 fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &ChampSelect) -> bool {
     let mut changed = false;
     if cs.session_id != auto.session {
-        *auto = Auto { session: cs.session_id.clone(), map_id: 0, rec_for: None, applied: None };
+        *auto = Auto { session: cs.session_id.clone(), ..Auto::default() };
         let mut s = shared.snap.lock();
         s.champ_log.clear();
         s.rec_pages.clear();
+        s.meta = None;
         auto.map_id = s.session.as_ref().map(|g| g.map_id).filter(|&m| m > 0).unwrap_or(0);
         drop(s);
         let pickable = lcu.pickable_champions();
@@ -496,6 +522,7 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
                 if pos == "NONE" && auto.map_id == live::SUMMONERS_RIFT {
                     pos = lcu.recommended_positions(c).into_iter().next().unwrap_or(pos);
                 }
+                auto.position = pos.clone();
                 match lcu.recommended_pages(c, &pos, auto.map_id) {
                     Ok(p) => p,
                     Err(e) => {
@@ -506,8 +533,34 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
             }
             None => Vec::new(),
         };
-        shared.snap.lock().rec_pages = pages;
+        let meta = match champ.filter(|_| shared.settings.lock().meta_builds) {
+            None => None,
+            Some(c) => {
+                let query = meta::query_for(cs.queue_id, auto.map_id, &auto.position);
+                let build = match (&query, auto.meta_cache.get(&c)) {
+                    (Err(e), _) => Some(Err(e.clone())),
+                    (Ok(_), Some(cached)) => Some(cached.clone()),
+                    (Ok(q), None) => request_meta(auto, c, *q).err().map(Err),
+                };
+                Some(MetaState { champion_id: c, query, build })
+            }
+        };
+        let mut s = shared.snap.lock();
+        s.rec_pages = pages;
+        s.meta = meta;
+        sync_meta_page(&mut s);
         changed = true;
+    }
+    if let Some((_, rx)) = &auto.meta_chan {
+        for (c, r) in rx.try_iter() {
+            auto.meta_cache.insert(c, r.clone());
+            let mut s = shared.snap.lock();
+            if let Some(m) = s.meta.as_mut().filter(|m| m.champion_id == c) {
+                m.build = Some(r);
+                sync_meta_page(&mut s);
+                changed = true;
+            }
+        }
     }
     if cs.locked && champ.is_some() && auto.applied != champ {
         auto.applied = champ;
@@ -521,23 +574,90 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
             let _ = apply_spells(shared, lcu, 0, cs);
         }
         if prefs.auto_item_set {
-            let s = shared.snap.lock();
-            let name = s.data.champion_name(champ);
-            let history = s.lol_history.as_deref().unwrap_or(&[]);
-            let r = match (itemset::best_game(history, champ), s.league_root()) {
-                (_, None) => Err("League install not found; set it in Settings".to_string()),
-                (None, _) => Err(format!("No {name} game with items in your last {} matches", history.len())),
-                (Some(g), Some(root)) => itemset::write_from_game(&root, &s.data, g).map(|_| format!("Item set for {name} written")),
-            };
-            drop(s);
-            match r {
-                Ok(m) => log(shared, m, true),
-                Err(m) => log(shared, format!("Item set: {m}"), false),
-            }
+            auto.items_pending = Some((champ, Instant::now()));
         }
         changed = true;
     }
+    if let Some((c, since)) = auto.items_pending {
+        // A swap after lock-in re-arms the automation for the new champion.
+        if champ != Some(c) || lock_in_item_set(shared, c, since) {
+            auto.items_pending = None;
+            changed = true;
+        }
+    }
     changed
+}
+
+fn request_meta(auto: &mut Auto, champion_id: i64, query: Query) -> Result<(), String> {
+    let (tx, _) = auto.meta_chan.get_or_insert_with(mpsc::channel);
+    let tx = tx.clone();
+    std::thread::Builder::new()
+        .name("riftlite-opgg".into())
+        .spawn(move || {
+            let r = meta::fetch(&net::public_agent(), champion_id, query);
+            let _ = tx.send((champion_id, r));
+        })
+        .map(drop)
+        .map_err(|e| format!("could not start the OP.GG request: {e}"))
+}
+
+/// Keeps exactly one OP.GG page (when its build has runes and spells) after Riot's pages.
+fn sync_meta_page(s: &mut Snapshot) {
+    s.rec_pages.retain(|p| !p.label.starts_with("OP.GG"));
+    let build = s.meta.as_ref().and_then(|m| m.build.as_ref()).and_then(|b| b.as_ref().ok());
+    s.rec_pages.extend(build.and_then(meta_page));
+}
+
+fn meta_page(b: &MetaBuild) -> Option<RecPage> {
+    let r = b.runes.as_ref()?;
+    let spells = b.spells.as_ref()?;
+    let win_rate = if r.games == 0 { 0.0 } else { r.wins as f64 / r.games as f64 * 100.0 };
+    Some(RecPage {
+        position: b.query.position.to_uppercase(),
+        primary_style: r.primary_page_id,
+        sub_style: r.secondary_page_id,
+        perks: r.perks()?,
+        spells: [spells.ids[0], spells.ids[1]],
+        label: format!("OP.GG {} · most played · {win_rate:.0}% WR · {} games", b.query.label(), r.games),
+    })
+}
+
+/// Writes the lock-in item set; `false` while it should keep waiting for OP.GG.
+fn lock_in_item_set(shared: &Shared, champ: i64, since: Instant) -> bool {
+    let meta_on = shared.settings.lock().meta_builds;
+    let s = shared.snap.lock();
+    let meta = match s.meta.as_ref().filter(|m| meta_on && m.champion_id == champ).map(|m| &m.build) {
+        None => None,
+        Some(None) if since.elapsed() < META_WAIT => return false,
+        Some(None) => Some(Err("OP.GG did not answer in time".to_string())),
+        Some(Some(r)) => Some(r.clone()),
+    };
+    let name = s.data.champion_name(champ);
+    let history = s.lol_history.as_deref().unwrap_or(&[]);
+    let best = itemset::best_game(history, champ);
+    let r = match (s.league_root(), meta) {
+        (None, _) => Err("League install not found; set it in Settings".to_string()),
+        (Some(root), Some(Ok(b))) => itemset::write_meta(&root, &s.data, &b, best).map(|_| {
+            let own = if best.is_some() { " + your best game" } else { "" };
+            format!("Item set for {name} written: OP.GG {} ({}){own}", b.query.label(), b.core.stats())
+        }),
+        (Some(root), meta) => {
+            let why = match meta {
+                Some(Err(e)) => format!(" ({e})"),
+                _ => String::new(),
+            };
+            match best {
+                None => Err(format!("No {name} game with items in your last {} matches{why}", history.len())),
+                Some(g) => itemset::write_from_game(&root, &s.data, g).map(|_| format!("Item set for {name} written from your best game{why}")),
+            }
+        }
+    };
+    drop(s);
+    match r {
+        Ok(m) => log(shared, m, true),
+        Err(m) => log(shared, format!("Item set: {m}"), false),
+    }
+    true
 }
 
 fn apply_runes(shared: &Shared, lcu: &Lcu, i: usize, cs: &ChampSelect) -> Result<String, String> {
