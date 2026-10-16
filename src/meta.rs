@@ -292,9 +292,20 @@ pub struct MetaBuild {
 }
 
 impl MetaBuild {
-    /// Groups that have at least one build, in `Group::ORDER`.
+    /// Groups that have at least one build. "All" comes first (it is a filter, not a build
+    /// type); the rest are ordered by their top build: win rate, then games, then `Group::ORDER`.
     pub fn groups(&self) -> Vec<Group> {
-        Group::ORDER.into_iter().filter(|&g| self.cores.iter().any(|c| c.in_group(g))).collect()
+        // `cores` is sorted by win rate then games, so a group's first member is its top build.
+        let mut groups: Vec<(Group, &Choice)> =
+            Group::ORDER.into_iter().filter_map(|g| Some((g, &self.cores.iter().find(|c| c.in_group(g))?.items))).collect();
+        // Stable sort: equal win rate and games keep `Group::ORDER`.
+        groups.sort_by(|(ga, a), (gb, b)| {
+            (*gb == Group::All)
+                .cmp(&(*ga == Group::All))
+                .then(b.win_rate().total_cmp(&a.win_rate()))
+                .then(b.games.cmp(&a.games))
+        });
+        groups.into_iter().map(|(g, _)| g).collect()
     }
 
     /// Indices into `cores` of a group's builds, highest win rate first.
@@ -463,7 +474,8 @@ mod tests {
                 (vec![6672, 3124, 3302], "AD · On-hit".to_string()),
             ]
         );
-        assert_eq!(b.groups(), [Group::All, Group::Ap, Group::Ad, Group::OnHit, Group::Crit]);
+        // AD and Crit share the 60.1% top build, as do AP and On-hit at 55.2%: ties keep `Group::ORDER`.
+        assert_eq!(b.groups(), [Group::All, Group::Ad, Group::Crit, Group::Ap, Group::OnHit]);
         assert_eq!(b.in_group(Group::Ad), [0, 2]);
         assert_eq!(b.in_group(Group::Ap), [1]);
         // An AP build keeps AP finishing items and drops Infinity Edge; boots are never doubled.
