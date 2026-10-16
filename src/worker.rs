@@ -60,6 +60,8 @@ pub enum Action {
     SwiftplayRunes,
     /// Riot's recommended pages for a champion in each of its positions and in ARAM.
     BrowseChampion(i64),
+    /// Show (and use for the lock-in item set) OP.GG build `cores[i]`.
+    SelectBuild(usize),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -84,6 +86,8 @@ pub struct MetaState {
     pub query: Result<Query, String>,
     /// `None` while the request is in flight.
     pub build: Option<Result<MetaBuild, String>>,
+    /// Index into the build's `cores` shown and written on lock-in; 0 = highest win rate.
+    pub selected: usize,
 }
 
 pub struct Snapshot {
@@ -540,9 +544,9 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
                 let build = match (&query, auto.meta_cache.get(&c)) {
                     (Err(e), _) => Some(Err(e.clone())),
                     (Ok(_), Some(cached)) => Some(cached.clone()),
-                    (Ok(q), None) => request_meta(auto, c, *q).err().map(Err),
+                    (Ok(q), None) => request_meta(auto, shared.snap.lock().data.clone(), c, *q).err().map(Err),
                 };
-                Some(MetaState { champion_id: c, query, build })
+                Some(MetaState { champion_id: c, query, build, selected: 0 })
             }
         };
         let mut s = shared.snap.lock();
@@ -588,13 +592,13 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
     changed
 }
 
-fn request_meta(auto: &mut Auto, champion_id: i64, query: Query) -> Result<(), String> {
+fn request_meta(auto: &mut Auto, data: Arc<StaticData>, champion_id: i64, query: Query) -> Result<(), String> {
     let (tx, _) = auto.meta_chan.get_or_insert_with(mpsc::channel);
     let tx = tx.clone();
     std::thread::Builder::new()
         .name("riftlite-opgg".into())
         .spawn(move || {
-            let r = meta::fetch(&net::public_agent(), champion_id, query);
+            let r = meta::fetch(&net::public_agent(), &data, champion_id, query);
             let _ = tx.send((champion_id, r));
         })
         .map(drop)
@@ -626,20 +630,23 @@ fn meta_page(b: &MetaBuild) -> Option<RecPage> {
 fn lock_in_item_set(shared: &Shared, champ: i64, since: Instant) -> bool {
     let meta_on = shared.settings.lock().meta_builds;
     let s = shared.snap.lock();
-    let meta = match s.meta.as_ref().filter(|m| meta_on && m.champion_id == champ).map(|m| &m.build) {
+    let meta = match s.meta.as_ref().filter(|m| meta_on && m.champion_id == champ) {
         None => None,
-        Some(None) if since.elapsed() < META_WAIT => return false,
-        Some(None) => Some(Err("OP.GG did not answer in time".to_string())),
-        Some(Some(r)) => Some(r.clone()),
+        Some(m) => match &m.build {
+            None if since.elapsed() < META_WAIT => return false,
+            None => Some(Err("OP.GG did not answer in time".to_string())),
+            Some(r) => Some(r.clone().map(|b| (b, m.selected))),
+        },
     };
     let name = s.data.champion_name(champ);
     let history = s.lol_history.as_deref().unwrap_or(&[]);
     let best = itemset::best_game(history, champ);
     let r = match (s.league_root(), meta) {
         (None, _) => Err("League install not found; set it in Settings".to_string()),
-        (Some(root), Some(Ok(b))) => itemset::write_meta(&root, &s.data, &b, best).map(|_| {
+        (Some(root), Some(Ok((b, i)))) => itemset::write_meta(&root, &s.data, &b, i, best).map(|_| {
             let own = if best.is_some() { " + your best game" } else { "" };
-            format!("Item set for {name} written: OP.GG {} ({}){own}", b.query.label(), b.core.stats())
+            let c = &b.cores[i];
+            format!("Item set for {name} written: OP.GG {} {} ({}){own}", b.query.label(), c.label(), c.items.stats())
         }),
         (Some(root), meta) => {
             let why = match meta {
@@ -658,6 +665,27 @@ fn lock_in_item_set(shared: &Shared, champ: i64, since: Instant) -> bool {
         Err(m) => log(shared, format!("Item set: {m}"), false),
     }
     true
+}
+
+/// Selects an OP.GG build; if the lock-in item set was already written, rewrites it with this build.
+fn select_build(shared: &Shared, auto: &Auto, i: usize) -> Result<String, String> {
+    let (champ, label) = {
+        let mut s = shared.snap.lock();
+        let m = s.meta.as_mut().ok_or("no OP.GG build loaded")?;
+        let label = match &m.build {
+            Some(Ok(b)) => b.cores.get(i).map(|c| c.label()).ok_or("no such OP.GG build")?,
+            _ => return Err("no OP.GG build loaded".into()),
+        };
+        m.selected = i;
+        (m.champion_id, label)
+    };
+    let written = auto.applied == Some(champ) && auto.items_pending.is_none() && shared.settings.lock().auto_item_set;
+    if written {
+        lock_in_item_set(shared, champ, Instant::now());
+        Ok(format!("OP.GG {label} build selected; item set rewritten"))
+    } else {
+        Ok(format!("OP.GG {label} build selected; it is written on lock-in"))
+    }
 }
 
 fn apply_runes(shared: &Shared, lcu: &Lcu, i: usize, cs: &ChampSelect) -> Result<String, String> {
@@ -772,6 +800,7 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             .spectate(&puuid)
             .map(|_| "Spectator requested; the League client starts it".to_string())
             .map_err(|e| format!("Spectate: {e} (the player must be in a game that can be spectated)")),
+        Action::SelectBuild(i) => select_build(shared, &st.auto, i),
         Action::BrowseChampion(champ) => {
             let mut positions = lcu.recommended_positions(champ);
             positions.truncate(2);

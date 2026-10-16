@@ -1,43 +1,27 @@
-//! Aggregated champion builds from OP.GG's public MCP server
-//! (`https://mcp-api.op.gg/mcp`, tool `lol_get_champion_analysis`; documented at
-//! github.com/opgginc/opgg-mcp). OP.GG permits use of its data with the source
-//! cited and without excessive requests: riftlite sends one query per picked
-//! champion, containing only the champion id, mode and lane, and labels
+//! Aggregated champion builds from OP.GG.
+//!
+//! Source: `https://lol-api-champion.op.gg/api/global/champions/{mode}/{id}/{lane}`,
+//! the JSON endpoint behind op.gg's champion pages. It lists up to 15 core
+//! builds per champion with games, wins and pick rate. OP.GG's public MCP server
+//! (`mcp-api.op.gg`) returns only the single most played core build, so it cannot
+//! offer several builds to pick from. OP.GG permits use of its data with the
+//! source cited and without excessive requests: riftlite sends one request per
+//! picked champion, containing only the champion id, mode and lane, and labels
 //! everything it writes "OP.GG".
 //!
-//! The tool answers in a compact text notation rather than JSON:
-//!
-//! ```text
-//! class Data: core_items,boots
-//! class CoreItems: ids,play
-//!
-//! LolGetChampionAnalysis(Data(CoreItems([6655,4645],1518),CoreItems([3020],8855)))
-//! ```
-//!
-//! Every constructor's arguments map to the field list of its `class` line, so
-//! [`parse_notation`] turns it into ordinary JSON objects regardless of field order.
+//! Builds are classified from Data Dragon item data (`ddragon::ItemStats`), never
+//! from item names: AP or AD by which damage stat the core items mostly give, and
+//! Crit / On-hit / Tank by the item tags.
 
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
 
-const ENDPOINT: &str = "https://mcp-api.op.gg/mcp";
-const PROTOCOL: &str = "2025-06-18";
-/// Below this many games OP.GG still returns a "build", but it is noise (an off-role pick).
+use crate::ddragon::StaticData;
+
+const BASE: &str = "https://lol-api-champion.op.gg/api/global/champions";
+/// op.gg's default rank filter for ranked tables.
+const RANKED_TIER: &str = "emerald_plus";
+/// Below this many games OP.GG still lists a build, but its win rate is noise.
 pub const MIN_GAMES: u64 = 100;
-
-const FIELDS: &[&str] = &[
-    "data.summary.id",
-    "data.starter_items.{ids[],pick_rate,play,win}",
-    "data.core_items.{ids[],pick_rate,play,win}",
-    "data.boots.{ids[],pick_rate,play,win}",
-    "data.fourth_items[].{ids[],pick_rate,play,win}",
-    "data.fifth_items[].{ids[],pick_rate,play,win}",
-    "data.sixth_items[].{ids[],pick_rate,play,win}",
-    "data.skills.{order[],pick_rate,play,win}",
-    "data.skill_masteries.{ids[],pick_rate,play,win}",
-    "data.runes.{primary_page_id,primary_rune_ids[],secondary_page_id,secondary_rune_ids[],stat_mod_ids[],pick_rate,play,win}",
-    "data.summoner_spells.{ids[],pick_rate,play,win}",
-];
 
 /// What to ask OP.GG for: its game mode and lane names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,9 +33,15 @@ pub struct Query {
 impl Query {
     pub fn label(&self) -> String {
         match self.position {
-            "none" => self.mode.replace('_', " "),
-            p => format!("{} {p}", self.mode),
+            "NONE" => self.mode.replace('_', " "),
+            p => format!("{} {}", self.mode, p.to_lowercase()),
         }
+    }
+
+    fn url(&self, champion_id: i64) -> String {
+        let base = format!("{BASE}/{}/{champion_id}/{}", self.mode, self.position);
+        // ARAM, URF and Nexus Blitz have no rank tiers; a tier filter only shrinks the sample.
+        if matches!(self.mode, "ranked" | "flex") { format!("{base}?tier={RANKED_TIER}") } else { base }
     }
 }
 
@@ -70,15 +60,13 @@ pub fn query_for(queue_id: i64, map_id: i64, position: &str) -> Result<Query, St
         _ => return Err("OP.GG has no builds for this map".into()),
     };
     let position = match mode {
-        // OP.GG ignores the lane for ARAM but still requires a valid one.
-        "aram" => "mid",
-        "urf" | "nexus_blitz" => "none",
+        "aram" | "urf" | "nexus_blitz" => "NONE",
         _ => match position {
-            "TOP" => "top",
-            "JUNGLE" => "jungle",
-            "MIDDLE" => "mid",
-            "BOTTOM" => "adc",
-            "UTILITY" => "support",
+            "TOP" => "TOP",
+            "JUNGLE" => "JUNGLE",
+            "MIDDLE" => "MID",
+            "BOTTOM" => "ADC",
+            "UTILITY" => "SUPPORT",
             _ => return Err("no lane known for this pick".into()),
         },
     };
@@ -94,6 +82,7 @@ pub struct Choice {
     pub games: u64,
     #[serde(rename = "win")]
     pub wins: u64,
+    /// Share of the champion's games in this mode and lane that used it (0–1).
     pub pick_rate: f64,
 }
 
@@ -102,9 +91,9 @@ impl Choice {
         if self.games == 0 { 0.0 } else { self.wins as f64 / self.games as f64 }
     }
 
-    /// "52% WR · 1,518 games"
+    /// "53% WR · 39% pick · 92,134 games"
     pub fn stats(&self) -> String {
-        format!("{:.0}% WR · {} games", self.win_rate() * 100.0, thousands(self.games))
+        format!("{:.1}% WR · {:.1}% pick · {} games", self.win_rate() * 100.0, self.pick_rate * 100.0, thousands(self.games))
     }
 }
 
@@ -141,6 +130,117 @@ impl Runes {
     }
 }
 
+/// Main damage of a core build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Damage {
+    Ap,
+    Ad,
+    /// Core items give no attack or ability power (tank and support builds).
+    None,
+}
+
+/// Ways to group builds for picking; a build can be in several groups.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    All,
+    Ap,
+    Ad,
+    OnHit,
+    Crit,
+    Tank,
+}
+
+impl Group {
+    pub const ORDER: [Group; 6] = [Group::All, Group::Ap, Group::Ad, Group::OnHit, Group::Crit, Group::Tank];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::All => "All",
+            Group::Ap => "AP",
+            Group::Ad => "AD",
+            Group::OnHit => "On-hit",
+            Group::Crit => "Crit",
+            Group::Tank => "Tank",
+        }
+    }
+}
+
+/// A core build (OP.GG's first three completed items) and what kind of build it is.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CoreBuild {
+    pub items: Choice,
+    pub damage: Damage,
+    /// At least two core items carry the tag.
+    pub crit: bool,
+    pub on_hit: bool,
+    /// At least two core items are defensive and give no attack or ability power.
+    pub tank: bool,
+}
+
+impl CoreBuild {
+    /// Classifies from Data Dragon stats: an item counts as AP (AD) when it gives more
+    /// ability (attack) power than the other; ties between AP and AD items are broken
+    /// by the summed stat. Items Data Dragon does not know count for nothing.
+    pub fn classify(items: Choice, data: &StaticData) -> CoreBuild {
+        let stats: Vec<_> = items.ids.iter().filter_map(|id| data.item_stats.get(id)).collect();
+        let ap_items = stats.iter().filter(|s| s.ap > s.ad).count();
+        let ad_items = stats.iter().filter(|s| s.ad > s.ap).count();
+        let (ap, ad): (f64, f64) = stats.iter().fold((0.0, 0.0), |(p, d), s| (p + s.ap, d + s.ad));
+        let damage = match ap_items.cmp(&ad_items) {
+            std::cmp::Ordering::Greater => Damage::Ap,
+            std::cmp::Ordering::Less => Damage::Ad,
+            std::cmp::Ordering::Equal if ap > ad => Damage::Ap,
+            std::cmp::Ordering::Equal if ad > ap => Damage::Ad,
+            std::cmp::Ordering::Equal => Damage::None,
+        };
+        let count = |f: &dyn Fn(&crate::ddragon::ItemStats) -> bool| stats.iter().filter(|s| f(s)).count();
+        CoreBuild {
+            crit: count(&|s| s.crit) >= 2,
+            on_hit: count(&|s| s.on_hit) >= 2,
+            tank: count(&|s| s.defensive && s.ap == 0.0 && s.ad == 0.0) >= 2,
+            damage,
+            items,
+        }
+    }
+
+    pub fn in_group(&self, g: Group) -> bool {
+        match g {
+            Group::All => true,
+            Group::Ap => self.damage == Damage::Ap,
+            Group::Ad => self.damage == Damage::Ad,
+            Group::OnHit => self.on_hit,
+            Group::Crit => self.crit,
+            Group::Tank => self.tank,
+        }
+    }
+
+    /// "AD · On-hit", "AP", "Tank"
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        match self.damage {
+            Damage::Ap => parts.push("AP"),
+            Damage::Ad => parts.push("AD"),
+            Damage::None if !self.tank => parts.push("Utility"),
+            Damage::None => {}
+        }
+        for (on, name) in [(self.on_hit, "On-hit"), (self.crit, "Crit"), (self.tank, "Tank")] {
+            if on {
+                parts.push(name);
+            }
+        }
+        parts.join(" · ")
+    }
+
+    /// Whether a later item fits this build's damage (an AP build skips AD items and vice versa).
+    fn fits(&self, s: &crate::ddragon::ItemStats) -> bool {
+        match self.damage {
+            Damage::Ap => s.ad <= s.ap,
+            Damage::Ad => s.ap <= s.ad,
+            Damage::None => s.ap == 0.0 && s.ad == 0.0,
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Summary {
@@ -157,30 +257,33 @@ struct Mastery {
 #[serde(default)]
 struct RawData {
     summary: Summary,
-    starter_items: Option<Choice>,
-    core_items: Option<Choice>,
-    boots: Option<Choice>,
-    fourth_items: Vec<Choice>,
-    fifth_items: Vec<Choice>,
-    sixth_items: Vec<Choice>,
-    skills: Option<Skills>,
-    skill_masteries: Option<Mastery>,
-    runes: Option<Runes>,
-    summoner_spells: Option<Choice>,
+    starter_items: Vec<Choice>,
+    core_items: Vec<Choice>,
+    boots: Vec<Choice>,
+    last_items: Vec<Choice>,
+    skills: Vec<Skills>,
+    skill_masteries: Vec<Mastery>,
+    runes: Vec<Runes>,
+    summoner_spells: Vec<Choice>,
 }
 
-/// A champion's most played build on OP.GG for one mode and lane.
+#[derive(Deserialize)]
+struct Envelope {
+    data: RawData,
+}
+
+/// A champion's OP.GG builds for one mode and lane.
 #[derive(Clone, PartialEq, Debug)]
 pub struct MetaBuild {
     pub champion_id: i64,
     pub query: Query,
+    /// Core builds with at least `MIN_GAMES` games, highest win rate first. Never empty.
+    pub cores: Vec<CoreBuild>,
     pub starter: Option<Choice>,
-    pub core: Choice,
-    pub boots: Option<Choice>,
-    /// Most played 4th, 5th and 6th item options.
-    pub fourth: Vec<Choice>,
-    pub fifth: Vec<Choice>,
-    pub sixth: Vec<Choice>,
+    /// Boots options, most played first.
+    pub boots: Vec<Choice>,
+    /// Single items players finished with, most played first.
+    pub last_items: Vec<Choice>,
     pub skills: Option<Skills>,
     /// Max order, e.g. `["Q","E","W"]`.
     pub skill_priority: Vec<String>,
@@ -189,260 +292,100 @@ pub struct MetaBuild {
 }
 
 impl MetaBuild {
-    /// Core items, boots, then the most played 4th/5th/6th items: one six-item build.
-    pub fn full_build(&self) -> Vec<i64> {
-        let mut out: Vec<i64> = Vec::new();
-        let add = |id: i64, out: &mut Vec<i64>| {
-            if out.len() < 6 && !out.contains(&id) {
-                out.push(id);
-            }
-        };
-        for &id in &self.core.ids {
-            add(id, &mut out);
-        }
-        for id in self.boots.iter().flat_map(|b| b.ids.iter().copied()) {
-            add(id, &mut out);
-        }
-        for slot in [&self.fourth, &self.fifth, &self.sixth] {
-            // The most played option of each slot that is not already in the build.
-            if let Some(id) = slot.iter().flat_map(|c| c.ids.iter().copied()).find(|id| !out.contains(id)) {
-                add(id, &mut out);
-            }
-        }
-        out
+    /// Groups that have at least one build, in `Group::ORDER`.
+    pub fn groups(&self) -> Vec<Group> {
+        Group::ORDER.into_iter().filter(|&g| self.cores.iter().any(|c| c.in_group(g))).collect()
     }
 
-    /// Every 4th–6th item option in order of appearance, minus what the core and boots already have.
-    pub fn situational(&self) -> Vec<i64> {
-        let taken: Vec<i64> = self.core.ids.iter().chain(self.boots.iter().flat_map(|b| b.ids.iter())).copied().collect();
-        let mut out = Vec::new();
-        for id in self.fourth.iter().chain(&self.fifth).chain(&self.sixth).flat_map(|c| c.ids.iter().copied()) {
-            if !taken.contains(&id) && !out.contains(&id) {
+    /// Indices into `cores` of a group's builds, highest win rate first.
+    pub fn in_group(&self, g: Group) -> Vec<usize> {
+        (0..self.cores.len()).filter(|&i| self.cores[i].in_group(g)).collect()
+    }
+
+    /// Most played boots.
+    pub fn boots(&self) -> Option<&Choice> {
+        self.boots.first()
+    }
+
+    /// The core, boots, then the most played finishing items that fit its damage: six items.
+    pub fn full_build(&self, core: usize, data: &StaticData) -> Vec<i64> {
+        let c = &self.cores[core];
+        let mut out: Vec<i64> = c.items.ids.clone();
+        out.extend(self.boots().iter().flat_map(|b| b.ids.iter().copied()).filter(|id| !c.items.ids.contains(id)));
+        for id in self.last_items.iter().flat_map(|l| l.ids.iter().copied()) {
+            if out.len() >= 6 {
+                break;
+            }
+            let fits = data.item_stats.get(&id).is_some_and(|s| !s.boots && c.fits(s));
+            if fits && !out.contains(&id) {
                 out.push(id);
             }
         }
         out
     }
+
+    /// Other often finished items that fit the build, beyond the full build.
+    pub fn situational(&self, core: usize, data: &StaticData) -> Vec<i64> {
+        let full = self.full_build(core, data);
+        let c = &self.cores[core];
+        self.last_items
+            .iter()
+            .flat_map(|l| l.ids.iter().copied())
+            .filter(|id| !full.contains(id) && data.item_stats.get(id).is_some_and(|s| !s.boots && c.fits(s)))
+            .take(6)
+            .collect()
+    }
 }
 
-/// Fetches and validates the build. Blocking (several seconds); call it off the poll thread.
-pub fn fetch(agent: &ureq::Agent, champion_id: i64, query: Query) -> Result<MetaBuild, String> {
-    let init = post(
-        agent,
-        None,
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": PROTOCOL,
-            "capabilities": {},
-            "clientInfo": {"name": "riftlite", "version": env!("CARGO_PKG_VERSION")}
-        }}),
-    )?;
-    let session = init.session;
-    post(agent, session.as_deref(), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
-    let call = post(
-        agent,
-        session.as_deref(),
-        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "lol_get_champion_analysis",
-            "arguments": {
-                "game_mode": query.mode,
-                "champion": champion_id.to_string(),
-                "position": query.position,
-                "desired_output_fields": FIELDS
-            }
-        }}),
-    )?;
-    let reply = call.message.ok_or("OP.GG sent no reply")?;
-    if let Some(e) = reply.get("error") {
-        return Err(format!("OP.GG: {}", e["message"].as_str().unwrap_or("error")));
+/// Fetches, validates and classifies the builds. Blocking (about a second); call it off the poll thread.
+pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Query) -> Result<MetaBuild, String> {
+    if data.item_stats.is_empty() {
+        return Err("Data Dragon item data is not loaded yet; builds cannot be classified".into());
     }
-    let result = &reply["result"];
-    let text = result["content"][0]["text"].as_str().ok_or("OP.GG reply has no text content")?;
-    if result["isError"].as_bool() == Some(true) {
-        return Err(format!("OP.GG: {}", text.chars().take(200).collect::<String>()));
-    }
-    parse_build(champion_id, query, text)
+    let resp = match agent.get(&query.url(champion_id)).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) => return Err("OP.GG does not know this champion".into()),
+        Err(ureq::Error::Status(code, _)) => return Err(format!("OP.GG HTTP {code}")),
+        Err(e) => return Err(format!("OP.GG unreachable: {e}")),
+    };
+    let text = resp.into_string().map_err(|e| format!("OP.GG read: {e}"))?;
+    parse_build(champion_id, query, &text, data)
 }
 
-/// Turns the tool's text into a build, rejecting other champions and tiny samples.
-pub fn parse_build(champion_id: i64, query: Query, text: &str) -> Result<MetaBuild, String> {
-    let v = parse_notation(text)?;
-    let raw: RawData = serde_json::from_value(v["data"].clone()).map_err(|e| format!("OP.GG build: {e}"))?;
+/// Turns OP.GG's JSON into classified builds, rejecting other champions and tiny samples.
+pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData) -> Result<MetaBuild, String> {
+    let raw = serde_json::from_str::<Envelope>(json).map_err(|e| format!("OP.GG build: {e}"))?.data;
     if raw.summary.id != champion_id {
         return Err(format!("OP.GG answered for champion {} instead of {champion_id}", raw.summary.id));
     }
-    let core = raw.core_items.filter(|c| !c.ids.is_empty()).ok_or("OP.GG has no build for this champion and mode")?;
-    if core.games < MIN_GAMES {
-        let n = core.games;
-        return Err(format!("OP.GG has only {n} game{} of this build ({}); too few to trust", if n == 1 { "" } else { "s" }, query.label()));
+    let most = raw.core_items.iter().map(|c| c.games).max().unwrap_or(0);
+    let mut cores: Vec<CoreBuild> = raw
+        .core_items
+        .into_iter()
+        .filter(|c| !c.ids.is_empty() && c.games >= MIN_GAMES)
+        .map(|c| CoreBuild::classify(c, data))
+        .collect();
+    if cores.is_empty() {
+        return Err(match most {
+            0 => "OP.GG has no build for this champion and mode".into(),
+            1 => format!("OP.GG has only 1 game of this build ({}); too few to trust", query.label()),
+            n => format!("OP.GG has only {n} games of this build ({}); too few to trust", query.label()),
+        });
     }
+    cores.sort_by(|a, b| b.items.win_rate().total_cmp(&a.items.win_rate()).then(b.items.games.cmp(&a.items.games)));
+    let first = |v: Vec<Choice>| v.into_iter().find(|c| !c.ids.is_empty());
     Ok(MetaBuild {
         champion_id,
         query,
-        starter: raw.starter_items.filter(|c| !c.ids.is_empty()),
-        core,
-        boots: raw.boots.filter(|c| !c.ids.is_empty()),
-        fourth: raw.fourth_items,
-        fifth: raw.fifth_items,
-        sixth: raw.sixth_items,
-        skills: raw.skills.filter(|s| !s.order.is_empty()),
-        skill_priority: raw.skill_masteries.map(|m| m.ids).unwrap_or_default(),
-        runes: raw.runes,
-        spells: raw.summoner_spells.filter(|c| c.ids.len() == 2),
+        cores,
+        starter: first(raw.starter_items),
+        boots: raw.boots.into_iter().filter(|b| !b.ids.is_empty()).collect(),
+        last_items: raw.last_items,
+        skills: raw.skills.into_iter().find(|s| !s.order.is_empty()),
+        skill_priority: raw.skill_masteries.into_iter().next().map(|m| m.ids).unwrap_or_default(),
+        runes: raw.runes.into_iter().next(),
+        spells: first(raw.summoner_spells).filter(|c| c.ids.len() == 2),
     })
-}
-
-struct Reply {
-    session: Option<String>,
-    /// The JSON-RPC response; `None` for an accepted notification.
-    message: Option<Value>,
-}
-
-fn post(agent: &ureq::Agent, session: Option<&str>, body: &Value) -> Result<Reply, String> {
-    let mut req = agent
-        .post(ENDPOINT)
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json, text/event-stream");
-    if let Some(s) = session {
-        req = req.set("Mcp-Session-Id", s).set("MCP-Protocol-Version", PROTOCOL);
-    }
-    let resp = match req.send_json(body.clone()) {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let detail = r.into_string().unwrap_or_default();
-            return Err(format!("OP.GG HTTP {code} {}", detail.chars().take(160).collect::<String>()));
-        }
-        Err(e) => return Err(format!("OP.GG unreachable: {e}")),
-    };
-    let session = resp.header("Mcp-Session-Id").map(str::to_string);
-    let streamed = resp.content_type() == "text/event-stream";
-    let text = resp.into_string().map_err(|e| format!("OP.GG read: {e}"))?;
-    let message = if text.trim().is_empty() {
-        None
-    } else if streamed {
-        // Streamable HTTP may answer as server-sent events; the response is the last `data:` message.
-        let data = text.lines().filter_map(|l| l.strip_prefix("data:")).last().ok_or("OP.GG stream had no data")?;
-        Some(serde_json::from_str(data.trim()).map_err(|e| format!("OP.GG reply: {e}"))?)
-    } else {
-        Some(serde_json::from_str(&text).map_err(|e| format!("OP.GG reply: {e}"))?)
-    };
-    Ok(Reply { session, message })
-}
-
-/// Parses the `class X: a,b` + `X(…)` notation into JSON. The outermost constructor
-/// becomes the returned object.
-pub fn parse_notation(text: &str) -> Result<Value, String> {
-    let mut classes: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    let mut body = String::new();
-    for line in text.lines() {
-        if let Some(decl) = line.strip_prefix("class ") {
-            let (name, fields) = decl.split_once(':').ok_or_else(|| format!("bad class line: {line}"))?;
-            classes.insert(name.trim(), fields.split(',').map(str::trim).filter(|f| !f.is_empty()).collect());
-        } else {
-            body.push_str(line);
-            body.push('\n');
-        }
-    }
-    let mut p = Parser { s: body.as_bytes(), i: 0, classes: &classes };
-    let v = p.value()?;
-    p.ws();
-    if p.i != p.s.len() {
-        return Err(format!("unexpected text at {}", p.i));
-    }
-    Ok(v)
-}
-
-struct Parser<'a> {
-    s: &'a [u8],
-    i: usize,
-    classes: &'a std::collections::HashMap<&'a str, Vec<&'a str>>,
-}
-
-impl Parser<'_> {
-    fn ws(&mut self) {
-        while self.s.get(self.i).is_some_and(u8::is_ascii_whitespace) {
-            self.i += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Value, String> {
-        self.ws();
-        match self.s.get(self.i).copied() {
-            None => Err("unexpected end".into()),
-            Some(b'[') => {
-                self.i += 1;
-                Ok(Value::Array(self.list(b']')?))
-            }
-            Some(b'"') => {
-                let start = self.i;
-                self.i += 1;
-                while let Some(&b) = self.s.get(self.i) {
-                    self.i += 1;
-                    match b {
-                        b'\\' => self.i += 1,
-                        b'"' => {
-                            let lit = std::str::from_utf8(&self.s[start..self.i]).map_err(|e| e.to_string())?;
-                            return serde_json::from_str(lit).map_err(|e| format!("bad string {lit}: {e}"));
-                        }
-                        _ => {}
-                    }
-                }
-                Err("unterminated string".into())
-            }
-            Some(b) if b == b'-' || b.is_ascii_digit() => {
-                let start = self.i;
-                while self.s.get(self.i).is_some_and(|b| b.is_ascii_digit() || b"+-.eE".contains(b)) {
-                    self.i += 1;
-                }
-                let lit = std::str::from_utf8(&self.s[start..self.i]).expect("ascii");
-                serde_json::from_str(lit).map_err(|e| format!("bad number {lit}: {e}"))
-            }
-            Some(b) if b.is_ascii_alphabetic() || b == b'_' => {
-                let start = self.i;
-                while self.s.get(self.i).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
-                    self.i += 1;
-                }
-                let name = std::str::from_utf8(&self.s[start..self.i]).expect("ascii");
-                self.ws();
-                if self.s.get(self.i) != Some(&b'(') {
-                    return match name {
-                        "true" => Ok(Value::Bool(true)),
-                        "false" => Ok(Value::Bool(false)),
-                        "null" | "None" => Ok(Value::Null),
-                        _ => Err(format!("unknown word {name}")),
-                    };
-                }
-                self.i += 1;
-                let args = self.list(b')')?;
-                let fields = self.classes.get(name).ok_or_else(|| format!("undeclared class {name}"))?;
-                if fields.len() != args.len() {
-                    return Err(format!("{name} has {} fields but {} values", fields.len(), args.len()));
-                }
-                Ok(Value::Object(fields.iter().map(|f| f.to_string()).zip(args).collect::<Map<_, _>>()))
-            }
-            Some(b) => Err(format!("unexpected '{}' at {}", b as char, self.i)),
-        }
-    }
-
-    fn list(&mut self, close: u8) -> Result<Vec<Value>, String> {
-        let mut out = Vec::new();
-        self.ws();
-        if self.s.get(self.i) == Some(&close) {
-            self.i += 1;
-            return Ok(out);
-        }
-        loop {
-            out.push(self.value()?);
-            self.ws();
-            match self.s.get(self.i).copied() {
-                Some(b',') => self.i += 1,
-                Some(b) if b == close => {
-                    self.i += 1;
-                    return Ok(out);
-                }
-                _ => return Err(format!("expected ',' or '{}' at {}", close as char, self.i)),
-            }
-        }
-    }
 }
 
 fn thousands(n: u64) -> String {
@@ -460,58 +403,96 @@ fn thousands(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ddragon::ItemStats;
 
-    /// Trimmed from a real `lol_get_champion_analysis` answer (Ziggs, ranked mid).
-    const ZIGGS: &str = "class LolGetChampionAnalysis: data\n\
-class Data: summary,core_items,boots,starter_items,fourth_items,summoner_spells,runes,skills,skill_masteries,counters_meta\n\
-class Summary: id\n\
-class CoreItems: ids,ids_names,play,win,pick_rate\n\
-class SummonerSpells: ids,win,play,pick_rate\n\
-class Runes: primary_page_id,primary_rune_ids,secondary_page_id,secondary_rune_ids,stat_mod_ids,play,win,pick_rate\n\
-class Skills: order,play,win,pick_rate\n\
-class CountersMeta: message\n\
-\n\
-LolGetChampionAnalysis(Data(Summary(115),CoreItems([6655,4645,3089],[\"Luden's Echo\",\"Shadowflame\",\"Rabadon's Deathcap\"],1518,844,0.22),\
-CoreItems([3020],[\"Sorcerer's Shoes\"],8855,4481,0.88),CoreItems([1056,2003,2003],[\"Doran's Ring\",\"Health Potion\",\"Health Potion\"],9486,4730,0.92),\
-[CoreItems([3089],[\"Rabadon's Deathcap\"],903,470,0.27),CoreItems([3157],[\"Zhonya's Hourglass\"],675,383,0.2)],SummonerSpells([4,12],4018,8121,0.78),\
-Runes(8200,[8229,8226,8210,8237],8000,[8009,8014],[5008,5008,5001],3440,1687,0.32),Skills([\"Q\",\"E\",\"W\",\"Q\"],3086,1682,0.42),\
-SummonerSpells([\"Q\",\"E\",\"W\"],3814,7009,0.96),CountersMeta(\"Insufficient matchup sample.\")))";
+    fn item(ap: f64, ad: f64, crit: bool, on_hit: bool, defensive: bool, boots: bool) -> ItemStats {
+        ItemStats { ap, ad, crit, on_hit, defensive, boots }
+    }
 
-    const MID: Query = Query { mode: "ranked", position: "mid" };
+    /// Data Dragon 16.20 stats/tags of the items in the Kai'Sa answer below.
+    fn data() -> StaticData {
+        let mut d = StaticData::default();
+        for (id, s) in [
+            (6672, item(0.0, 45.0, false, true, false, false)),  // Kraken Slayer
+            (3124, item(30.0, 30.0, false, true, false, false)), // Guinsoo's Rageblade
+            (3302, item(0.0, 30.0, false, true, false, false)),  // Terminus
+            (3115, item(80.0, 0.0, false, true, false, false)),  // Nashor's Tooth
+            (3087, item(45.0, 45.0, false, true, false, false)), // Statikk Shiv
+            (3032, item(0.0, 50.0, true, false, false, false)),  // Yun Tal Wildarrows
+            (3031, item(0.0, 75.0, true, false, false, false)),  // Infinity Edge
+            (3085, item(0.0, 0.0, true, true, false, false)),    // Runaan's Hurricane
+            (3089, item(130.0, 0.0, false, false, false, false)), // Rabadon's Deathcap
+            (3006, item(0.0, 0.0, false, false, false, true)),   // Berserker's Greaves
+            (3020, item(0.0, 0.0, false, false, false, true)),   // Sorcerer's Shoes
+            (3068, item(0.0, 0.0, false, false, true, false)),   // Sunfire Aegis
+            (3075, item(0.0, 0.0, false, false, true, false)),   // Thornmail
+            (3047, item(0.0, 0.0, false, false, true, true)),    // Plated Steelcaps
+        ] {
+            d.item_stats.insert(id, s);
+        }
+        d
+    }
+
+    /// Trimmed from a real answer for Kai'Sa, ranked ADC, emerald+.
+    const KAISA: &str = r#"{"data":{"summary":{"id":145},
+        "core_items":[
+          {"ids":[6672,3124,3302],"play":92134,"win":49015,"pick_rate":0.3896},
+          {"ids":[3087,3124,3115],"play":23020,"win":12707,"pick_rate":0.0973},
+          {"ids":[3032,3031,3085],"play":1176,"win":707,"pick_rate":0.005},
+          {"ids":[3068,3075,3047],"play":40,"win":30,"pick_rate":0.0002}],
+        "starter_items":[{"ids":[1055,2003],"play":9000,"win":4600,"pick_rate":0.9}],
+        "boots":[{"ids":[3006],"play":90000,"win":47000,"pick_rate":0.8},{"ids":[3020],"play":9000,"win":4800,"pick_rate":0.08}],
+        "last_items":[{"ids":[3006],"play":50000,"win":1},{"ids":[3115],"play":30000,"win":1},{"ids":[3031],"play":20000,"win":1},{"ids":[3089],"play":9000,"win":1}],
+        "skills":[{"order":["Q","E","W","Q"],"play":10,"win":5}],
+        "skill_masteries":[{"ids":["Q","E","W"],"play":10,"win":5}],
+        "runes":[{"primary_page_id":8000,"primary_rune_ids":[8008,9111,9104,8017],"secondary_page_id":8100,"secondary_rune_ids":[8139,8135],"stat_mod_ids":[5005,5008,5011],"play":100,"win":50}],
+        "summoner_spells":[{"ids":[4,7],"play":100,"win":50,"pick_rate":0.9}]}}"#;
+
+    const ADC: Query = Query { mode: "ranked", position: "ADC" };
 
     #[test]
-    fn notation_maps_fields_by_declared_class_not_position() {
-        let b = parse_build(115, MID, ZIGGS).expect("parses");
-        assert_eq!(b.core.ids, [6655, 4645, 3089]);
-        assert_eq!((b.core.games, b.core.wins), (1518, 844));
-        // `SummonerSpells` declares win before play, unlike `CoreItems`.
-        assert_eq!(b.spells.as_ref().map(|s| (s.ids.clone(), s.games, s.wins)), Some((vec![4, 12], 8121, 4018)));
-        assert_eq!(b.skill_priority, ["Q", "E", "W"]);
-        assert_eq!(b.runes.as_ref().and_then(Runes::perks), Some(vec![8229, 8226, 8210, 8237, 8009, 8014, 5008, 5008, 5001]));
-        assert_eq!(b.starter.as_ref().map(|s| s.ids.clone()), Some(vec![1056, 2003, 2003]));
-        // Rabadon's is already core, so the full build takes the next 4th-item option.
-        assert_eq!(b.full_build(), [6655, 4645, 3089, 3020, 3157]);
-        assert_eq!(b.situational(), [3157]);
+    fn kaisa_builds_split_into_ap_ad_on_hit_and_crit_sorted_by_win_rate() {
+        let b = parse_build(145, ADC, KAISA, &data()).expect("parses");
+        // The 40-game tank line is under MIN_GAMES; the rest is highest win rate first.
+        let order: Vec<_> = b.cores.iter().map(|c| (c.items.ids.clone(), c.label())).collect();
+        assert_eq!(
+            order,
+            [
+                (vec![3032, 3031, 3085], "AD · Crit".to_string()),
+                (vec![3087, 3124, 3115], "AP · On-hit".to_string()),
+                (vec![6672, 3124, 3302], "AD · On-hit".to_string()),
+            ]
+        );
+        assert_eq!(b.groups(), [Group::All, Group::Ap, Group::Ad, Group::OnHit, Group::Crit]);
+        assert_eq!(b.in_group(Group::Ad), [0, 2]);
+        assert_eq!(b.in_group(Group::Ap), [1]);
+        // An AP build keeps AP finishing items and drops Infinity Edge; boots are never doubled.
+        assert_eq!(b.full_build(1, &data()), [3087, 3124, 3115, 3006, 3089]);
+        // Nashor's Tooth (AP) stays out of the AD build.
+        assert_eq!(b.full_build(2, &data()), [6672, 3124, 3302, 3006, 3031]);
     }
 
     #[test]
-    fn builds_for_another_champion_or_tiny_samples_are_rejected() {
-        assert!(parse_build(62, MID, ZIGGS).unwrap_err().contains("instead of 62"));
-        let sona = "class LolGetChampionAnalysis: data\nclass Data: summary,core_items\nclass Summary: id\nclass CoreItems: ids,play\n\n\
-LolGetChampionAnalysis(Data(Summary(37),CoreItems([3070,3100,3040],1)))";
-        assert!(parse_build(37, Query { mode: "ranked", position: "jungle" }, sona).unwrap_err().contains("only 1 game "));
-        let empty = "class LolGetChampionAnalysis: data\nclass Data: summary\nclass Summary: id\n\nLolGetChampionAnalysis(Data(Summary(37)))";
-        assert!(parse_build(37, MID, empty).is_err());
-        assert!(parse_notation("class A: x,y\n\nA(1)").is_err(), "arity mismatch is an error, not a shifted mapping");
+    fn tank_builds_and_rejections() {
+        let d = data();
+        let tank = CoreBuild::classify(Choice { ids: vec![3068, 3075, 3047], ..Choice::default() }, &d);
+        assert_eq!((tank.damage, tank.tank, tank.label().as_str()), (Damage::None, true, "Tank"));
+        assert!(parse_build(62, ADC, KAISA, &d).unwrap_err().contains("instead of 62"));
+        let sona = r#"{"data":{"summary":{"id":37},"core_items":[{"ids":[3070,3100,3040],"play":1,"win":1}]}}"#;
+        assert!(parse_build(37, Query { mode: "ranked", position: "JUNGLE" }, sona, &d).unwrap_err().contains("only 1 game "));
+        let none = r#"{"data":{"summary":{"id":37},"core_items":[]}}"#;
+        assert!(parse_build(37, ADC, none, &d).unwrap_err().contains("no build"));
     }
 
     #[test]
     fn queues_map_to_opgg_modes_and_lanes() {
-        assert_eq!(query_for(420, 11, "MIDDLE"), Ok(Query { mode: "ranked", position: "mid" }));
-        assert_eq!(query_for(440, 11, "UTILITY"), Ok(Query { mode: "flex", position: "support" }));
-        assert_eq!(query_for(2400, 12, "NONE"), Ok(Query { mode: "aram", position: "mid" }));
-        assert_eq!(query_for(1900, 11, "TOP"), Ok(Query { mode: "urf", position: "none" }));
+        assert_eq!(query_for(420, 11, "MIDDLE"), Ok(Query { mode: "ranked", position: "MID" }));
+        assert_eq!(query_for(440, 11, "UTILITY"), Ok(Query { mode: "flex", position: "SUPPORT" }));
+        assert_eq!(query_for(2400, 12, "NONE"), Ok(Query { mode: "aram", position: "NONE" }));
+        assert_eq!(query_for(1900, 11, "TOP"), Ok(Query { mode: "urf", position: "NONE" }));
         assert!(query_for(430, 11, "NONE").is_err(), "blind pick without a lane");
         assert!(query_for(1700, 30, "NONE").is_err(), "Arena");
+        assert_eq!(Query { mode: "aram", position: "NONE" }.url(115), format!("{BASE}/aram/115/NONE"));
+        assert_eq!(Query { mode: "ranked", position: "ADC" }.url(145), format!("{BASE}/ranked/145/ADC?tier=emerald_plus"));
     }
 }

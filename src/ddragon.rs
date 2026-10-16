@@ -1,6 +1,6 @@
 //! Champion and item names from Riot's official Data Dragon CDN, cached per
-//! patch under `%LOCALAPPDATA%\riftlite\ddragon`. Only the name maps are kept
-//! in memory.
+//! patch under `%LOCALAPPDATA%\riftlite\ddragon`. Only the name maps and the few
+//! item stats used to classify builds are kept in memory.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,11 +16,30 @@ pub struct Champion {
     pub name: String,
 }
 
+/// What an item gives, from Data Dragon's `stats` and `tags`; used to tell an AP
+/// build from an AD, crit, on-hit or tank one.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct ItemStats {
+    /// `FlatMagicDamageMod`
+    pub ap: f64,
+    /// `FlatPhysicalDamageMod`
+    pub ad: f64,
+    /// `CriticalStrike` tag
+    pub crit: bool,
+    /// `OnHit` tag
+    pub on_hit: bool,
+    /// `Health`, `Armor` or `SpellBlock` tag
+    pub defensive: bool,
+    /// `Boots` tag
+    pub boots: bool,
+}
+
 #[derive(Default, Clone)]
 pub struct StaticData {
     pub version: String,
     pub champions: HashMap<i64, Champion>,
     pub items: HashMap<i64, String>,
+    pub item_stats: HashMap<i64, ItemStats>,
     /// Summoner spells by numeric key.
     pub spells: HashMap<i64, String>,
     /// Runes and rune paths (styles) by id.
@@ -143,12 +162,24 @@ pub fn load(agent: &ureq::Agent) -> Result<StaticData, String> {
             Some((key, Champion { id: c["id"].as_str()?.to_string(), name: c["name"].as_str()?.to_string() }))
         })
         .collect();
-    let items = items["data"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(k, i)| Some((k.parse().ok()?, i["name"].as_str()?.to_string())))
+    let item_data: Vec<(i64, &Value)> =
+        items["data"].as_object().into_iter().flatten().filter_map(|(k, i)| Some((k.parse().ok()?, i))).collect();
+    let item_stats = item_data
+        .iter()
+        .map(|&(id, i)| {
+            let tag = |t: &str| i["tags"].as_array().is_some_and(|a| a.iter().any(|x| x == t));
+            let stats = ItemStats {
+                ap: i["stats"]["FlatMagicDamageMod"].as_f64().unwrap_or(0.0),
+                ad: i["stats"]["FlatPhysicalDamageMod"].as_f64().unwrap_or(0.0),
+                crit: tag("CriticalStrike"),
+                on_hit: tag("OnHit"),
+                defensive: tag("Health") || tag("Armor") || tag("SpellBlock"),
+                boots: tag("Boots"),
+            };
+            (id, stats)
+        })
         .collect();
+    let items = item_data.iter().filter_map(|&(id, i)| Some((id, i["name"].as_str()?.to_string()))).collect();
     let spells = spells["data"]
         .as_object()
         .into_iter()
@@ -166,7 +197,7 @@ pub fn load(agent: &ureq::Agent) -> Result<StaticData, String> {
             }
         }
     }
-    Ok(StaticData { version, champions, items, spells, perks, has_client_assets: false })
+    Ok(StaticData { version, champions, items, item_stats, spells, perks, has_client_assets: false })
 }
 
 /// `TFT13_Ahri` → `Ahri`, `TFT13_Sniper` → `Sniper`. Character/trait ids are

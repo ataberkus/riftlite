@@ -17,7 +17,7 @@ use crate::live::{LiveGame, LivePlayer};
 use crate::riot::{self, Product};
 use crate::settings::{self, Settings};
 use crate::worker::{Action, LcuStatus, Shared, Snapshot};
-use crate::{itemset, win};
+use crate::{itemset, meta, win};
 
 const ACCENT: Color32 = Color32::from_rgb(0x4f, 0xb8, 0xff);
 const WIN: Color32 = Color32::from_rgb(0x52, 0xc4, 0x7a);
@@ -56,6 +56,8 @@ pub struct App {
     lookup_input: String,
     champ_filter: String,
     champ_selected: Option<i64>,
+    /// OP.GG build group listed in champ select.
+    meta_group: meta::Group,
     folder_input: String,
     hotkey: Option<bool>,
     hotkey_rx: Receiver<bool>,
@@ -86,6 +88,7 @@ impl App {
             lookup_input: String::new(),
             champ_filter: String::new(),
             champ_selected: None,
+            meta_group: meta::Group::All,
             hotkey: None,
             hotkey_rx,
         }
@@ -627,35 +630,62 @@ impl App {
         suggestions(ui, s, history);
     }
 
-    /// OP.GG's build for the current pick (Settings → "Use OP.GG builds").
+    /// OP.GG's builds for the current pick (Settings → "Use OP.GG builds"), grouped by
+    /// type and highest win rate first; the selected one is shown and written on lock-in.
     fn meta_build(&mut self, ui: &mut Ui, s: &Snapshot) {
         if !self.settings.meta_builds {
             return;
         }
-        section(ui, "OP.GG build");
+        section(ui, "OP.GG builds");
         let Some(m) = &s.meta else {
-            return void(ui.colored_label(MUTED, "Hover or lock a champion to load OP.GG's most played build for it."));
+            return void(ui.colored_label(MUTED, "Hover or lock a champion to load OP.GG's builds for it."));
         };
         let name = s.data.champion_name(m.champion_id);
         let build = match (&m.query, &m.build) {
             (Err(e), _) => return void(ui.colored_label(MUTED, format!("OP.GG: {e}; the lock-in item set uses your own games."))),
-            (Ok(q), None) => return void(ui.colored_label(MUTED, format!("Loading OP.GG {} build for {name}…", q.label()))),
+            (Ok(q), None) => return void(ui.colored_label(MUTED, format!("Loading OP.GG {} builds for {name}…", q.label()))),
             (_, Some(Err(e))) => return void(ui.colored_label(LOSS, format!("{e}; the lock-in item set uses your own games."))),
             (_, Some(Ok(b))) => b,
         };
+        let sel = m.selected.min(build.cores.len() - 1);
+        let groups = build.groups();
+        if !groups.contains(&self.meta_group) {
+            self.meta_group = meta::Group::All;
+        }
         let names = |ids: &[i64], sep: &str| ids.iter().map(|&i| s.data.item_name(i)).collect::<Vec<_>>().join(sep);
         card(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(format!("{name} · OP.GG {} · core {}", build.query.label(), build.core.stats())).strong());
+            ui.label(RichText::new(format!("{name} · OP.GG {} · {} builds", build.query.label(), build.cores.len())).strong());
+            ui.horizontal_wrapped(|ui| {
+                for g in groups {
+                    let members = build.in_group(g);
+                    if ui.selectable_label(self.meta_group == g, format!("{} ({})", g.label(), members.len())).clicked() {
+                        self.meta_group = g;
+                        if let Some(&best) = members.first().filter(|&&b| b != sel) {
+                            self.request(Action::SelectBuild(best));
+                        }
+                    }
+                }
+            });
+            for i in build.in_group(self.meta_group) {
+                let c = &build.cores[i];
+                let text = format!("{} · {} · {}", c.label(), names(&c.items.ids, " → "), c.items.stats());
+                if ui.selectable_label(i == sel, text).clicked() && i != sel {
+                    self.request(Action::SelectBuild(i));
+                }
+            }
+            ui.separator();
+            let chosen = &build.cores[sel];
+            ui.label(RichText::new(format!("{} · {}", chosen.label(), chosen.items.stats())).strong());
             if let Some(st) = &build.starter {
                 ui.label(format!("Starting: {}", names(&st.ids, ", ")));
             }
-            ui.label(format!("Core: {}", names(&build.core.ids, " → ")));
-            if let Some(b) = &build.boots {
+            ui.label(format!("Core: {}", names(&chosen.items.ids, " → ")));
+            if let Some(b) = build.boots() {
                 ui.label(format!("Boots: {} ({})", names(&b.ids, ", "), b.stats()));
             }
-            ui.label(format!("Full build: {}", names(&build.full_build(), ", ")));
-            let situational = build.situational();
+            ui.label(format!("Full build: {}", names(&build.full_build(sel, &s.data), ", ")));
+            let situational = build.situational(sel, &s.data);
             if !situational.is_empty() {
                 ui.label(RichText::new(format!("Situational: {}", names(&situational, ", "))).color(MUTED));
             }
@@ -663,7 +693,12 @@ impl App {
                 let max = if build.skill_priority.is_empty() { String::new() } else { format!("max {} · ", build.skill_priority.join(" > ")) };
                 ui.label(format!("Skills: {max}{}", sk.order.join(" ")));
             }
-            ui.label(RichText::new("Data: OP.GG (op.gg), all ranks, current patch").color(MUTED).small());
+            let sample = match build.query.mode {
+                "ranked" | "flex" => "Emerald+ games",
+                _ => "all games",
+            };
+            let note = format!("Data: OP.GG (op.gg), {sample}, current patch. Types from Data Dragon item stats.");
+            ui.label(RichText::new(note).color(MUTED).small());
         });
     }
 
@@ -905,10 +940,11 @@ impl App {
         changed |= ui.checkbox(&mut self.settings.meta_builds, "Use OP.GG builds (aggregated from many players' games)").changed();
         ui.label(
             RichText::new(
-                "On: the item set is OP.GG's most played build for your mode and lane (Starting, Core, Boots, Full build, Situational) \
-                 plus your best recent game as an extra block, and OP.GG's rune page is offered next to Riot's. \
-                 Only the champion id, mode and lane are sent to mcp-api.op.gg. \
-                 Off, or when OP.GG is unreachable or has too few games: the build from your best recent game.",
+                "On: champ select lists OP.GG's builds for your mode and lane, grouped AP / AD / On-hit / Crit / Tank \
+                 (from Data Dragon item stats) and sorted by win rate. The item set holds the build you select \
+                 (default: highest win rate), the best build of each other group, and your best recent game; \
+                 OP.GG's rune page is offered next to Riot's. Only the champion id, mode and lane are sent to \
+                 lol-api-champion.op.gg. Off, or when OP.GG is unreachable or has too few games: the build from your best recent game.",
             )
             .color(MUTED),
         );

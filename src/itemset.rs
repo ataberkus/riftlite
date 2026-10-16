@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::ddragon::StaticData;
 use crate::lcu::LolGame;
-use crate::meta::MetaBuild;
+use crate::meta::{Group, MetaBuild};
 
 const PREFIX: &str = "riftlite_";
 
@@ -23,11 +23,19 @@ pub fn write_from_game(league_root: &Path, data: &StaticData, game: &LolGame) ->
     write_set(league_root, data, game.champion_id, &game.game_id.to_string(), &title, &[], blocks)
 }
 
-/// OP.GG's build split into Starting / Core / Boots / Full build / Situational blocks,
-/// plus the player's own best game on the champion when there is one. One file per
-/// champion and OP.GG mode, shown by the client only on that mode's map.
-pub fn write_meta(league_root: &Path, data: &StaticData, build: &MetaBuild, personal: Option<&LolGame>) -> Result<PathBuf, String> {
+/// One of OP.GG's builds (`core`, an index into `build.cores`) as Starting / Core / Boots /
+/// Full build / Situational blocks, then the best build of every other group (AP, AD,
+/// On-hit, Crit, Tank) as "Alternative" blocks, then the player's own best game on the
+/// champion. One file per champion and OP.GG mode, shown by the client only on that mode's map.
+pub fn write_meta(
+    league_root: &Path,
+    data: &StaticData,
+    build: &MetaBuild,
+    core: usize,
+    personal: Option<&LolGame>,
+) -> Result<PathBuf, String> {
     let q = build.query;
+    let chosen = build.cores.get(core).ok_or("no such OP.GG build")?;
     let mut blocks = Vec::new();
     if let Some(s) = &build.starter {
         let skills = match build.skill_priority.as_slice() {
@@ -36,17 +44,25 @@ pub fn write_meta(league_root: &Path, data: &StaticData, build: &MetaBuild, pers
         };
         blocks.push(block(format!("Starting · {skills}OP.GG {}", s.stats()), &s.ids));
     }
-    blocks.push(block(format!("Core, in order · OP.GG {}", build.core.stats()), &build.core.ids));
-    if let Some(b) = &build.boots {
+    blocks.push(block(format!("Core {} · OP.GG {}", chosen.label(), chosen.items.stats()), &chosen.items.ids));
+    if let Some(b) = build.boots() {
         blocks.push(block(format!("Boots · OP.GG {}", b.stats()), &b.ids));
     }
-    blocks.push(block("Full build · core, boots, most played 4th–6th".into(), &build.full_build()));
-    let situational = build.situational();
+    blocks.push(block(format!("Full build {} · core, boots, most finished items", chosen.label()), &build.full_build(core, data)));
+    let situational = build.situational(core, data);
     if !situational.is_empty() {
-        blocks.push(block("Situational · OP.GG 4th–6th item options".into(), &situational));
+        blocks.push(block("Situational · OP.GG often finished items".into(), &situational));
+    }
+    let mut listed = vec![core];
+    for g in build.groups().into_iter().filter(|&g| g != Group::All) {
+        if let Some(&best) = build.in_group(g).first().filter(|i| !listed.contains(i)) {
+            listed.push(best);
+            let c = &build.cores[best];
+            blocks.push(block(format!("Alternative {} · {} · OP.GG {}", g.label(), c.label(), c.items.stats()), &c.items.ids));
+        }
     }
     blocks.extend(personal.and_then(personal_block));
-    let title = format!("riftlite · {} · OP.GG {}", data.champion_name(build.champion_id), q.label());
+    let title = format!("riftlite · {} · OP.GG {} · {}", data.champion_name(build.champion_id), q.label(), chosen.label());
     let maps: &[i64] = match q.mode {
         "aram" => &[12],
         "nexus_blitz" => &[21],
