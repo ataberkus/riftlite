@@ -56,8 +56,8 @@ pub struct App {
     lookup_input: String,
     champ_filter: String,
     champ_selected: Option<i64>,
-    /// OP.GG build group listed in champ select.
-    meta_group: meta::Group,
+    /// OP.GG build group the user opened in champ select, per champion id.
+    meta_group: Option<(i64, meta::Group)>,
     folder_input: String,
     hotkey: Option<bool>,
     hotkey_rx: Receiver<bool>,
@@ -88,7 +88,7 @@ impl App {
             lookup_input: String::new(),
             champ_filter: String::new(),
             champ_selected: None,
-            meta_group: meta::Group::All,
+            meta_group: None,
             hotkey: None,
             hotkey_rx,
         }
@@ -649,9 +649,11 @@ impl App {
         };
         let sel = m.selected.min(build.cores.len() - 1);
         let groups = build.groups();
-        if !groups.contains(&self.meta_group) {
-            self.meta_group = meta::Group::All;
-        }
+        // The group the user opened for this champion, else the first one holding the selected build.
+        let opened = self.meta_group.filter(|&(c, g)| c == m.champion_id && groups.contains(&g)).map(|(_, g)| g);
+        let Some(shown) = opened.or_else(|| groups.iter().copied().find(|&g| build.cores[sel].in_group(g))) else {
+            return;
+        };
         let names = |ids: &[i64], sep: &str| ids.iter().map(|&i| s.data.item_name(i)).collect::<Vec<_>>().join(sep);
         card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -659,15 +661,15 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for g in groups {
                     let members = build.in_group(g);
-                    if ui.selectable_label(self.meta_group == g, format!("{} ({})", g.label(), members.len())).clicked() {
-                        self.meta_group = g;
+                    if ui.selectable_label(shown == g, format!("{} ({})", g.label(), members.len())).clicked() {
+                        self.meta_group = Some((m.champion_id, g));
                         if let Some(&best) = members.first().filter(|&&b| b != sel) {
                             self.request(Action::SelectBuild(best));
                         }
                     }
                 }
             });
-            for i in build.in_group(self.meta_group) {
+            for i in build.in_group(shown) {
                 let c = &build.cores[i];
                 let text = format!("{} · {} · {}", c.label(), names(&c.items.ids, " → "), c.items.stats());
                 if ui.selectable_label(i == sel, text).clicked() && i != sel {
@@ -940,7 +942,7 @@ impl App {
         changed |= ui.checkbox(&mut self.settings.meta_builds, "Use OP.GG builds (aggregated from many players' games)").changed();
         ui.label(
             RichText::new(
-                "On: champ select lists OP.GG's builds for your mode and lane, grouped AP / AD / On-hit / Crit / Tank \
+                "On: champ select lists OP.GG's builds for your mode and lane, grouped AP / AD / On-hit / Crit / Tank / Utility \
                  (from Data Dragon item stats) and sorted by win rate. The item set holds the build you select \
                  (default: highest win rate), the best build of each other group, and your best recent game; \
                  OP.GG's rune page is offered next to Riot's. Only the champion id, mode and lane are sent to \

@@ -139,28 +139,30 @@ pub enum Damage {
     None,
 }
 
-/// Ways to group builds for picking; a build can be in several groups.
+/// Ways to group builds for picking; a build can be in several groups, and every build is
+/// in at least one (AP, AD, Tank or Utility).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Group {
-    All,
     Ap,
     Ad,
     OnHit,
     Crit,
     Tank,
+    /// Neither attack nor ability power, and not a tank build (e.g. enchanter supports).
+    Utility,
 }
 
 impl Group {
-    pub const ORDER: [Group; 6] = [Group::All, Group::Ap, Group::Ad, Group::OnHit, Group::Crit, Group::Tank];
+    pub const ORDER: [Group; 6] = [Group::Ap, Group::Ad, Group::OnHit, Group::Crit, Group::Tank, Group::Utility];
 
     pub fn label(self) -> &'static str {
         match self {
-            Group::All => "All",
             Group::Ap => "AP",
             Group::Ad => "AD",
             Group::OnHit => "On-hit",
             Group::Crit => "Crit",
             Group::Tank => "Tank",
+            Group::Utility => "Utility",
         }
     }
 }
@@ -205,12 +207,12 @@ impl CoreBuild {
 
     pub fn in_group(&self, g: Group) -> bool {
         match g {
-            Group::All => true,
             Group::Ap => self.damage == Damage::Ap,
             Group::Ad => self.damage == Damage::Ad,
             Group::OnHit => self.on_hit,
             Group::Crit => self.crit,
             Group::Tank => self.tank,
+            Group::Utility => self.damage == Damage::None && !self.tank,
         }
     }
 
@@ -292,19 +294,14 @@ pub struct MetaBuild {
 }
 
 impl MetaBuild {
-    /// Groups that have at least one build. "All" comes first (it is a filter, not a build
-    /// type); the rest are ordered by their top build: win rate, then games, then `Group::ORDER`.
+    /// Groups that have at least one build, ordered by their top build: win rate, then
+    /// games, then `Group::ORDER`.
     pub fn groups(&self) -> Vec<Group> {
         // `cores` is sorted by win rate then games, so a group's first member is its top build.
         let mut groups: Vec<(Group, &Choice)> =
             Group::ORDER.into_iter().filter_map(|g| Some((g, &self.cores.iter().find(|c| c.in_group(g))?.items))).collect();
         // Stable sort: equal win rate and games keep `Group::ORDER`.
-        groups.sort_by(|(ga, a), (gb, b)| {
-            (*gb == Group::All)
-                .cmp(&(*ga == Group::All))
-                .then(b.win_rate().total_cmp(&a.win_rate()))
-                .then(b.games.cmp(&a.games))
-        });
+        groups.sort_by(|(_, a), (_, b)| b.win_rate().total_cmp(&a.win_rate()).then(b.games.cmp(&a.games)));
         groups.into_iter().map(|(g, _)| g).collect()
     }
 
@@ -475,7 +472,7 @@ mod tests {
             ]
         );
         // AD and Crit share the 60.1% top build, as do AP and On-hit at 55.2%: ties keep `Group::ORDER`.
-        assert_eq!(b.groups(), [Group::All, Group::Ad, Group::Crit, Group::Ap, Group::OnHit]);
+        assert_eq!(b.groups(), [Group::Ad, Group::Crit, Group::Ap, Group::OnHit]);
         assert_eq!(b.in_group(Group::Ad), [0, 2]);
         assert_eq!(b.in_group(Group::Ap), [1]);
         // An AP build keeps AP finishing items and drops Infinity Edge; boots are never doubled.
@@ -489,6 +486,10 @@ mod tests {
         let d = data();
         let tank = CoreBuild::classify(Choice { ids: vec![3068, 3075, 3047], ..Choice::default() }, &d);
         assert_eq!((tank.damage, tank.tank, tank.label().as_str()), (Damage::None, true, "Tank"));
+        assert!(tank.in_group(Group::Tank) && !tank.in_group(Group::Utility));
+        // No damage and not tank (Runaan's carries only tags): still listed, under Utility.
+        let utility = CoreBuild::classify(Choice { ids: vec![3085, 3006], ..Choice::default() }, &d);
+        assert!(Group::ORDER.iter().filter(|&&g| utility.in_group(g)).eq([&Group::Utility]));
         assert!(parse_build(62, ADC, KAISA, &d).unwrap_err().contains("instead of 62"));
         let sona = r#"{"data":{"summary":{"id":37},"core_items":[{"ids":[3070,3100,3040],"play":1,"win":1}]}}"#;
         assert!(parse_build(37, Query { mode: "ranked", position: "JUNGLE" }, sona, &d).unwrap_err().contains("only 1 game "));

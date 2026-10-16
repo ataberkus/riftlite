@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::ddragon::StaticData;
 use crate::lcu::LolGame;
-use crate::meta::{Group, MetaBuild};
+use crate::meta::MetaBuild;
 
 const PREFIX: &str = "riftlite_";
 
@@ -54,7 +54,7 @@ pub fn write_meta(
         blocks.push(block("Situational · OP.GG often finished items".into(), &situational));
     }
     let mut listed = vec![core];
-    for g in build.groups().into_iter().filter(|&g| g != Group::All) {
+    for g in build.groups() {
         if let Some(&best) = build.in_group(g).first().filter(|i| !listed.contains(i)) {
             listed.push(best);
             let c = &build.cores[best];
