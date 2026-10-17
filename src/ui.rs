@@ -679,8 +679,7 @@ impl App {
         let names = |ids: &[i64], sep: &str| ids.iter().map(|&i| s.data.item_name(i)).collect::<Vec<_>>().join(sep);
         card(ui, |ui| {
             ui.set_width(ui.available_width());
-            let ranking = if build.confident { " · ranked by confidence" } else { "" };
-            ui.label(RichText::new(format!("{name} · OP.GG {} · {} builds{ranking}", build.query.label(), build.cores.len())).strong());
+            ui.label(RichText::new(format!("{name} · OP.GG {} · {} builds", build.query.label(), build.cores.len())).strong());
             if !build.patch_matches(&s.data.version) {
                 ui.colored_label(LOSS, format!("OP.GG's data is for patch {}; the game is on {}.", build.patch, s.data.version));
             }
@@ -1046,22 +1045,13 @@ impl App {
             RichText::new(
                 "On: champ select lists OP.GG's builds for your mode and lane (ranked and flex: Emerald+; ARAM, URF, Nexus Blitz, \
                  Arena: all games), grouped AP / AD / On-hit / Crit / Tank / Utility (from Data Dragon item stats), each with its \
-                 win rate's 95% margin; wide margins are marked \"few games\". You also pick OP.GG's skill order, rune page and \
+                 win rate's 95% margin; wide margins are marked \"few games\". Builds are ranked by the low end of that 95% range, so a \
+                 build with few games cannot outrank a much-played one on luck. You also pick OP.GG's skill order, rune page and \
                  spells, and see your lane win rate against enemy picks. The build you pick is remembered per champion and mode \
                  (%LOCALAPPDATA%\\riftlite\\builds.json). The item set holds the picked build, OP.GG's other starts and boots, the \
                  best build of each other group, and your best recent game in this mode. Only the champion id, mode and lane are \
                  sent to lol-api-champion.op.gg. Off, or when OP.GG is unreachable or has too few games: the build from your best \
                  recent game in this mode.",
-            )
-            .color(MUTED),
-        );
-        changed |= ui
-            .checkbox(&mut self.settings.meta_sort_confident, "Rank OP.GG builds by confidence instead of raw win rate")
-            .changed();
-        ui.label(
-            RichText::new(
-                "Uses the low end of each win rate's 95% range, so a build with few games cannot outrank a much-played one on luck. \
-                 Off: highest win rate first.",
             )
             .color(MUTED),
         );

@@ -575,12 +575,11 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
                 Some(MetaState { champion_id: c, query, build, picks: Picks::default() })
             }
         };
-        let confident = shared.settings.lock().meta_sort_confident;
         let mut s = shared.snap.lock();
         s.rec_pages = pages;
         s.meta = meta;
         if let Some(m) = s.meta.as_mut() {
-            adopt_build(m, confident);
+            adopt_build(m);
         }
         sync_meta_page(&mut s);
         changed = true;
@@ -633,11 +632,9 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
     changed
 }
 
-/// Requests the pick's OP.GG builds when they are missing, takes in answers, and keeps the
-/// shown builds ranked as Settings ask.
+/// Requests the pick's OP.GG builds when they are missing and takes in answers.
 fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
     let mut changed = false;
-    let confident = shared.settings.lock().meta_sort_confident;
     let want = {
         let s = shared.snap.lock();
         // Classifying needs Data Dragon's items; until they load the panel shows "loading".
@@ -648,7 +645,7 @@ fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
     };
     if let Some((key, data)) = want.filter(|(k, _)| !auto.meta_inflight.contains(k)) {
         auto.meta_inflight.insert(key);
-        if let Err(e) = request_meta(auto, data, key, confident) {
+        if let Err(e) = request_meta(auto, data, key) {
             auto.meta_inflight.remove(&key);
             if let Some(m) = shared.snap.lock().meta.as_mut() {
                 m.build = Some(Err(e));
@@ -665,44 +662,30 @@ fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
             let mut s = shared.snap.lock();
             if let Some(m) = s.meta.as_mut().filter(|m| m.champion_id == key.0 && m.query.as_ref().ok() == Some(&key.1)) {
                 m.build = Some(r);
-                adopt_build(m, confident);
+                adopt_build(m);
                 sync_meta_page(&mut s);
                 changed = true;
             }
         }
     }
-    // The ranking setting changed while builds are shown: re-rank, keeping the picked build.
-    let mut s = shared.snap.lock();
-    if let Some(m) = s.meta.as_mut()
-        && let Some(Ok(b)) = &mut m.build
-        && b.confident != confident
-    {
-        let picked = b.cores.get(m.picks.build).map(|c| c.items.ids.clone());
-        b.sort(confident);
-        m.picks.build = picked.and_then(|ids| b.index_of(&ids)).unwrap_or(0);
-        changed = true;
-    }
     changed
 }
 
-/// A build just arrived for `m`: rank it as Settings ask and start on the build last picked
-/// for this champion and mode (else the best one) and OP.GG's most played options.
-fn adopt_build(m: &mut MetaState, confident: bool) {
-    let Some(Ok(b)) = &mut m.build else { return };
-    if b.confident != confident {
-        b.sort(confident);
-    }
+/// A build just arrived for `m`: start on the build last picked for this champion and mode
+/// (else the best one) and OP.GG's most played options.
+fn adopt_build(m: &mut MetaState) {
+    let Some(Ok(b)) = &m.build else { return };
     let build = meta::saved_build(m.champion_id, b.query.mode).and_then(|ids| b.index_of(&ids)).unwrap_or(0);
     m.picks = Picks { build, ..Picks::default() };
 }
 
-fn request_meta(auto: &mut Auto, data: Arc<StaticData>, key: (i64, Query), confident: bool) -> Result<(), String> {
+fn request_meta(auto: &mut Auto, data: Arc<StaticData>, key: (i64, Query)) -> Result<(), String> {
     let (tx, _) = auto.meta_chan.get_or_insert_with(mpsc::channel);
     let tx = tx.clone();
     std::thread::Builder::new()
         .name("riftlite-opgg".into())
         .spawn(move || {
-            let r = meta::fetch(&net::public_agent(), &data, key.0, key.1, confident);
+            let r = meta::fetch(&net::public_agent(), &data, key.0, key.1);
             let _ = tx.send((key, r));
         })
         .map(drop)
@@ -1110,7 +1093,7 @@ mod tests {
     fn lockin_waits_for_opgg_then_falls_back_after_meta_wait() {
         let q = Query { mode: "ranked", position: "ADC" };
         let json = r#"{"data":{"summary":{"id":145},"core_items":[{"ids":[6672,3124,3302],"play":500,"win":260}]}}"#;
-        let b = meta::parse_build(145, q, json, &StaticData::default(), false).expect("parses");
+        let b = meta::parse_build(145, q, json, &StaticData::default()).expect("parses");
         let early = Duration::from_secs(5);
         // Still loading before META_WAIT: keep waiting.
         assert!(lockin_meta(Some(&state(None)), 145, early).is_none());

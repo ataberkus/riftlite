@@ -153,9 +153,10 @@ impl Choice {
         margin(self.wins, self.games) >= FEW_GAMES_MARGIN
     }
 
-    /// Ranking key: the win rate, or its 95 % lower bound when `confident`.
-    fn score(&self, confident: bool) -> f64 {
-        if confident { wilson_lower(self.wins, self.games) } else { self.win_rate() }
+    /// Ranking key: the low end of the win rate's 95 % Wilson interval, so a few lucky games
+    /// cannot outrank a much-played build.
+    fn score(&self) -> f64 {
+        wilson_lower(self.wins, self.games)
     }
 
     pub fn stats(&self) -> String {
@@ -414,10 +415,8 @@ pub struct MetaBuild {
     pub query: Query,
     /// Patch OP.GG aggregated, e.g. `16.20`; empty when it did not say.
     pub patch: String,
-    /// Core builds with at least `MIN_GAMES` games, best first (see `confident`). Never empty.
+    /// Core builds with at least `MIN_GAMES` games, best `Choice::score` first. Never empty.
     pub cores: Vec<CoreBuild>,
-    /// `cores` are ranked by the 95 % lower bound of their win rate instead of the win rate.
-    pub confident: bool,
     /// Options below, most played first: the first one always, others with `MIN_GAMES`.
     pub starters: Vec<Choice>,
     pub boots: Vec<Choice>,
@@ -434,10 +433,9 @@ pub struct MetaBuild {
 }
 
 impl MetaBuild {
-    /// Re-ranks `cores` by win rate or, when `confident`, by its 95 % lower bound.
-    pub fn sort(&mut self, confident: bool) {
-        self.confident = confident;
-        self.cores.sort_by(|a, b| b.items.score(confident).total_cmp(&a.items.score(confident)).then(b.items.games.cmp(&a.items.games)));
+    /// Ranks `cores` by `Choice::score`, then games.
+    fn sort(&mut self) {
+        self.cores.sort_by(|a, b| b.items.score().total_cmp(&a.items.score()).then(b.items.games.cmp(&a.items.games)));
     }
 
     /// Groups that have at least one build, ordered by their top build (same key as `cores`),
@@ -447,8 +445,7 @@ impl MetaBuild {
         let mut groups: Vec<(Group, &Choice)> =
             Group::ORDER.into_iter().filter_map(|g| Some((g, &self.cores.iter().find(|c| c.in_group(g))?.items))).collect();
         // Stable sort: equal scores and games keep `Group::ORDER`.
-        let key = |c: &Choice| c.score(self.confident);
-        groups.sort_by(|(_, a), (_, b)| key(b).total_cmp(&key(a)).then(b.games.cmp(&a.games)));
+        groups.sort_by(|(_, a), (_, b)| b.score().total_cmp(&a.score()).then(b.games.cmp(&a.games)));
         groups.into_iter().map(|(g, _)| g).collect()
     }
 
@@ -517,7 +514,7 @@ impl MetaBuild {
 
 /// Fetches, validates and classifies the builds. Blocking (about a second); call it off the
 /// poll thread, and only once `data` holds Data Dragon's items (classification needs them).
-pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Query, confident: bool) -> Result<MetaBuild, String> {
+pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Query) -> Result<MetaBuild, String> {
     let resp = match agent.get(&query.url(champion_id)).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Err("OP.GG does not know this champion".into()),
@@ -525,7 +522,7 @@ pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Qu
         Err(e) => return Err(format!("OP.GG unreachable: {e}")),
     };
     let text = resp.into_string().map_err(|e| format!("OP.GG read: {e}"))?;
-    parse_build(champion_id, query, &text, data, confident)
+    parse_build(champion_id, query, &text, data)
 }
 
 /// Most played first; the most played option always stays, others need `MIN_GAMES`.
@@ -537,7 +534,7 @@ fn trusted<T>(mut v: Vec<T>, games: impl Fn(&T) -> u64) -> Vec<T> {
 }
 
 /// Turns OP.GG's JSON into classified builds, rejecting other champions and tiny samples.
-pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData, confident: bool) -> Result<MetaBuild, String> {
+pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData) -> Result<MetaBuild, String> {
     let changed = |why: String| format!("OP.GG's data format changed ({why}); riftlite needs an update to read it");
     let env = serde_json::from_str::<Envelope>(json).map_err(|e| changed(e.to_string()))?;
     let raw = env.data;
@@ -568,7 +565,6 @@ pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData
         query,
         patch: env.meta.version,
         cores,
-        confident,
         starters: items(raw.starter_items),
         boots: items(raw.boots),
         skills: trusted(raw.skills.into_iter().filter(|s| !s.order.is_empty()).collect(), |s| s.games),
@@ -578,7 +574,7 @@ pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData
         counters: raw.counters.into_iter().filter(|m| m.games >= MIN_GAMES).collect(),
         masteries: raw.skill_masteries,
     };
-    build.sort(confident);
+    build.sort();
     Ok(build)
 }
 
@@ -674,9 +670,9 @@ mod tests {
     const ADC: Query = Query { mode: "ranked", position: "ADC" };
 
     #[test]
-    fn kaisa_builds_split_into_ap_ad_on_hit_and_crit_sorted_by_win_rate() {
-        let b = parse_build(145, ADC, KAISA, &data(), false).expect("parses");
-        // The 40-game tank line is under MIN_GAMES; the rest is highest win rate first.
+    fn kaisa_builds_split_into_ap_ad_on_hit_and_crit_ranked_by_score() {
+        let b = parse_build(145, ADC, KAISA, &data()).expect("parses");
+        // The 40-game tank line is under MIN_GAMES; the rest is best score first.
         let order: Vec<_> = b.cores.iter().map(|c| (c.items.ids.clone(), c.label())).collect();
         assert_eq!(
             order,
@@ -686,7 +682,7 @@ mod tests {
                 (vec![6672, 3124, 3302], "AD · On-hit".to_string()),
             ]
         );
-        // AD and Crit share the 60.1% top build, as do AP and On-hit at 55.2%: ties keep `Group::ORDER`.
+        // AD and Crit share the top build, as do AP and On-hit the second: ties keep `Group::ORDER`.
         assert_eq!(b.groups(), [Group::Ad, Group::Crit, Group::Ap, Group::OnHit]);
         assert_eq!(b.in_group(Group::Ad), [0, 2]);
         assert_eq!(b.in_group(Group::Ap), [1]);
@@ -699,7 +695,7 @@ mod tests {
 
     #[test]
     fn options_keep_the_most_played_and_trusted_alternatives() {
-        let b = parse_build(145, ADC, KAISA, &data(), false).expect("parses");
+        let b = parse_build(145, ADC, KAISA, &data()).expect("parses");
         // Most played first; the 40-game start is dropped, the incomplete rune page and
         // the one-spell entry are skipped, the 60-game matchup is too small.
         assert_eq!(b.starters.iter().map(|s| s.ids.clone()).collect::<Vec<_>>(), [vec![1086, 2003, 2003], vec![1055, 2003]]);
@@ -712,16 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn confident_ranking_discounts_small_samples() {
+    fn ranking_discounts_small_samples() {
         let json = r#"{"data":{"summary":{"id":145},"core_items":[
             {"ids":[3087,3124,3115],"play":100,"win":65},
             {"ids":[6672,3124,3302],"play":10000,"win":6000}]}}"#;
-        let mut b = parse_build(145, ADC, json, &data(), false).expect("parses");
-        assert_eq!(b.cores[0].items.ids, [3087, 3124, 3115], "65% beats 60% on raw win rate");
-        assert!(b.cores[0].items.few_games() && !b.cores[1].items.few_games());
-        assert_eq!(b.groups()[0], Group::Ap);
+        let b = parse_build(145, ADC, json, &data()).expect("parses");
+        assert!(b.cores[1].items.win_rate() > b.cores[0].items.win_rate(), "65% beats 60% on raw win rate");
+        assert!(b.cores[1].items.few_games() && !b.cores[0].items.few_games());
         // 65 of 100 has a lower bound near 55%; 6,000 of 10,000 stays near 59%.
-        b.sort(true);
         assert_eq!(b.cores[0].items.ids, [6672, 3124, 3302]);
         assert_eq!(b.groups()[0], Group::Ad);
     }
@@ -735,19 +729,19 @@ mod tests {
         // No damage and not tank (Runaan's carries only tags): still listed, under Utility.
         let utility = CoreBuild::classify(Choice { ids: vec![3085, 3006], ..Choice::default() }, &d);
         assert!(Group::ORDER.iter().filter(|&&g| utility.in_group(g)).eq([&Group::Utility]));
-        assert!(parse_build(62, ADC, KAISA, &d, false).unwrap_err().contains("instead of 62"));
+        assert!(parse_build(62, ADC, KAISA, &d).unwrap_err().contains("instead of 62"));
         let sona = r#"{"data":{"summary":{"id":37},"core_items":[{"ids":[3070,3100,3040],"play":1,"win":1}]}}"#;
-        assert!(parse_build(37, Query { mode: "ranked", position: "JUNGLE" }, sona, &d, false).unwrap_err().contains("only 1 game "));
+        assert!(parse_build(37, Query { mode: "ranked", position: "JUNGLE" }, sona, &d).unwrap_err().contains("only 1 game "));
         let none = r#"{"data":{"summary":{"id":37},"core_items":[]}}"#;
-        assert!(parse_build(37, ADC, none, &d, false).unwrap_err().contains("no build"));
-        assert!(parse_build(37, ADC, r#"{"data":[]}"#, &d, false).unwrap_err().contains("format changed"));
-        assert!(parse_build(37, ADC, r#"{"data":{"champion":{"id":37}}}"#, &d, false).unwrap_err().contains("format changed"));
-        assert!(parse_build(37, ADC, "<html>", &d, false).unwrap_err().contains("format changed"));
+        assert!(parse_build(37, ADC, none, &d).unwrap_err().contains("no build"));
+        assert!(parse_build(37, ADC, r#"{"data":[]}"#, &d).unwrap_err().contains("format changed"));
+        assert!(parse_build(37, ADC, r#"{"data":{"champion":{"id":37}}}"#, &d).unwrap_err().contains("format changed"));
+        assert!(parse_build(37, ADC, "<html>", &d).unwrap_err().contains("format changed"));
     }
 
     #[test]
     fn patch_check_compares_whole_version_parts() {
-        let b = parse_build(145, ADC, KAISA, &data(), false).expect("parses");
+        let b = parse_build(145, ADC, KAISA, &data()).expect("parses");
         assert!(b.patch_matches("16.20.1"));
         assert!(!b.patch_matches("16.21.1"));
         assert!(!b.patch_matches("16.2.1"));

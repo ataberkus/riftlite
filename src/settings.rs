@@ -46,8 +46,6 @@ pub struct Settings {
     /// Fetch OP.GG's aggregated builds for the pick: written as the lock-in item set
     /// (with your best game as an extra block) and offered as a rune page.
     pub meta_builds: bool,
-    /// Rank OP.GG builds by the 95 % lower bound of their win rate instead of the win rate.
-    pub meta_sort_confident: bool,
     /// League install folder chosen by hand; empty = detect automatically.
     pub league_folder: String,
 }
@@ -65,7 +63,6 @@ impl Default for Settings {
             page_source: PageSource::Riot,
             auto_item_set: true,
             meta_builds: true,
-            meta_sort_confident: false,
             league_folder: String::new(),
         }
     }
