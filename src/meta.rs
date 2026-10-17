@@ -432,6 +432,9 @@ pub struct MetaBuild {
     masteries: Vec<Mastery>,
 }
 
+/// Most builds listed per group.
+pub const GROUP_LIMIT: usize = 3;
+
 impl MetaBuild {
     /// Ranks `cores` by `Choice::score`, then games.
     fn sort(&mut self) {
@@ -449,9 +452,9 @@ impl MetaBuild {
         groups.into_iter().map(|(g, _)| g).collect()
     }
 
-    /// Indices into `cores` of a group's builds, best first.
+    /// Indices into `cores` of a group's best `GROUP_LIMIT` builds, best first.
     pub fn in_group(&self, g: Group) -> Vec<usize> {
-        (0..self.cores.len()).filter(|&i| self.cores[i].in_group(g)).collect()
+        (0..self.cores.len()).filter(|&i| self.cores[i].in_group(g)).take(GROUP_LIMIT).collect()
     }
 
     /// Index of the core build with exactly these items.
@@ -691,6 +694,18 @@ mod tests {
         assert_eq!(b.full_build(1, &data()), [3087, 3124, 3115, 3006, 3089]);
         // Nashor's Tooth (AP) stays out of the AD build; Phantom Dancer fits it.
         assert_eq!(b.full_build(2, &data()), [6672, 3124, 3302, 3006, 3031, 3046]);
+    }
+
+    #[test]
+    fn groups_list_at_most_three_best_builds() {
+        let extra = r#"{"ids":[3124,6672,3302],"play":9000,"win":4700},{"ids":[3302,3124,6672],"play":8000,"win":4300},{"ids":[3031,3032,3085],"play":7000,"win":3600},"#;
+        let json = KAISA.replacen(r#""core_items":["#, &format!(r#""core_items":[{extra}"#), 1);
+        let b = parse_build(145, ADC, &json, &data()).expect("parses");
+        let ad = b.in_group(Group::Ad);
+        assert_eq!(b.cores.iter().filter(|c| c.in_group(Group::Ad)).count(), 5);
+        assert_eq!(ad.len(), GROUP_LIMIT);
+        // The best three, in rank order.
+        assert!(ad.windows(2).all(|w| w[0] < w[1]) && ad[0] == 0);
     }
 
     #[test]
