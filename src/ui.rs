@@ -120,6 +120,8 @@ pub struct App {
     autostart: bool,
     tab: Tab,
     seen_phase: String,
+    /// Main window title, used to find its HWND when a match starts.
+    title: &'static str,
     notice: Option<(String, bool, Instant)>,
     seen_action: u64,
     start_minimized: bool,
@@ -152,6 +154,7 @@ impl App {
             autostart: settings::autostart_enabled(),
             tab: Tab::Home,
             seen_phase: String::new(),
+            title,
             notice: None,
             seen_action: 0,
             start_minimized,
@@ -278,6 +281,11 @@ impl eframe::App for App {
                         "EndOfGame" if matches!(self.tab, Tab::Live | Tab::ChampSelect) => self.tab = Tab::PostGame,
                         _ => {}
                     }
+                }
+                // Champ select and match start. Not from "" (riftlite or the client just
+                // started), so an autostart during champ select or a game keeps its focus.
+                if matches!(snap.phase.as_str(), "ChampSelect" | "InProgress") && !self.seen_phase.is_empty() {
+                    crate::tray::raise_main(self.title);
                 }
                 self.seen_phase = snap.phase.clone();
             }

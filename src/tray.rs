@@ -9,14 +9,16 @@ use eframe::egui;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_SHARED,
-    LoadIconW, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINEVENT_OUTOFCONTEXT,
-    WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    AppendMenuW, BringWindowToTop, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HWND_MESSAGE,
+    GetSystemMetrics, IDI_APPLICATION, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXSMICON, SM_CYSMICON,
+    IsIconic, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SW_SHOW,
+    SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP,
+    WINEVENT_OUTOFCONTEXT, WNDCLASSW,
 };
 
 use crate::worker::Shared;
@@ -173,15 +175,38 @@ fn toggle_edit(c: &Ctx) {
     crate::ui::set_overlay_edit(&c.egui, &c.shared, on);
 }
 
-fn open_main(c: &Ctx) {
-    if let Some(h) = crate::win::own_window(c.main_title) {
-        // A click on the tray icon grants this process the right to take the foreground.
-        unsafe {
+/// Restores the main window if minimized or hidden and makes it the foreground window.
+/// Returns whether it ended up in the foreground.
+pub fn raise_main(title: &str) -> bool {
+    let Some(h) = crate::win::own_window(title) else { return false };
+    unsafe {
+        if IsIconic(h) != 0 {
+            // Also returns a window minimized from maximized to maximized.
             ShowWindow(h, SW_RESTORE);
-            SetForegroundWindow(h);
+        } else if IsWindowVisible(h) == 0 {
+            ShowWindow(h, SW_SHOW);
         }
-        c.egui.request_repaint();
+        if SetForegroundWindow(h) != 0 && GetForegroundWindow() == h {
+            return true;
+        }
+        // Foreground lock: a background process may only flash its taskbar button.
+        // Sharing input state with the current foreground thread lifts that restriction.
+        let fg_thread = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
+        let me = GetCurrentThreadId();
+        let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, 1) != 0;
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+        if attached {
+            AttachThreadInput(me, fg_thread, 0);
+        }
+        GetForegroundWindow() == h
     }
+}
+
+fn open_main(c: &Ctx) {
+    // A click on the tray icon already grants this process the right to take the foreground.
+    raise_main(c.main_title);
+    c.egui.request_repaint();
 }
 
 unsafe fn menu(hwnd: HWND, c: &Ctx) {
