@@ -2,7 +2,9 @@
 //! `<League>/Config/Champions/<ChampionId>/Recommended/`, the same location and
 //! schema the client reads for recommended sets. Contents come from the player's
 //! own match history (local LCU data) and, optionally, OP.GG's aggregated builds
-//! (`meta.rs`). Every file riftlite writes starts with `riftlite_`.
+//! (`meta.rs`). Every file riftlite writes starts with `riftlite_`. Writing a set also deletes
+//! Blitz's leftover sets (`Config/Global/Recommended/!!!blitz-<n>.json`, titled "Blitz: …"),
+//! which the client would otherwise list next to riftlite's.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +15,8 @@ use crate::lcu::LolGame;
 use crate::meta::{self, MetaBuild, Picks};
 
 const PREFIX: &str = "riftlite_";
+/// File-name prefix of Blitz's sets in `Config/Global/Recommended/` (`!!!blitz-0.json`, …).
+const BLITZ_PREFIX: &str = "!!!blitz-";
 
 pub fn write_from_game(league_root: &Path, data: &StaticData, game: &LolGame) -> Result<PathBuf, String> {
     let mut blocks = vec![personal_block(game).ok_or("that game has no completed items")?];
@@ -140,6 +144,7 @@ fn write_set(
     blocks: Vec<Value>,
 ) -> Result<PathBuf, String> {
     let champ = data.champions.get(&champion_id).ok_or("unknown champion (Data Dragon not loaded?)")?;
+    remove_blitz_sets(league_root)?;
     let set = item_set_json(champion_id, title, maps, blocks);
     let dir = league_root.join("Config").join("Champions").join(&champ.id).join("Recommended");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -149,7 +154,22 @@ fn write_set(
     Ok(path)
 }
 
-/// Deletes only files riftlite created; other tools' sets are left alone.
+/// Deletes Blitz's global sets; the user's own and other tools' sets are left alone.
+fn remove_blitz_sets(league_root: &Path) -> Result<(), String> {
+    let dir = league_root.join("Config").join("Global").join("Recommended");
+    let Ok(files) = std::fs::read_dir(&dir) else { return Ok(()) };
+    for f in files.flatten() {
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(BLITZ_PREFIX) && name.ends_with(".json") {
+            std::fs::remove_file(f.path()).map_err(|e| format!("{}: {e}", f.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes only files riftlite created; the user's own and other tools' sets are left alone
+/// (Blitz's are already gone once riftlite has written a set).
 pub fn clear_all(league_root: &Path) -> Result<usize, String> {
     let champions = league_root.join("Config").join("Champions");
     let Ok(rd) = std::fs::read_dir(&champions) else { return Ok(0) };
