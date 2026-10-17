@@ -12,9 +12,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_NOREPEAT,
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, EnumWindows, GetCursorPos,
-    GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HWND_MESSAGE, IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING,
-    MSG, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    GetMessageW, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON,
+    LR_SHARED, LoadIconW, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
+    SM_CYSMICON, SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
+    WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use crate::worker::Shared;
@@ -106,7 +107,11 @@ unsafe fn add_icon(hwnd: HWND) {
         let mut nid = icon_data(hwnd);
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        // Resource 1 is riftlite's icon, embedded by build.rs; LR_SHARED so re-adding after an
+        // Explorer restart does not leak a handle.
+        let size = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        let own = LoadImageW(GetModuleHandleW(std::ptr::null()), 1 as _, IMAGE_ICON, size.0, size.1, LR_SHARED);
+        nid.hIcon = if own.is_null() { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) } else { own };
         for (d, s) in nid.szTip.iter_mut().zip("riftlite · Ctrl+Shift+O toggles the overlay".encode_utf16()) {
             *d = s;
         }
