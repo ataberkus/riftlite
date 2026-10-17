@@ -184,9 +184,10 @@ impl App {
     /// How the overlay viewport should be declared now; `None`: not shown.
     fn overlay_decl(&mut self, ctx: &egui::Context, s: &Snapshot) -> Option<OverlayDecl> {
         let edit = self.shared.overlay_edit.load(Ordering::Relaxed);
-        let in_game = overlay_game(&s.live).is_some() || loading_screen(s);
-        // Edit mode also shows it outside a game (with a sample game), so Settings → Overlay
-        // can open it.
+        let in_game = (!self.settings.overlay_focus_only || self.shared.game_focused.load(Ordering::Relaxed))
+            && (overlay_game(&s.live).is_some() || loading_screen(s));
+        // Edit mode also shows it outside a game (with a sample game) and while the main
+        // window has the focus, so Settings → Overlay can open it.
         if !self.settings.overlay_enabled || self.shared.overlay_hidden.load(Ordering::Relaxed) || !(edit || in_game) {
             return None;
         }

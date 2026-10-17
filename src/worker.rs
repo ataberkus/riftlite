@@ -192,6 +192,8 @@ pub struct Shared {
     /// The overlay changed its layout in `settings` during edit mode; the main window
     /// copies it into its own settings and saves them.
     pub overlay_layout_dirty: AtomicBool,
+    /// The League game window is the foreground window; maintained by the tray thread's WinEvent hook.
+    pub game_focused: AtomicBool,
     pub settings: Mutex<Settings>,
     actions: Mutex<Vec<Action>>,
 }
@@ -219,6 +221,7 @@ pub fn spawn(ctx: eframe::egui::Context, settings: Settings) -> Arc<Shared> {
         overlay_hidden: AtomicBool::new(false),
         overlay_edit: AtomicBool::new(false),
         overlay_layout_dirty: AtomicBool::new(false),
+        game_focused: AtomicBool::new(false),
         settings: Mutex::new(settings),
         actions: Mutex::new(Vec::new()),
     });

@@ -97,6 +97,8 @@ pub struct Settings {
     legacy_margin_right: Option<f32>,
     #[serde(rename = "overlay_margin_top", skip_serializing)]
     legacy_margin_top: Option<f32>,
+    /// Show the overlay only while the League game window is the foreground window.
+    pub overlay_focus_only: bool,
     pub switch_tabs_automatically: bool,
     /// Accept the matchmaking ready check automatically (unless you already answered it).
     pub auto_accept: bool,
@@ -125,6 +127,7 @@ impl Default for Settings {
             overlay_sections: OverlaySections::default(),
             legacy_margin_right: None,
             legacy_margin_top: None,
+            overlay_focus_only: true,
             switch_tabs_automatically: true,
             auto_accept: false,
             auto_runes: true,

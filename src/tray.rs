@@ -1,19 +1,22 @@
-//! Notification-area icon and the global overlay hotkeys (Ctrl+Shift+O, Ctrl+Shift+E),
-//! all owned by one thread with a message-only window. Plain Win32; no hooks.
+//! Notification-area icon, the global overlay hotkeys (Ctrl+Shift+O, Ctrl+Shift+E) and
+//! foreground tracking, all owned by one thread with a message-only window.
+//! Plain Win32; the WinEvent hook is out-of-context (nothing is injected).
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use eframe::egui;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetSystemMetrics, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_SHARED, LoadIconW, LoadImageW, MF_SEPARATOR, MF_STRING,
-    MSG, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SW_RESTORE, SetForegroundWindow, ShowWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, HWND_MESSAGE, IDI_APPLICATION, IMAGE_ICON, LR_SHARED,
+    LoadIconW, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
+    SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINEVENT_OUTOFCONTEXT,
+    WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use crate::worker::Shared;
@@ -93,6 +96,17 @@ pub fn spawn(egui: egui::Context, shared: Arc<Shared>, main_title: &'static str)
             add_icon(hwnd);
             let hotkey = |id, key: char| RegisterHotKey(hwnd, id, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, key as u32) != 0;
             let _ = tx.send(Hotkeys { overlay: hotkey(HOTKEY_OVERLAY, 'O'), edit: hotkey(HOTKEY_EDIT, 'E') });
+            // Out-of-context callbacks arrive through this thread's message loop.
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                std::ptr::null_mut(),
+                Some(on_foreground),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            foreground_changed(GetForegroundWindow());
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                 DispatchMessageW(&msg);
@@ -125,6 +139,26 @@ unsafe fn add_icon(hwnd: HWND) {
         }
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
+}
+
+/// The overlay is shown only while the League game window has the foreground. Clicking
+/// the overlay in edit mode activates it; that keeps the previous state so the overlay
+/// stays up and is still there after edit mode ends.
+fn foreground_changed(hwnd: HWND) {
+    let Some(c) = CTX.get() else { return };
+    if !hwnd.is_null() && crate::win::own_window(crate::ui::OVERLAY_TITLE) == Some(hwnd) {
+        return;
+    }
+    let focused = crate::win::is_league_game(hwnd);
+    if c.shared.game_focused.swap(focused, Ordering::Relaxed) != focused {
+        // Same path as the hotkey: the main pass (re)declares the overlay viewport.
+        c.egui.request_repaint();
+        c.egui.request_repaint_of(crate::ui::overlay_id());
+    }
+}
+
+unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, hwnd: HWND, _: i32, _: i32, _: u32, _: u32) {
+    foreground_changed(hwnd);
 }
 
 fn toggle_overlay(c: &Ctx) {

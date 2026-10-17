@@ -82,6 +82,12 @@ impl App {
                      Nothing is injected into the game; it is visible when League runs in Borderless or Windowed mode.",
                 ),
             );
+            changed |= toggle(
+                ui,
+                &mut self.settings.overlay_focus_only,
+                "Only while the game window is focused",
+                Some("Off: the overlay stays on top of every window while a game is running (useful for testing)."),
+            );
             if let Some(h) = self.hotkeys {
                 if h.overlay {
                     void_msg(ui, true, "Ctrl+Shift+O hides/shows it; the tray icon menu does the same.");

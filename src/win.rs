@@ -125,6 +125,19 @@ pub fn command_line(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(chars))
 }
 
+/// The window belongs to the League game process (`League of Legends.exe`).
+pub fn is_league_game(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    pid != 0
+        && image_path(pid)
+            .and_then(|p| p.file_name().map(|n| n.eq_ignore_ascii_case("League of Legends.exe")))
+            .unwrap_or(false)
+}
+
 /// This process's top-level window with exactly `title`, so a folder or browser tab
 /// with the same name is never matched.
 pub fn own_window(title: &str) -> Option<HWND> {
