@@ -213,19 +213,29 @@ impl Lcu {
 
     /// `Ok(None)` when not in champ select (the client answers 404).
     pub fn champ_select(&self) -> Result<Option<ChampSelect>, LcuError> {
-        match self.get("/lol-champ-select/v1/session") {
-            Ok(v) => Ok(Some(parse_champ_select(&v))),
-            Err(LcuError::Status(404)) => Ok(None),
-            Err(e) => Err(e),
+        let mut cs = match self.get("/lol-champ-select/v1/session") {
+            Ok(v) => parse_champ_select(&v),
+            Err(LcuError::Status(404)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if cs.picking_card() {
+            // Card-select ARAM (Mayhem…): the offered cards are not in the session. The
+            // client answers 404 once the cards are gone.
+            cs.card_choices =
+                self.get("/lol-lobby-team-builder/champ-select/v1/subset-champion-list").map(|v| parse_champion_ids(&v)).unwrap_or_default();
         }
+        Ok(Some(cs))
+    }
+
+    /// Locks `champion_id` into the local player's pick action, as clicking a champion card does.
+    pub fn pick_champion(&self, action_id: i64, champion_id: i64) -> Result<(), LcuError> {
+        let body = serde_json::json!({"championId": champion_id, "completed": true});
+        self.send("PATCH", &format!("/lol-champ-select/v1/session/actions/{action_id}"), Some(&body)).map(drop)
     }
 
     /// Champions the local player may pick right now (owned, not banned).
     pub fn pickable_champions(&self) -> Vec<i64> {
-        self.get("/lol-champ-select/v1/pickable-champion-ids")
-            .ok()
-            .and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_i64).collect()))
-            .unwrap_or_default()
+        self.get("/lol-champ-select/v1/pickable-champion-ids").map(|v| parse_champion_ids(&v)).unwrap_or_default()
     }
 
     /// Riot's own rune + summoner spell recommendations (the client's "recommended" pages).
@@ -692,6 +702,14 @@ pub struct ChampSelect {
     pub my_spells: [i64; 2],
     pub bench_enabled: bool,
     pub bench: Vec<i64>,
+    /// `allowSubsetChampionPicks`: ARAM card select, where the player picks one of a few offered
+    /// champions during `BAN_PICK` (ARAM Mayhem and other ARAM queues with champion cards).
+    pub subset_picks: bool,
+    /// The offered champion cards (`/lol-lobby-team-builder/champ-select/v1/subset-champion-list`),
+    /// fetched only while `picking_card()`.
+    pub card_choices: Vec<i64>,
+    /// The local player's pick action that is not completed yet; picking a card completes it.
+    pub my_pick_action: Option<i64>,
 }
 
 impl ChampSelect {
@@ -702,6 +720,15 @@ impl ChampSelect {
     pub fn my_champion(&self) -> Option<i64> {
         self.me().map(|p| p.champion_id).filter(|&c| c > 0)
     }
+
+    /// The client shows its "Pick your champion" cards.
+    pub fn picking_card(&self) -> bool {
+        self.subset_picks && self.phase == "BAN_PICK" && !self.locked
+    }
+}
+
+fn parse_champion_ids(v: &Value) -> Vec<i64> {
+    v.as_array().into_iter().flatten().filter_map(Value::as_i64).filter(|&c| c > 0).collect()
 }
 
 fn parse_champ_select(v: &Value) -> ChampSelect {
@@ -734,9 +761,14 @@ fn parse_champ_select(v: &Value) -> ChampSelect {
     let my_picks: Vec<&&Value> = actions.iter().filter(|a| a["type"] == "pick" && a["actorCellId"].as_i64() == me).collect();
     let my_team = team("myTeam");
     let phase = v["timer"]["phase"].as_str().unwrap_or("").to_string();
+    let subset_picks = v["allowSubsetChampionPicks"].as_bool().unwrap_or(false);
     let mine = my_team.iter().find(|p| p.is_me);
+    // Plain ARAM has no pick actions and assigns the champion; card-select ARAM assigns
+    // nothing final during BAN_PICK until the player's pick action completes.
+    let assigned = my_picks.is_empty() && !(subset_picks && phase == "BAN_PICK");
     let locked = mine.is_some_and(|p| p.picked)
-        && (phase == "FINALIZATION" || my_picks.is_empty() || my_picks.iter().any(|a| a["completed"] == true));
+        && (phase == "FINALIZATION" || assigned || my_picks.iter().any(|a| a["completed"] == true));
+    let my_pick_action = my_picks.iter().find(|a| a["completed"] != true).and_then(|a| a["id"].as_i64());
     let mine_raw = v["myTeam"].as_array().into_iter().flatten().find(|p| p["cellId"].as_i64() == me);
     let spell = |k: &str| mine_raw.and_then(|p| p[k].as_i64()).unwrap_or(0);
     ChampSelect {
@@ -747,6 +779,9 @@ fn parse_champ_select(v: &Value) -> ChampSelect {
         my_spells: [spell("spell1Id"), spell("spell2Id")],
         bench_enabled: v["benchEnabled"].as_bool().unwrap_or(false),
         bench: v["benchChampions"].as_array().into_iter().flatten().filter_map(|b| b["championId"].as_i64()).collect(),
+        subset_picks,
+        card_choices: Vec::new(),
+        my_pick_action,
         their_team: team("theirTeam"),
         my_team,
         bans,
@@ -1085,6 +1120,33 @@ mod tests {
         assert!(aram.locked);
         assert_eq!((aram.my_spells, aram.bench.as_slice()), ([4, 14], &[99][..]));
         assert!(!parse_champ_select(&session(serde_json::json!([]), "BAN_PICK", 0)).locked);
+    }
+
+    #[test]
+    fn aram_card_select_waits_for_the_picked_card() {
+        // Shape from the client's card-select UI: `allowSubsetChampionPicks` with an open pick
+        // action in BAN_PICK; clicking a card PATCHes that action with `completed: true`.
+        let session = |phase: &str, champ: i64, completed: Option<bool>| {
+            let actions = completed.map_or(serde_json::json!([]), |c| {
+                serde_json::json!([[{"id": 7, "type": "pick", "actorCellId": 2, "completed": c, "championId": champ}]])
+            });
+            parse_champ_select(&serde_json::json!({
+                "id": "s2", "queueId": 2400, "localPlayerCellId": 2, "timer": {"phase": phase}, "actions": actions,
+                "allowSubsetChampionPicks": true, "benchEnabled": true, "benchChampions": [],
+                "myTeam": [{"cellId": 2, "championId": champ, "championPickIntent": 0, "puuid": "me"}]
+            }))
+        };
+        let choosing = session("BAN_PICK", 0, Some(false));
+        assert!(choosing.picking_card() && !choosing.locked);
+        assert_eq!(choosing.my_pick_action, Some(7));
+        let shown = session("BAN_PICK", 360, Some(false));
+        assert!(!shown.locked && shown.picking_card(), "a champion shown before the pick completes is no lock");
+        assert!(!session("BAN_PICK", 360, None).locked, "card select without pick actions does not assign yet");
+        let picked = session("BAN_PICK", 360, Some(true));
+        assert!(picked.locked && !picked.picking_card());
+        assert_eq!(picked.my_pick_action, None);
+        assert!(session("FINALIZATION", 360, None).locked);
+        assert_eq!(parse_champion_ids(&serde_json::json!([360, 17, 0])), vec![360, 17]);
     }
 
     #[test]

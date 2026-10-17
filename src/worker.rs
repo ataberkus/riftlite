@@ -52,6 +52,8 @@ pub enum Action {
     /// Apply `rec_pages[i]`'s summoner spells.
     ApplySpells(usize),
     BenchSwap(i64),
+    /// Card-select ARAM: pick one of the offered champion cards.
+    PickCard(i64),
     MatchDetail(u64),
     MoreHistory,
     /// `Name#TAG`
@@ -897,6 +899,11 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             let name = shared.snap.lock().data.champion_name(champ);
             lcu.bench_swap(champ).map(|_| format!("Swapped to {name}")).map_err(|e| format!("Bench swap: {e}"))
         }
+        Action::PickCard(champ) => with_champ_select(shared, |cs| {
+            let name = shared.snap.lock().data.champion_name(champ);
+            let action = cs.my_pick_action.filter(|_| cs.picking_card()).ok_or("no champion pick is open")?;
+            lcu.pick_champion(action, champ).map(|_| format!("Picked {name}")).map_err(|e| format!("Pick {name}: {e}"))
+        }),
         Action::MatchDetail(id) => {
             let me = shared.snap.lock().summoner.as_ref().map(|s| s.puuid.clone()).unwrap_or_default();
             let r = lcu.match_detail(id).map(|d| d.with_me(&me)).map_err(|e| e.to_string());

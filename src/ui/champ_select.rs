@@ -1,4 +1,4 @@
-//! Champ select: teams, bans, ARAM bench, OP.GG builds, Riot's
+//! Champ select: teams, bans, ARAM cards and bench, OP.GG builds, Riot's
 //! recommended pages, automation log, your record on the pick and suggestions.
 
 use eframe::egui::{Align, Align2, Color32, Frame, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
@@ -17,6 +17,7 @@ use crate::itemset;
 /// The champ select step in words; the LCU's `timer.phase` is an enum like `BAN_PICK`.
 pub(super) fn cs_phase_label(cs: &ChampSelect) -> &str {
     match cs.phase.as_str() {
+        _ if cs.picking_card() => "Pick a champion",
         "" => "…",
         "PLANNING" => "Declare intent",
         "BAN_PICK" => "Picks and bans",
@@ -55,7 +56,7 @@ fn option_stats(ui: &mut Ui, stats: &str, few: bool) {
     });
 }
 
-/// A clickable champion tile (bench, suggestions) with your record on it.
+/// A clickable champion tile (ARAM cards, bench, suggestions) with your record on it.
 fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>) -> eframe::egui::Response {
     let bg = ui.painter().add(eframe::egui::Shape::Noop);
     let inner = Frame::new().inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
@@ -200,6 +201,23 @@ impl App {
         }
         let history = s.lol_history.as_deref().unwrap_or(&[]);
         let record = |c: i64| averages(history.iter().filter(|g| g.champion_id == c));
+        if cs.picking_card() {
+            section(ui, "Pick a champion");
+            if cs.card_choices.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add(eframe::egui::Spinner::new().size(14.0).color(ACCENT));
+                    note(ui, "Waiting for the client's champion cards…");
+                });
+            }
+            tiles(ui, |ui| {
+                for &c in &cs.card_choices {
+                    let resp = pick_tile(ui, &g, c, record(c).as_ref());
+                    if resp.on_hover_text("Pick this champion (your record on it from recent games)").clicked() {
+                        self.request(Action::PickCard(c));
+                    }
+                }
+            });
+        }
 
         if cs.bench_enabled {
             section(ui, "Bench");
