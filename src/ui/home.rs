@@ -3,11 +3,12 @@
 
 use eframe::egui::{Align, Color32, Layout, RichText, Ui, vec2};
 
-use super::stats::{averages, cs_per_min, date, no_data_hint, title};
+use super::stats::{Avg, averages, cs_per_min, date, next_division, no_data_hint, now_ms, streak, title};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
-use crate::lcu::{LolGame, Mastery, RankedQueue, TftGame};
+use crate::lcu::{self, LolGame, Mastery, RankedQueue, TftGame};
+use crate::lp;
 use crate::riot::{self, Product};
 use crate::worker::{Action, LcuStatus, Snapshot};
 
@@ -172,6 +173,15 @@ impl App {
                     if let Some(q) = s.ranked.iter().find(|q| q.queue == "RANKED_SOLO_5x5" && q.is_ranked()) {
                         pill(ui, format!("Solo/Duo {}", q.rank()), tier_color(&q.tier));
                     }
+                    if let Some(h) = s.honor_level {
+                        pill(ui, format!("Honor {h}"), CYAN);
+                    }
+                    if let Some(w) = s.wallet {
+                        let n = |v: i64| crate::meta::thousands(v.max(0) as u64);
+                        pill(ui, format!("{} BE", n(w.blue_essence)), BODY);
+                        pill(ui, format!("{} OE", n(w.orange_essence)), SOON);
+                        pill(ui, format!("{} RP", n(w.rp)), ACCENT_TEXT);
+                    }
                 });
             });
         });
@@ -185,6 +195,7 @@ impl App {
                 });
             }
         });
+        ranked_progress(ui, s);
         let lol = s.lol_history.as_deref().unwrap_or(&[]);
         if !lol.is_empty() {
             card(ui, |ui| lol_summary(ui, &g, lol));
@@ -269,6 +280,72 @@ impl App {
 }
 
 pub(super) fn void<T>(_: T) {}
+
+/// Ranked Solo/Duo and Flex: the current streak, wins to the next division from the LP log,
+/// and this session's results.
+fn ranked_progress(ui: &mut Ui, s: &Snapshot) {
+    let history = s.lol_history.as_deref().unwrap_or(&[]);
+    let rows: Vec<(&RankedQueue, Option<(bool, usize)>)> = [("RANKED_SOLO_5x5", 420), ("RANKED_FLEX_SR", 440)]
+        .into_iter()
+        .filter_map(|(name, id)| {
+            let q = s.ranked.iter().find(|q| q.queue == name && q.is_ranked())?;
+            Some((q, streak(history.iter().filter(|g| g.queue_id == id))))
+        })
+        .collect();
+    let session = lp::session(&s.lp_log, now_ms());
+    if rows.is_empty() && session.is_empty() {
+        return;
+    }
+    card(ui, |ui| {
+        card_head(ui, "Ranked progress", |_| {});
+        for (q, st) in rows {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized([120.0, 20.0], eframe::egui::Label::new(RichText::new(q.label()).font(semibold(12.5)).color(TEXT)));
+                match st {
+                    Some((won, n)) if n >= 2 => void(pill(ui, format!("{n}-{} streak", if won { "win" } else { "loss" }), result_color(won))),
+                    Some((won, _)) => void(pill(ui, if won { "won last game" } else { "lost last game" }, MUTED)),
+                    None => {}
+                }
+                let Some(next) = next_division(&q.tier, &q.division) else { return };
+                match lp::avg_gain(&s.lp_log, &q.queue) {
+                    Some((avg, n)) => {
+                        let wins = (((100 - q.lp).max(1) as f64) / avg).ceil() as i64;
+                        ui.label(RichText::new(format!("≈{wins} win{} to {next}", if wins == 1 { "" } else { "s" })).color(BODY));
+                        ui.label(RichText::new(format!("at +{avg:.0} LP per win (your last {n} recorded)")).size(11.5).color(MUTED));
+                    }
+                    None => void(ui.label(RichText::new(format!("{} LP to {next}", 100 - q.lp)).color(BODY))),
+                }
+            });
+        }
+        if !session.is_empty() {
+            ui.add_space(4.0);
+            session_line(ui, session);
+        }
+        ui.add_space(2.0);
+        small_note(ui, "Streaks from match history (remakes skipped). LP per win from the LP riftlite saw after your ranked games; the client keeps no LP history.");
+    });
+}
+
+/// This play session's ranked results per queue, from the LP log.
+pub(super) fn session_line(ui: &mut Ui, session: &[lp::LpEntry]) {
+    let mut queues: Vec<&str> = session.iter().map(|e| e.queue.as_str()).collect();
+    queues.sort_unstable();
+    queues.dedup();
+    for q in queues {
+        let games: Vec<_> = session.iter().filter(|e| e.queue == q).collect();
+        let wins = games.iter().filter(|e| e.win).count();
+        let net: i64 = games.iter().map(|e| e.delta).sum();
+        ui.horizontal_wrapped(|ui| {
+            overline(ui, &format!("This session · {}", lcu::ranked_label(q)));
+            ui.label(RichText::new(format!("{wins}W {}L", games.len() - wins)).font(semibold(12.5)).color(TEXT));
+            ui.label(RichText::new(format!("{}{net} LP", if net >= 0 { "+" } else { "" })).font(semibold(12.5)).color(result_color(net >= 0)));
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for e in &games {
+                pill(ui, format!("{}{}", if e.delta >= 0 { "+" } else { "" }, e.delta), result_color(e.win));
+            }
+        });
+    }
+}
 
 /// A rounded square badge with the product's initials.
 fn product_badge(ui: &mut Ui, p: Product) {
@@ -418,6 +495,30 @@ pub(super) fn lol_summary(ui: &mut Ui, g: &Gfx, games: &[LolGame]) {
             });
         }
     });
+    let positions: Vec<(&str, Avg)> = ["Top", "Jungle", "Mid", "Bot", "Support"]
+        .into_iter()
+        .filter_map(|p| Some((p, averages(games.iter().filter(|g| g.position == p))?)))
+        .collect();
+    if !positions.is_empty() {
+        ui.add_space(4.0);
+        overline(ui, "By position");
+        tiles(ui, |ui| {
+            for (p, a) in &positions {
+                inset_frame().show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new(*p).font(semibold(12.5)).color(TEXT));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(RichText::new(format!("{:.0}%", a.win_rate() * 100.0)).font(semibold(11.5)).color(wr_color(a.win_rate())));
+                            ui.label(RichText::new(format!("{}G · KDA {:.1}", a.n, a.kda())).size(11.5).color(MUTED));
+                        });
+                    });
+                });
+            }
+        });
+        small_note(ui, "Summoner's Rift games only; the position is Riot's guess from where you played (match timeline) and is often wrong for roaming or lane swaps.");
+    }
 }
 
 /// Recent TFT form: average placement, top 4s, firsts and a placement strip.

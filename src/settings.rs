@@ -46,6 +46,12 @@ pub struct OverlaySections {
     pub objectives: bool,
     /// Dead enemies with respawn timers.
     pub dead_enemies: bool,
+    /// Enemy summoner spells and keystones (which spells, not their cooldowns).
+    pub enemy_spells: bool,
+    /// The last few kills, objectives and structures.
+    pub events: bool,
+    /// Finished items enemies bought in the last minute.
+    pub enemy_items: bool,
     /// Enemy ranks during loading and the first minute and a half.
     pub scouts: bool,
     /// ARAM Mayhem: where the augment tiers come from (or why they are missing).
@@ -62,6 +68,9 @@ impl Default for OverlaySections {
             skill_hint: true,
             objectives: true,
             dead_enemies: true,
+            enemy_spells: false,
+            events: false,
+            enemy_items: false,
             scouts: true,
             augment_line: true,
         }
@@ -70,7 +79,7 @@ impl Default for OverlaySections {
 
 impl OverlaySections {
     /// Short label and flag of every section, in drawing order.
-    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 9] {
+    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 12] {
         [
             ("Clock", &mut self.clock),
             ("KDA / CS", &mut self.kda),
@@ -79,6 +88,9 @@ impl OverlaySections {
             ("Skill hint", &mut self.skill_hint),
             ("Objectives", &mut self.objectives),
             ("Dead enemies", &mut self.dead_enemies),
+            ("Enemy spells", &mut self.enemy_spells),
+            ("Recent events", &mut self.events),
+            ("Enemy items", &mut self.enemy_items),
             ("Enemy ranks", &mut self.scouts),
             ("Augment source", &mut self.augment_line),
         ]

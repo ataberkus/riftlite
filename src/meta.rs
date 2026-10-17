@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ddragon::StaticData;
 
@@ -462,6 +462,28 @@ impl MetaBuild {
         self.cores.iter().position(|c| c.items.ids == ids)
     }
 
+    /// Indices of remembered picks in this build's lists; one no longer offered falls back to
+    /// the default (first) option.
+    pub fn picks_of(&self, saved: &SavedPicks) -> Picks {
+        let find = |found: Option<usize>| found.unwrap_or(0);
+        Picks {
+            build: find(self.index_of(&saved.build)),
+            runes: find(self.runes.iter().position(|r| r.perks().as_deref() == Some(saved.runes.as_slice()))),
+            spells: find(self.spells.iter().position(|s| s.ids == saved.spells)),
+            skills: find(self.skills.iter().position(|s| s.order == saved.skills)),
+        }
+    }
+
+    /// The content of `picks`, to remember.
+    pub fn saved(&self, picks: Picks) -> SavedPicks {
+        SavedPicks {
+            build: self.cores.get(picks.build).map(|c| c.items.ids.clone()).unwrap_or_default(),
+            runes: self.runes.get(picks.runes).and_then(Runes::perks).unwrap_or_default(),
+            spells: self.spells.get(picks.spells).map(|s| s.ids.clone()).unwrap_or_default(),
+            skills: self.skills.get(picks.skills).map(|s| s.order.clone()).unwrap_or_default(),
+        }
+    }
+
     /// Most played boots.
     pub fn boots(&self) -> Option<&Choice> {
         self.boots.first()
@@ -585,20 +607,50 @@ fn choices_path() -> PathBuf {
     crate::settings::local_dir().join("builds.json")
 }
 
-/// `"<championId>:<mode>"` → core item ids of the OP.GG build picked last.
-fn load_choices() -> HashMap<String, Vec<i64>> {
-    std::fs::read(choices_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+/// The OP.GG options last picked for a champion and mode, by content so they survive OP.GG
+/// reordering its lists. Empty fields mean "not picked": the default option stays.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedPicks {
+    /// Core item ids.
+    pub build: Vec<i64>,
+    /// Keystone, runes and shards (`Runes::perks`).
+    pub runes: Vec<i64>,
+    pub spells: Vec<i64>,
+    pub skills: Vec<String>,
 }
 
-/// Core items of the build last picked for this champion and OP.GG mode.
-pub fn saved_build(champion_id: i64, mode: &str) -> Option<Vec<i64>> {
+/// A `builds.json` entry: older versions kept only the core items.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedEntry {
+    Picks(SavedPicks),
+    Build(Vec<i64>),
+}
+
+/// `"<championId>:<mode>"` → the picks made last.
+fn load_choices() -> HashMap<String, SavedPicks> {
+    let all: HashMap<String, SavedEntry> = std::fs::read(choices_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    all.into_iter()
+        .map(|(k, e)| {
+            let picks = match e {
+                SavedEntry::Picks(p) => p,
+                SavedEntry::Build(build) => SavedPicks { build, ..SavedPicks::default() },
+            };
+            (k, picks)
+        })
+        .collect()
+}
+
+/// The picks made last for this champion and OP.GG mode.
+pub fn saved_picks(champion_id: i64, mode: &str) -> Option<SavedPicks> {
     load_choices().remove(&format!("{champion_id}:{mode}"))
 }
 
-/// Remembers a picked build, in `%LOCALAPPDATA%\riftlite\builds.json`; nothing leaves the machine.
-pub fn save_build(champion_id: i64, mode: &str, ids: &[i64]) -> Result<(), String> {
+/// Remembers the picks, in `%LOCALAPPDATA%\riftlite\builds.json`; nothing leaves the machine.
+pub fn save_picks(champion_id: i64, mode: &str, picks: SavedPicks) -> Result<(), String> {
     let mut all = load_choices();
-    all.insert(format!("{champion_id}:{mode}"), ids.to_vec());
+    all.insert(format!("{champion_id}:{mode}"), picks);
     let p = choices_path();
     std::fs::create_dir_all(p.parent().expect("builds path has a parent")).map_err(|e| e.to_string())?;
     let tmp = p.with_extension("json.tmp");
@@ -607,7 +659,8 @@ pub fn save_build(champion_id: i64, mode: &str, ids: &[i64]) -> Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
-fn thousands(n: u64) -> String {
+/// `12345` → `12,345`.
+pub fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -762,6 +815,19 @@ mod tests {
         assert!(!b.patch_matches("16.2.1"));
         let older = MetaBuild { patch: "16.2".into(), ..b };
         assert!(!older.patch_matches("16.20.1"), "16.2 is not a prefix match for 16.20");
+    }
+
+    #[test]
+    fn builds_json_reads_old_build_only_and_new_entries() {
+        let all: HashMap<String, SavedEntry> =
+            serde_json::from_str(r#"{"1:ranked": [3089, 3157], "2:aram": {"build": [6655], "spells": [4, 32], "skills": ["Q", "E"]}}"#).unwrap();
+        let picks = |k: &str| match &all[k] {
+            SavedEntry::Picks(p) => p.clone(),
+            SavedEntry::Build(b) => SavedPicks { build: b.clone(), ..SavedPicks::default() },
+        };
+        assert_eq!(picks("1:ranked"), SavedPicks { build: vec![3089, 3157], ..SavedPicks::default() });
+        assert_eq!(picks("2:aram").spells, [4, 32]);
+        assert!(picks("2:aram").runes.is_empty());
     }
 
     #[test]

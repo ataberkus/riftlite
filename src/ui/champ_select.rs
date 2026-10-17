@@ -4,12 +4,13 @@
 use eframe::egui::{Align, Align2, Color32, Label, Layout, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, vec2};
 
 use super::home::void;
+use super::live_tab::mastery_tag;
 use super::matches::trunc;
-use super::stats::{Avg, averages, position, queue_name, scout};
+use super::stats::{Avg, Comp, averages, mmss, now_ms, position, position_label, queue_name, scout};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
-use crate::lcu::{self, ChampSelect, LolGame, RecPage};
+use crate::lcu::{self, ChampSelect, Lobby, LolGame, RecPage};
 use crate::meta::{self, Pick};
 use crate::worker::{Action, Snapshot};
 use crate::itemset;
@@ -99,12 +100,105 @@ fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>) -> eframe::
     resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
 }
 
+/// The party before champ select: members with rank and roles, and the queue timer.
+fn lobby_card(ui: &mut Ui, s: &Snapshot, g: &Gfx, l: &Lobby) {
+    section_with(ui, "Lobby", |ui| {
+        if l.queue_id > 0 {
+            pill(ui, queue_name(l.queue_id), MUTED);
+        }
+        if l.max_size > 0 {
+            pill(ui, format!("{} / {}", l.members.len(), l.max_size), MUTED);
+        }
+        if let Some(q) = &s.queue {
+            let text = match q.state.as_str() {
+                "Searching" if q.estimate_s > 0.0 => format!("In queue {} · est. {}", mmss(q.in_queue_s), mmss(q.estimate_s)),
+                "Searching" => format!("In queue {}", mmss(q.in_queue_s)),
+                "Found" => "Match found".to_string(),
+                other => format!("Queue: {other}"),
+            };
+            pill(ui, text, if q.state == "Found" { WIN } else { CYAN });
+        }
+    });
+    card(ui, |ui| {
+        for m in &l.members {
+            ui.horizontal(|ui| {
+                let name = s.names.get(&m.puuid).map(String::as_str).filter(|n| !n.is_empty()).unwrap_or("…");
+                g.profile(ui, m.icon, name, 34.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(RichText::new(if m.is_me { "you" } else { name }).font(semibold(13.0)).color(if m.is_me { CYAN } else { TEXT }));
+                        if m.leader {
+                            pill(ui, "leader", ACCENT_TEXT);
+                        }
+                    });
+                    let roles: Vec<&str> =
+                        m.positions.iter().filter(|p| !matches!(p.as_str(), "" | "UNSELECTED")).map(|p| position_label(p)).collect();
+                    let mut line = format!("Level {}", m.level);
+                    if !roles.is_empty() {
+                        line += &format!(" · {}", roles.join(" / "));
+                    }
+                    ui.label(RichText::new(line).size(11.5).color(MUTED));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(r) = scout(s, &m.puuid) {
+                        ui.label(RichText::new(&r.text).size(11.5).color(if r.tier.is_empty() { MUTED } else { tier_color(&r.tier) }));
+                        rank_emblem(ui, &r.tier, 22.0);
+                    }
+                });
+            });
+        }
+    });
+}
+
+/// While you have a ban to make: the champions your intended pick wins least against in lane
+/// (OP.GG matchups), not banned yet and not on your team.
+fn ban_hints(ui: &mut Ui, s: &Snapshot, cs: &ChampSelect, g: &Gfx, meta_on: bool) {
+    section(ui, "Ban suggestions");
+    let Some(mine) = cs.my_champion() else {
+        return void(note(ui, "Hover or declare your pick to see the champions it does worst against."));
+    };
+    let name = s.data.champion_name(mine);
+    let build = s.meta.as_ref().filter(|m| m.champion_id == mine).and_then(|m| m.build.as_ref()?.as_ref().ok());
+    let Some(build) = build else {
+        let why = if meta_on { format!("Loading OP.GG lane matchups for {name}…") } else { "Turn on OP.GG builds in Settings for lane-matchup ban suggestions.".into() };
+        return void(note(ui, why));
+    };
+    let taken = |c: i64| cs.bans.contains(&c) || cs.my_team.iter().any(|p| p.champion_id == c);
+    let mut worst: Vec<_> = build.counters.iter().filter(|m| !taken(m.champion_id) && m.games > 0).collect();
+    worst.sort_by(|a, b| (a.wins as f64 / a.games as f64).total_cmp(&(b.wins as f64 / b.games as f64)));
+    if worst.is_empty() {
+        return void(note(ui, format!("OP.GG has no lane matchups for {name} in this queue.")));
+    }
+    card(ui, |ui| {
+        tiles(ui, |ui| {
+            for m in worst.iter().take(5) {
+                inset_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        g.champ(ui, m.champion_id, 30.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(RichText::new(s.data.champion_name(m.champion_id)).font(semibold(12.5)).color(TEXT));
+                            ui.label(RichText::new(m.stats()).size(11.5).color(MUTED));
+                        });
+                    });
+                });
+            }
+        });
+        small_note(ui, format!("{name}'s lane win rate against each (OP.GG, {} games or more), lowest first.", meta::MIN_GAMES));
+    });
+}
+
 impl App {
     pub(super) fn champ_select(&mut self, ui: &mut Ui, s: &Snapshot) {
         let icons = self.icons.clone();
         let g = Gfx::new(&icons, &s.data);
         let Some(cs) = &s.champ_select else {
-            empty_state(ui, Icon::Target, "Not in champ select", "This tab opens automatically when one starts.", |_| {});
+            match &s.lobby {
+                Some(l) => lobby_card(ui, s, &g, l),
+                None => empty_state(ui, Icon::Target, "Not in champ select", "This tab opens automatically when one starts.", |_| {}),
+            }
             if s.phase == "Lobby" && s.session.as_ref().is_some_and(|g| matches!(g.queue_id, 480 | 490)) {
                 section(ui, "Swiftplay");
                 card(ui, |ui| {
@@ -127,6 +221,11 @@ impl App {
         };
         ui.horizontal(|ui| {
             pill(ui, cs_phase_label(cs), ACCENT_TEXT);
+            let left = (cs.phase_ends_ms - now_ms()) as f64 / 1000.0;
+            if cs.phase_ends_ms > 0 && left > 0.0 {
+                pill(ui, format!("{} left", mmss(left.ceil())), if left <= 10.0 { SOON } else { BODY });
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            }
             if cs.queue_id > 0 {
                 pill(ui, queue_name(cs.queue_id), MUTED);
             }
@@ -176,6 +275,9 @@ impl App {
                                         ui.label(RichText::new("·").size(11.5).color(FAINT));
                                         trunc(ui, RichText::new(who).size(11.5).color(BODY), 120.0);
                                     }
+                                    if p.champion_id > 0 && !p.puuid.is_empty() {
+                                        mastery_tag(ui, s, &p.puuid, p.champion_id);
+                                    }
                                 });
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -184,6 +286,17 @@ impl App {
                                     rank_emblem(ui, &r.tier, 22.0);
                                 }
                             });
+                        });
+                    }
+                    let comp = Comp::of(&s.data, team.iter().filter(|p| p.picked || p.is_me).map(|p| p.champion_id));
+                    if comp.n > 0 {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(comp.summary()).size(11.5).color(MUTED))
+                                .on_hover_text("From Riot's champion ratings and class tags (Data Dragon), not this patch's builds");
+                            for w in comp.warnings() {
+                                pill(ui, w, SOON);
+                            }
                         });
                     }
                 });
@@ -200,6 +313,9 @@ impl App {
                     resp.on_hover_text(s.data.champion_name(b));
                 }
             });
+        }
+        if cs.my_ban_pending {
+            ban_hints(ui, s, cs, &g, self.settings.meta_builds);
         }
         let history = s.lol_history.as_deref().unwrap_or(&[]);
         let record = |c: i64| averages(history.iter().filter(|g| g.champion_id == c));

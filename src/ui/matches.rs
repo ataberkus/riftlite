@@ -3,7 +3,7 @@
 use eframe::egui::{Align, Align2, Color32, Frame, Grid, Label, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, vec2};
 
 use super::home::{lol_summary, void};
-use super::stats::{ago, cs_per_min, datetime, mmss, no_data_hint, queue_name};
+use super::stats::{Avg, ago, averages, cs_per_min, datetime, mmss, no_data_hint, queue_name};
 use super::theme::*;
 use super::widgets::*;
 use super::{App, Tab};
@@ -60,7 +60,9 @@ impl App {
             Ok(g) => g,
         };
         let icons = self.icons.clone();
-        card(ui, |ui| lol_summary(ui, &Gfx::new(&icons, &s.data), games));
+        let g = Gfx::new(&icons, &s.data);
+        card(ui, |ui| lol_summary(ui, &g, games));
+        self.champion_table(ui, &g, games);
         section(ui, "Recent League games");
         let root = s.league_root();
         let me = s.summoner.as_ref().map_or("", |x| x.puuid.as_str());
@@ -74,6 +76,74 @@ impl App {
             } else if ui.add(Btn::secondary(&format!("Load {} more", 20)).icon(Icon::ChevronDown)).clicked() {
                 self.request(Action::MoreHistory);
             }
+        });
+    }
+
+    /// Your averages per champion over the loaded history, sortable by any column.
+    fn champion_table(&mut self, ui: &mut Ui, g: &Gfx, games: &[LolGame]) {
+        const HEADS: [&str; 8] = ["Champion", "Games", "Win rate", "KDA", "CS / min", "Gold / min", "Damage / min", "Vision / min"];
+        const SHOWN: usize = 8;
+        let mut champs: Vec<i64> = games.iter().map(|x| x.champion_id).collect();
+        champs.sort_unstable();
+        champs.dedup();
+        let mut rows: Vec<(i64, String, Avg)> = champs
+            .into_iter()
+            .filter_map(|c| Some((c, g.data.champion_name(c), averages(games.iter().filter(|x| x.champion_id == c))?)))
+            .collect();
+        let (col, desc) = self.champ_sort;
+        let key = |a: &Avg| match col {
+            1 => a.n as f64,
+            2 => a.win_rate(),
+            3 => a.kda(),
+            4 => a.cs_min,
+            5 => a.gold_min,
+            6 => a.dmg_min,
+            _ => a.vision_min,
+        };
+        rows.sort_by(|x, y| {
+            let o = if col == 0 { x.1.cmp(&y.1) } else { key(&x.2).total_cmp(&key(&y.2)) };
+            if desc { o.reverse() } else { o }
+        });
+        section_with(ui, "By champion", |ui| {
+            if rows.len() > SHOWN {
+                let label = if self.champ_table_all { "Show fewer".to_string() } else { format!("Show all {}", rows.len()) };
+                if ui.add(Btn::ghost(&label).small()).clicked() {
+                    self.champ_table_all ^= true;
+                }
+            }
+        });
+        card(ui, |ui| {
+            Grid::new("champ-table").striped(true).spacing([18.0, 4.0]).min_row_height(28.0).show(ui, |ui| {
+                for (i, h) in HEADS.iter().enumerate() {
+                    let sorted = i == col;
+                    let head = ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.label(RichText::new(h.to_uppercase()).font(semibold(10.5)).color(if sorted { TEXT } else { MUTED }));
+                        if sorted {
+                            icon(ui, if desc { Icon::ChevronDown } else { Icon::ChevronUp }, 10.0, TEXT);
+                        }
+                    });
+                    let r = head.response.interact(Sense::click()).on_hover_cursor(eframe::egui::CursorIcon::PointingHand);
+                    if r.on_hover_text("Sort by this column").clicked() {
+                        // Numbers start highest first, names A to Z.
+                        self.champ_sort = if sorted { (col, !desc) } else { (i, i != 0) };
+                    }
+                }
+                ui.end_row();
+                for (c, name, a) in rows.iter().take(if self.champ_table_all { usize::MAX } else { SHOWN }) {
+                    ui.horizontal(|ui| {
+                        g.champ(ui, *c, 24.0);
+                        ui.label(RichText::new(name).font(semibold(12.5)).color(TEXT));
+                    });
+                    ui.label(RichText::new(a.n.to_string()).color(BODY));
+                    ui.label(RichText::new(format!("{:.0}%", a.win_rate() * 100.0)).font(semibold(12.5)).color(wr_color(a.win_rate())));
+                    ui.label(RichText::new(format!("{:.2}", a.kda())).color(kda_color(a.kda())));
+                    for v in [a.cs_min, a.gold_min, a.dmg_min, a.vision_min] {
+                        ui.label(RichText::new(if v >= 100.0 { format!("{v:.0}") } else { format!("{v:.1}") }).color(BODY));
+                    }
+                    ui.end_row();
+                }
+            });
         });
     }
 

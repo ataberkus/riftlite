@@ -8,6 +8,7 @@ mod ddragon;
 mod itemset;
 mod lcu;
 mod live;
+mod lp;
 mod meta;
 mod net;
 mod riot;

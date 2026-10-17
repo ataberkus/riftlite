@@ -451,6 +451,175 @@ impl Lcu {
     pub fn accept_ready_check(&self) -> Result<(), LcuError> {
         self.send("POST", "/lol-matchmaking/v1/ready-check/accept", None).map(drop)
     }
+
+    /// The lobby the player is in; `Ok(None)` outside one (the client answers 404).
+    pub fn lobby(&self) -> Result<Option<Lobby>, LcuError> {
+        match self.get("/lol-lobby/v2/lobby") {
+            Ok(v) => Ok(Some(parse_lobby(&v))),
+            Err(LcuError::Status(404)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The running matchmaking search; `Ok(None)` when not queued (404).
+    pub fn queue_search(&self) -> Result<Option<QueueSearch>, LcuError> {
+        match self.get("/lol-matchmaking/v1/search") {
+            Ok(v) => Ok(Some(QueueSearch {
+                state: v["searchState"].as_str().unwrap_or("").to_string(),
+                in_queue_s: v["timeInQueue"].as_f64().unwrap_or(0.0),
+                estimate_s: v["estimatedQueueTime"].as_f64().unwrap_or(0.0),
+            })),
+            Err(LcuError::Status(404)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Friends signed in to League (chat roster; offline and mobile-only friends left out).
+    pub fn friends(&self) -> Result<Vec<Friend>, LcuError> {
+        Ok(parse_friends(&self.get("/lol-chat/v1/friends")?))
+    }
+
+    /// RP, Blue Essence and Orange Essence.
+    pub fn wallet(&self) -> Result<Wallet, LcuError> {
+        // currencyTypes=["RP","lol_blue_essence","lol_orange_essence"], URL-encoded.
+        let v = self.get("/lol-inventory/v1/wallet?currencyTypes=%5B%22RP%22%2C%22lol_blue_essence%22%2C%22lol_orange_essence%22%5D")?;
+        let n = |k: &str| v[k].as_i64().unwrap_or(0);
+        Ok(Wallet { rp: n("RP"), blue_essence: n("lol_blue_essence"), orange_essence: n("lol_orange_essence") })
+    }
+
+    pub fn honor_level(&self) -> Result<i64, LcuError> {
+        Ok(self.get("/lol-honor-v2/v1/profile")?["honorLevel"].as_i64().unwrap_or(0))
+    }
+
+    /// Every champion the account owns or may play for free this week.
+    pub fn champion_access(&self) -> Result<Vec<ChampionAccess>, LcuError> {
+        let v = self.get("/lol-champions/v1/owned-champions-minimal")?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some(ChampionAccess {
+                    id: c["id"].as_i64().filter(|&id| id > 0)?,
+                    free: c["freeToPlay"].as_bool().unwrap_or(false),
+                    owned: c["ownership"]["owned"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect())
+    }
+
+    /// Back to the lobby of the queue just played (end of game screen).
+    pub fn play_again(&self) -> Result<(), LcuError> {
+        self.send("POST", "/lol-lobby/v2/play-again", None).map(drop)
+    }
+}
+
+/// A friend signed in to League, from `/lol-chat/v1/friends`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Friend {
+    /// `gameName#gameTag`.
+    pub name: String,
+    pub puuid: String,
+    pub icon: i64,
+    /// `chat`, `away`, `dnd`…
+    pub availability: String,
+    /// `lol.gameStatus`: `outOfGame`, `inQueue`, `championSelect`, `inGame`…; empty when not in League.
+    pub game_status: String,
+    pub queue_id: i64,
+    pub champion_id: i64,
+}
+
+fn parse_friends(v: &Value) -> Vec<Friend> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["product"] == "league_of_legends" && !matches!(f["availability"].as_str(), Some("offline" | "mobile") | None))
+        .map(|f| {
+            let lol = &f["lol"];
+            // The roster sends these ids as strings.
+            let id = |k: &str| lol[k].as_str().and_then(|s| s.parse().ok()).or(lol[k].as_i64()).unwrap_or(0);
+            Friend {
+                name: riot_id(f["gameName"].as_str().unwrap_or(""), f["gameTag"].as_str().unwrap_or("")),
+                puuid: f["puuid"].as_str().unwrap_or("").to_string(),
+                icon: f["icon"].as_i64().unwrap_or(0),
+                availability: f["availability"].as_str().unwrap_or("").to_string(),
+                game_status: lol["gameStatus"].as_str().unwrap_or("").to_string(),
+                queue_id: id("queueId"),
+                champion_id: id("championId"),
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Wallet {
+    pub rp: i64,
+    pub blue_essence: i64,
+    pub orange_essence: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ChampionAccess {
+    pub id: i64,
+    /// In this week's free rotation.
+    pub free: bool,
+    pub owned: bool,
+}
+
+/// One player in the lobby (`/lol-lobby/v2/lobby` `members`). The lobby leaves names empty;
+/// they come from the summoner endpoint.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct LobbyMember {
+    pub puuid: String,
+    pub leader: bool,
+    pub ready: bool,
+    /// First and second position preference (`TOP`, `UTILITY`, `FILL`…); empty when the queue has none.
+    pub positions: [String; 2],
+    pub level: i64,
+    pub icon: i64,
+    pub is_me: bool,
+}
+
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Lobby {
+    pub queue_id: i64,
+    pub map_id: i64,
+    pub max_size: i64,
+    pub members: Vec<LobbyMember>,
+}
+
+fn parse_lobby(v: &Value) -> Lobby {
+    let me = v["localMember"]["puuid"].as_str().unwrap_or("");
+    let cfg = &v["gameConfig"];
+    let s = |m: &Value, k: &str| m[k].as_str().unwrap_or("").to_string();
+    Lobby {
+        queue_id: cfg["queueId"].as_i64().unwrap_or(0),
+        map_id: cfg["mapId"].as_i64().unwrap_or(0),
+        max_size: cfg["maxLobbySize"].as_i64().unwrap_or(0),
+        members: v["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| LobbyMember {
+                puuid: s(m, "puuid"),
+                leader: m["isLeader"].as_bool().unwrap_or(false),
+                ready: m["ready"].as_bool().unwrap_or(false),
+                positions: [s(m, "firstPositionPreference"), s(m, "secondPositionPreference")],
+                level: m["summonerLevel"].as_i64().unwrap_or(0),
+                icon: m["summonerIconId"].as_i64().unwrap_or(0),
+                is_me: !me.is_empty() && m["puuid"].as_str() == Some(me),
+            })
+            .collect(),
+    }
+}
+
+/// `/lol-matchmaking/v1/search`: `searchState` is `Searching`, `Found`, `Canceled`, `Error`…;
+/// times are in seconds.
+#[derive(Clone, PartialEq, Debug)]
+pub struct QueueSearch {
+    pub state: String,
+    pub in_queue_s: f64,
+    /// The client's own estimate; 0 when it gives none.
+    pub estimate_s: f64,
 }
 
 /// `/lol-matchmaking/v1/ready-check`: `state` is `InProgress`, `EveryoneReady`,
@@ -515,17 +684,22 @@ pub struct RankedQueue {
     pub losses: i64,
 }
 
+/// Display name of a ranked queue type (`RANKED_SOLO_5x5` → `Ranked Solo/Duo`).
+pub fn ranked_label(queue: &str) -> &str {
+    match queue {
+        "RANKED_SOLO_5x5" => "Ranked Solo/Duo",
+        "RANKED_FLEX_SR" => "Ranked Flex",
+        "RANKED_TFT" => "TFT Ranked",
+        "RANKED_TFT_DOUBLE_UP" => "TFT Double Up",
+        "RANKED_TFT_TURBO" => "TFT Hyper Roll",
+        "CHERRY" => "Arena",
+        q => q,
+    }
+}
+
 impl RankedQueue {
     pub fn label(&self) -> &str {
-        match self.queue.as_str() {
-            "RANKED_SOLO_5x5" => "Ranked Solo/Duo",
-            "RANKED_FLEX_SR" => "Ranked Flex",
-            "RANKED_TFT" => "TFT Ranked",
-            "RANKED_TFT_DOUBLE_UP" => "TFT Double Up",
-            "RANKED_TFT_TURBO" => "TFT Hyper Roll",
-            "CHERRY" => "Arena",
-            q => q,
-        }
+        ranked_label(&self.queue)
     }
 
     pub fn is_tft(&self) -> bool {
@@ -596,6 +770,8 @@ pub struct LolGame {
     pub vision: i64,
     /// item0..item5 then trinket (item6); 0 = empty slot.
     pub items: [i64; 7],
+    /// `Top`, `Jungle`, `Mid`, `Bot`, `Support` from the match's timeline; empty when unknown.
+    pub position: &'static str,
 }
 
 impl LolGame {
@@ -638,9 +814,26 @@ fn parse_lol_history(v: &Value, puuid: &str) -> Vec<LolGame> {
                 damage_taken: n("totalDamageTaken"),
                 vision: n("visionScore"),
                 items: std::array::from_fn(|i| n(&format!("item{i}"))),
+                position: history_position(g["queueId"].as_i64().unwrap_or(0), &me["timeline"]),
             })
         })
         .collect()
+}
+
+/// The lane match history assigns from movement (`timeline.lane`/`role`), on Summoner's Rift
+/// queues only; Riot's guess, often wrong for roamers and swaps. Empty when unknown.
+fn history_position(queue_id: i64, timeline: &Value) -> &'static str {
+    if !matches!(queue_id, 400 | 420 | 430 | 440 | 480 | 490 | 700) {
+        return "";
+    }
+    match (timeline["lane"].as_str().unwrap_or(""), timeline["role"].as_str().unwrap_or("")) {
+        ("TOP", _) => "Top",
+        ("JUNGLE", _) => "Jungle",
+        ("MIDDLE" | "MID", _) => "Mid",
+        ("BOTTOM" | "BOT", "SUPPORT" | "DUO_SUPPORT") => "Support",
+        ("BOTTOM" | "BOT", _) => "Bot",
+        _ => "",
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -727,6 +920,11 @@ pub struct ChampSelect {
     pub card_choices: Vec<i64>,
     /// The local player's pick action that is not completed yet; picking a card completes it.
     pub my_pick_action: Option<i64>,
+    /// Unix ms at which the current timer phase ends (`timer.internalNowInEpochMs` +
+    /// `adjustedTimeLeftInPhase`); 0 when the phase is untimed.
+    pub phase_ends_ms: i64,
+    /// The local player has a ban to make that is not completed yet.
+    pub my_ban_pending: bool,
 }
 
 impl ChampSelect {
@@ -786,6 +984,13 @@ fn parse_champ_select(v: &Value) -> ChampSelect {
     let locked = mine.is_some_and(|p| p.picked)
         && (phase == "FINALIZATION" || assigned || my_picks.iter().any(|a| a["completed"] == true));
     let my_pick_action = my_picks.iter().find(|a| a["completed"] != true).and_then(|a| a["id"].as_i64());
+    let my_ban_pending = actions.iter().any(|a| a["type"] == "ban" && a["actorCellId"].as_i64() == me && a["completed"] != true);
+    let timer = &v["timer"];
+    let left = timer["adjustedTimeLeftInPhase"].as_i64().unwrap_or(0);
+    let phase_ends_ms = match timer["internalNowInEpochMs"].as_i64() {
+        Some(now) if timer["isInfinite"] != true && left > 0 => now + left,
+        _ => 0,
+    };
     let mine_raw = v["myTeam"].as_array().into_iter().flatten().find(|p| p["cellId"].as_i64() == me);
     let spell = |k: &str| mine_raw.and_then(|p| p[k].as_i64()).unwrap_or(0);
     ChampSelect {
@@ -799,6 +1004,8 @@ fn parse_champ_select(v: &Value) -> ChampSelect {
         subset_picks,
         card_choices: Vec::new(),
         my_pick_action,
+        phase_ends_ms,
+        my_ban_pending,
         their_team: team("theirTeam"),
         my_team,
         bans,

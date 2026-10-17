@@ -133,6 +133,10 @@ pub struct App {
     champ_selected: Option<i64>,
     /// OP.GG build group the user opened in champ select, per champion id.
     meta_group: Option<(i64, meta::Group)>,
+    /// "By champion" table: sorted column and descending; all rows or the first few.
+    champ_sort: (usize, bool),
+    champ_table_all: bool,
+    champ_scope: players::ChampScope,
     folder_input: String,
     hotkeys: Option<crate::tray::Hotkeys>,
     hotkeys_rx: Receiver<crate::tray::Hotkeys>,
@@ -164,6 +168,9 @@ impl App {
             champ_filter: String::new(),
             champ_selected: None,
             meta_group: None,
+            champ_sort: (1, true),
+            champ_table_all: false,
+            champ_scope: players::ChampScope::All,
             hotkeys: None,
             hotkeys_rx,
             icons,

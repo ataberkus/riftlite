@@ -16,13 +16,14 @@ use std::time::{Duration, Instant};
 
 use crate::ddragon::{self, StaticData};
 use crate::lcu::{
-    self, Challenges, ChampSelect, Creds, GameSession, Lcu, LcuError, LolGame, LpChange, MatchDetail, Mastery, Mission,
-    RankedQueue, RecPage, Summoner, TftGame,
+    self, ChampSelect, ChampionAccess, Challenges, Creds, Friend, GameSession, Lcu, LcuError, Lobby, LolGame, LpChange, MatchDetail,
+    Mastery, Mission, QueueSearch, RankedQueue, RecPage, Summoner, TftGame, Wallet,
 };
 use crate::augments::Offer;
 use crate::live::{self, LiveGame};
 use crate::riot::{self, Installs, Running};
 use crate::settings::{PageSource, Settings};
+use crate::lp::{self, LpEntry};
 use crate::skills::{Recorder, SkillHint};
 use crate::meta::{self, MetaBuild, Pick, Picks, Query};
 use crate::{itemset, net, win};
@@ -71,6 +72,9 @@ pub enum Action {
     SelectMeta(Pick),
     /// Ask OP.GG again after a failed answer.
     RetryMeta,
+    LoadFriends,
+    /// Back to the lobby of the queue just played.
+    PlayAgain,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -118,6 +122,12 @@ pub struct Snapshot {
     pub tft_history: Result<Vec<TftGame>, String>,
     pub match_details: HashMap<u64, Result<MatchDetail, String>>,
     pub champ_select: Option<ChampSelect>,
+    /// The lobby (phases Lobby, Matchmaking, ReadyCheck).
+    pub lobby: Option<Lobby>,
+    /// The matchmaking search while queued.
+    pub queue: Option<QueueSearch>,
+    /// Game names per puuid for lobby members (the lobby leaves them empty), cached.
+    pub names: HashMap<String, String>,
     /// Riot's recommended pages for the champion currently picked/hovered.
     pub rec_pages: Vec<RecPage>,
     /// Champions the player may pick in this champ select (owned, not banned).
@@ -130,7 +140,20 @@ pub struct Snapshot {
     pub champ_log: Vec<(String, bool)>,
     /// Ranked queues per puuid (champ select and game scouting, cached).
     pub ranks: HashMap<String, Result<Vec<RankedQueue>, String>>,
+    /// Champion mastery per puuid (allies in champ select, everyone in game), cached.
+    pub masteries: HashMap<String, Result<Vec<Mastery>, String>>,
+    /// Friends signed in to League; refreshed every 30 s outside games and on request.
+    pub friends: Option<Result<Vec<Friend>, String>>,
+    pub wallet: Option<Wallet>,
+    pub honor_level: Option<i64>,
+    /// Owned and free-rotation champions.
+    pub champion_access: Vec<ChampionAccess>,
     pub post_game: Option<PostGame>,
+    /// `[General] WindowMode` from the game's `Config/game.cfg`: 0 fullscreen, 1 windowed,
+    /// 2 borderless; `None` when unreadable.
+    pub window_mode: Option<i64>,
+    /// LP after ranked games riftlite saw end (`lp.json`).
+    pub lp_log: Vec<LpEntry>,
     pub live: Option<LiveGame>,
     /// ARAM Mayhem augment cards on screen, with their tiers.
     pub augments: Option<Offer>,
@@ -165,13 +188,23 @@ impl Default for Snapshot {
             tft_history: Ok(Vec::new()),
             match_details: HashMap::new(),
             champ_select: None,
+            lobby: None,
+            queue: None,
+            names: HashMap::new(),
             rec_pages: Vec::new(),
             pickable: Vec::new(),
             browse: None,
             meta: None,
             champ_log: Vec::new(),
             ranks: HashMap::new(),
+            masteries: HashMap::new(),
+            friends: None,
+            wallet: None,
+            honor_level: None,
+            champion_access: Vec::new(),
             post_game: None,
+            window_mode: None,
+            lp_log: Vec::new(),
             live: None,
             augments: None,
             augment_error: None,
@@ -325,6 +358,8 @@ struct State {
     action_seq: u64,
     /// The current ready check was answered (by riftlite or the player); reset when the phase leaves ReadyCheck.
     ready_handled: bool,
+    last_friends: Option<Instant>,
+    item_watch: live::ItemWatch,
 }
 
 fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
@@ -342,8 +377,11 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         recorder: Recorder::default(),
         action_seq: 0,
         ready_handled: false,
+        last_friends: None,
+        item_watch: live::ItemWatch::default(),
     };
     let mut last_install_scan: Option<Instant> = None;
+    shared.snap.lock().lp_log = lp::load();
     loop {
         let mut changed = false;
         let forced = shared.refresh.swap(false, Ordering::Relaxed);
@@ -351,6 +389,8 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         if forced || last_install_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
             let installs = riot::scan_installs(shared.settings.lock().league_override().as_deref());
             changed |= set(&mut shared.snap.lock().installs, installs);
+            let mode = shared.snap.lock().league_root().and_then(|root| window_mode(&root));
+            changed |= set(&mut shared.snap.lock().window_mode, mode);
             last_install_scan = Some(Instant::now());
         }
 
@@ -388,15 +428,21 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         }
 
         // --- Live game ---
-        let live_game = if running.any_game() { live::fetch(&local) } else { None };
+        let mut live_game = if running.any_game() { live::fetch(&local) } else { None };
         let hint = match &live_game {
             Some(g) => g.me().and_then(|me| st.recorder.observe(&me.champion_key, g.abilities, g.unspent_skill_points())),
             None => {
                 st.recorder.finish();
+                if !running.any_game() {
+                    st.item_watch = live::ItemWatch::default();
+                }
                 None
             }
         };
         let mut s = shared.snap.lock();
+        if let Some(g) = &mut live_game {
+            st.item_watch.observe(g, &s.data.completed_items);
+        }
         let live_changed = set(&mut s.live, live_game) | set(&mut s.skill_hint, hint);
         drop(s);
         if live_changed {
@@ -416,7 +462,7 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         }
         let s = shared.snap.lock();
         // A ready check lasts ~10 s: poll it at 1 s like champ select; other phases are unaffected.
-        let busy = s.live.is_some() || s.champ_select.is_some() || running.any_game() || s.phase == "ReadyCheck";
+        let busy = s.live.is_some() || s.champ_select.is_some() || running.any_game() || s.phase == "ReadyCheck" || s.phase == "Matchmaking";
         let idle = running.league_client.is_none() && running.riot_client.is_none();
         drop(s);
         let wait = if busy { 1000 } else if idle { 5000 } else { 2000 };
@@ -485,23 +531,41 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
         changed |= refresh_profile(shared, &c.lcu, st.history_len);
         st.last_profile = Some(Instant::now());
     }
+    if !in_game_phase && (forced || st.last_friends.is_none_or(|t| t.elapsed() > Duration::from_secs(30))) {
+        changed |= refresh_friends(shared, &c.lcu);
+        st.last_friends = Some(Instant::now());
+    }
 
     // --- Champ select ---
     let cs = if phase == "ChampSelect" { c.lcu.champ_select().ok().flatten() } else { None };
     if let Some(cs) = &cs {
         changed |= champ_select_automation(shared, &c.lcu, &mut st.auto, cs);
         let puuids: Vec<String> = cs.my_team.iter().chain(&cs.their_team).map(|p| p.puuid.clone()).collect();
-        changed |= fetch_ranks(shared, &c.lcu, puuids);
+        changed |= fetch_ranks(shared, &c.lcu, &puuids);
+        // Enemy puuids are hidden in champ select; only allies' mastery can be read.
+        changed |= fetch_masteries(shared, &c.lcu, &puuids);
     } else if !st.auto.session.is_empty() {
         st.auto = Auto::default();
     }
     changed |= set(&mut shared.snap.lock().champ_select, cs);
 
+    // --- Lobby and queue ---
+    let lobby = if matches!(phase.as_str(), "Lobby" | "Matchmaking" | "ReadyCheck") { c.lcu.lobby().ok().flatten() } else { None };
+    if let Some(l) = &lobby {
+        let puuids: Vec<String> = l.members.iter().map(|m| m.puuid.clone()).collect();
+        changed |= fetch_names(shared, &c.lcu, &puuids);
+        changed |= fetch_ranks(shared, &c.lcu, &puuids);
+    }
+    changed |= set(&mut shared.snap.lock().lobby, lobby);
+    let queue = if matches!(phase.as_str(), "Matchmaking" | "ReadyCheck") { c.lcu.queue_search().ok().flatten() } else { None };
+    changed |= set(&mut shared.snap.lock().queue, queue);
+
     // --- Loading screen / in game scouting ---
     if in_game_phase {
         let puuids: Vec<String> =
             shared.snap.lock().session.iter().flat_map(|s| s.players.iter().map(|p| p.puuid.clone())).collect();
-        changed |= fetch_ranks(shared, &c.lcu, puuids);
+        changed |= fetch_ranks(shared, &c.lcu, &puuids);
+        changed |= fetch_masteries(shared, &c.lcu, &puuids);
     }
 
     // --- Post game ---
@@ -513,6 +577,22 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
                 let mut detail = detail;
                 // The end-of-game block names the mode only; the gameflow session still knows the queue.
                 detail.queue_id = shared.snap.lock().session.as_ref().map_or(0, |s| s.queue_id);
+                if let Some(l) = &lp {
+                    let entry = LpEntry {
+                        game_id: detail.game_id,
+                        at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64),
+                        queue: l.queue.clone(),
+                        tier: l.tier.clone(),
+                        division: l.division.clone(),
+                        lp: l.lp,
+                        delta: l.delta,
+                        win: detail.me().is_some_and(|m| m.win),
+                    };
+                    // A failed write only loses this game from the log.
+                    if let Ok(all) = lp::record(entry) {
+                        shared.snap.lock().lp_log = all;
+                    }
+                }
                 shared.snap.lock().post_game = Some(PostGame { detail, lp });
                 changed = true;
             }
@@ -540,17 +620,32 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
     changed
 }
 
-/// Ranks for players not seen yet; failures are cached too so they are not retried every second.
-fn fetch_ranks(shared: &Shared, lcu: &Lcu, puuids: Vec<String>) -> bool {
+/// Per-player data for puuids not seen yet; failures are cached too so they are not retried
+/// every second.
+fn fetch_missing<T>(shared: &Shared, puuids: &[String], map: fn(&mut Snapshot) -> &mut HashMap<String, T>, get: impl Fn(&str) -> T) -> bool {
     let missing: Vec<String> = {
-        let s = shared.snap.lock();
-        puuids.into_iter().filter(|p| !p.is_empty() && !s.ranks.contains_key(p)).collect()
+        let mut s = shared.snap.lock();
+        let known = map(&mut s);
+        puuids.iter().filter(|p| !p.is_empty() && !known.contains_key(*p)).cloned().collect()
     };
     for p in &missing {
-        let r = lcu.ranked_of(p).map_err(|e| e.to_string());
-        shared.snap.lock().ranks.insert(p.clone(), r);
+        let v = get(p);
+        map(&mut shared.snap.lock()).insert(p.clone(), v);
     }
     !missing.is_empty()
+}
+
+fn fetch_ranks(shared: &Shared, lcu: &Lcu, puuids: &[String]) -> bool {
+    fetch_missing(shared, puuids, |s| &mut s.ranks, |p| lcu.ranked_of(p).map_err(|e| e.to_string()))
+}
+
+fn fetch_masteries(shared: &Shared, lcu: &Lcu, puuids: &[String]) -> bool {
+    fetch_missing(shared, puuids, |s| &mut s.masteries, |p| lcu.mastery(p).map_err(|e| e.to_string()))
+}
+
+/// Failures cache an empty name.
+fn fetch_names(shared: &Shared, lcu: &Lcu, puuids: &[String]) -> bool {
+    fetch_missing(shared, puuids, |s| &mut s.names, |p| lcu.summoner_by_puuid(p).map(|s| s.game_name).unwrap_or_default())
 }
 
 fn log(shared: &Shared, msg: String, ok: bool) {
@@ -702,12 +797,16 @@ fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
     changed
 }
 
-/// A build just arrived for `m`: start on the build last picked for this champion and mode
-/// (else the best one) and OP.GG's most played options.
+/// A build just arrived for `m`: start on the options last picked for this champion and mode
+/// (else the best build and OP.GG's most played options).
 fn adopt_build(m: &mut MetaState) {
     let Some(Ok(b)) = &m.build else { return };
-    let build = meta::saved_build(m.champion_id, b.query.mode).and_then(|ids| b.index_of(&ids)).unwrap_or(0);
-    m.picks = Picks { build, ..Picks::default() };
+    m.picks = saved_picks(m.champion_id, b);
+}
+
+/// The remembered picks for this champion in `b`'s mode, as indices into `b`.
+fn saved_picks(champion_id: i64, b: &MetaBuild) -> Picks {
+    meta::saved_picks(champion_id, b.query.mode).map(|p| b.picks_of(&p)).unwrap_or_default()
 }
 
 fn request_meta(auto: &mut Auto, data: Arc<StaticData>, key: (i64, Query)) -> Result<(), String> {
@@ -820,36 +919,35 @@ fn select_meta(shared: &Shared, auto: &Auto, pick: Pick) -> Result<String, Strin
         let m = s.meta.as_mut().ok_or("no OP.GG build loaded")?;
         let Some(Ok(b)) = &m.build else { return Err("no OP.GG build loaded".into()) };
         let missing = || "no such OP.GG option".to_string();
-        let (msg, save, rewrite) = match pick {
+        let (msg, rewrite) = match pick {
             Pick::Build(i) => {
                 let c = b.cores.get(i).ok_or_else(missing)?;
                 m.picks.build = i;
-                (format!("OP.GG {} build selected", c.label()), Some((b.query.mode, c.items.ids.clone())), true)
+                (format!("OP.GG {} build selected", c.label()), true)
             }
             Pick::Runes(i) => {
                 b.runes.get(i).ok_or_else(missing)?;
                 m.picks.runes = i;
-                ("OP.GG rune page selected".to_string(), None, false)
+                ("OP.GG rune page selected".to_string(), false)
             }
             Pick::Spells(i) => {
                 b.spells.get(i).ok_or_else(missing)?;
                 m.picks.spells = i;
-                ("OP.GG summoner spells selected".to_string(), None, false)
+                ("OP.GG summoner spells selected".to_string(), false)
             }
             Pick::Skills(i) => {
                 b.skills.get(i).ok_or_else(missing)?;
                 m.picks.skills = i;
-                ("OP.GG skill order selected".to_string(), None, true)
+                ("OP.GG skill order selected".to_string(), true)
             }
         };
+        let save = (b.query.mode, b.saved(m.picks));
         let champ = m.champion_id;
         sync_meta_page(&mut s);
         (champ, msg, save, rewrite)
     };
-    if let Some((mode, ids)) = &save {
-        // Losing a remembered choice is harmless: the best build is the default.
-        let _ = meta::save_build(champ, mode, ids);
-    }
+    // Losing remembered picks is harmless: the best options are the default.
+    let _ = meta::save_picks(champ, save.0, save.1);
     let written = rewrite && auto.applied == Some(champ) && auto.lockin.is_none() && shared.settings.lock().auto_item_set;
     if !written {
         return Ok(msg);
@@ -929,6 +1027,12 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             shared.snap.lock().match_details.insert(id, r);
             msg.map_or(Ok(String::new()), Err)
         }
+        Action::LoadFriends => {
+            refresh_friends(shared, lcu);
+            st.last_friends = Some(Instant::now());
+            Ok(String::new())
+        }
+        Action::PlayAgain => lcu.play_again().map(|_| "Back to the lobby".to_string()).map_err(|e| format!("Play again: {e}")),
         Action::MoreHistory => {
             let puuid = shared.snap.lock().summoner.as_ref().map(|s| s.puuid.clone()).unwrap_or_default();
             match lcu.lol_history(&puuid, st.history_len, st.history_len + PAGE - 1) {
@@ -1020,7 +1124,8 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
         }
         Action::SwiftplayRunes => {
             let data = shared.snap.lock().data.clone();
-            swiftplay_runes(lcu, &data)
+            let prefs = shared.settings.lock().clone();
+            swiftplay_runes(lcu, &data, prefs.page_source == PageSource::OpGg && prefs.meta_builds)
         }
     };
     finish_action(shared, st, r);
@@ -1061,8 +1166,9 @@ fn lookup(lcu: &Lcu, riot_id: &str) -> Result<Lookup, String> {
     })
 }
 
-/// Writes Riot's recommended page + spells into each Swiftplay slot that has a champion.
-fn swiftplay_runes(lcu: &Lcu, data: &StaticData) -> Result<String, String> {
+/// Writes a rune page + spells into each Swiftplay slot that has a champion: OP.GG's (ranked
+/// tables for the slot's lane) when `opgg`, else or when OP.GG has none, Riot's recommended one.
+fn swiftplay_runes(lcu: &Lcu, data: &StaticData, opgg: bool) -> Result<String, String> {
     let mut slots = lcu.player_slots().map_err(|e| format!("Swiftplay slots: {e}"))?;
     let mut done = Vec::new();
     for slot in &mut slots {
@@ -1071,8 +1177,32 @@ fn swiftplay_runes(lcu: &Lcu, data: &StaticData) -> Result<String, String> {
             continue;
         }
         let pos = lcu::perk_position(slot["positionPreference"].as_str().unwrap_or(""));
-        let pages = lcu.recommended_pages(champ, pos, live::SUMMONERS_RIFT).map_err(|e| format!("Recommended runes: {e}"))?;
-        let Some(rec) = pages.first() else { continue };
+        let name = data.champion_name(champ);
+        let from_opgg = if !opgg {
+            None
+        } else if data.item_stats.is_empty() {
+            Some(Err("Data Dragon items not loaded".to_string()))
+        } else {
+            Some(meta::query_for(480, live::SUMMONERS_RIFT, pos).and_then(|q| {
+                let b = meta::fetch(&net::public_agent(), data, champ, q)?;
+                meta_page(&b, saved_picks(champ, &b)).ok_or_else(|| "OP.GG has no rune page for this pick".to_string())
+            }))
+        };
+        let rec = match from_opgg {
+            Some(Ok(page)) => {
+                done.push(format!("{name} (OP.GG)"));
+                page
+            }
+            other => {
+                let pages = lcu.recommended_pages(champ, pos, live::SUMMONERS_RIFT).map_err(|e| format!("Recommended runes: {e}"))?;
+                let Some(rec) = pages.into_iter().next() else { continue };
+                done.push(match other {
+                    Some(Err(e)) => format!("{name} (Riot's page; OP.GG: {e})"),
+                    _ => format!("{name} (Riot)"),
+                });
+                rec
+            }
+        };
         slot["perks"] = Value::from(rec.perks_string());
         if !rec.spells.contains(&0) {
             let cur = [slot["spell1"].as_i64().unwrap_or(0), slot["spell2"].as_i64().unwrap_or(0)];
@@ -1080,13 +1210,12 @@ fn swiftplay_runes(lcu: &Lcu, data: &StaticData) -> Result<String, String> {
             slot["spell1"] = Value::from(s[0]);
             slot["spell2"] = Value::from(s[1]);
         }
-        done.push(data.champion_name(champ));
     }
     if done.is_empty() {
         return Err("No Swiftplay champion picked yet".into());
     }
     lcu.set_player_slots(&slots).map_err(|e| format!("Swiftplay slots: {e}"))?;
-    Ok(format!("Recommended runes set for {}", done.join(", ")))
+    Ok(format!("Runes set for {}", done.join(", ")))
 }
 
 fn refresh_profile(shared: &Shared, lcu: &Lcu, history_len: usize) -> bool {
@@ -1103,6 +1232,9 @@ fn refresh_profile(shared: &Shared, lcu: &Lcu, history_len: usize) -> bool {
     let tft = lcu.tft_history(&summoner.puuid).map_err(|e| format!("TFT match history: {e}"));
     let mastery = lcu.mastery(&summoner.puuid).unwrap_or_default();
     let challenges = lcu.challenges().ok();
+    let wallet = lcu.wallet().ok();
+    let honor = lcu.honor_level().ok();
+    let access = lcu.champion_access().unwrap_or_default();
     let mut s = shared.snap.lock();
     let mut changed = set(&mut s.profile_error, None);
     if let Ok(g) = &lol {
@@ -1114,7 +1246,29 @@ fn refresh_profile(shared: &Shared, lcu: &Lcu, history_len: usize) -> bool {
     changed |= set(&mut s.tft_history, tft);
     changed |= set(&mut s.mastery, mastery);
     changed |= set(&mut s.challenges, challenges);
+    changed |= set(&mut s.wallet, wallet);
+    changed |= set(&mut s.honor_level, honor);
+    changed |= set(&mut s.champion_access, access);
     changed
+}
+
+fn refresh_friends(shared: &Shared, lcu: &Lcu) -> bool {
+    let f = lcu.friends().map_err(|e| format!("Friends: {e}"));
+    set(&mut shared.snap.lock().friends, Some(f))
+}
+
+/// `[General] WindowMode` of the game's settings file.
+fn window_mode(league_root: &std::path::Path) -> Option<i64> {
+    let cfg = std::fs::read_to_string(league_root.join("Config").join("game.cfg")).ok()?;
+    let mut general = false;
+    for line in cfg.lines().map(str::trim) {
+        if line.starts_with('[') {
+            general = line.eq_ignore_ascii_case("[General]");
+        } else if let Some(v) = line.strip_prefix("WindowMode=").filter(|_| general) {
+            return v.trim().parse().ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

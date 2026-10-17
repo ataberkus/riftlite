@@ -1,5 +1,6 @@
 //! Formatting and per-player statistics shared by the tabs and the overlay.
 
+use crate::ddragon::StaticData;
 use crate::lcu::{LolGame, MatchDetail, MatchPlayer};
 use crate::live::LivePlayer;
 use crate::win;
@@ -99,6 +100,99 @@ pub fn cs_baseline(s: &Snapshot, champion_key: &str) -> Option<(f64, String)> {
     averages(history).map(|a| (a.cs_min, "your avg".to_string()))
 }
 
+/// `M7 · 84k` for a player on a champion, once their mastery list is loaded (`M0` when they
+/// have never played it), and the level.
+pub fn mastery_on(s: &Snapshot, puuid: &str, champion: i64) -> Option<(String, i64)> {
+    let list = s.masteries.get(puuid)?.as_ref().ok()?;
+    let (level, points) = list.iter().find(|m| m.champion_id == champion).map_or((0, 0), |m| (m.level, m.points));
+    let pts = match points {
+        p if p >= 1_000_000 => format!("{:.1}M", p as f64 / 1e6),
+        p if p >= 1000 => format!("{}k", p / 1000),
+        p => p.to_string(),
+    };
+    Some((format!("M{level} · {pts}"), level))
+}
+
+/// Games shorter than this are remakes and count for no streak.
+const REMAKE_S: i64 = 300;
+
+/// The current streak, newest game first: (won, games). Remakes are skipped.
+pub fn streak<'a>(games: impl IntoIterator<Item = &'a LolGame>) -> Option<(bool, usize)> {
+    let mut it = games.into_iter().filter(|g| g.duration_s >= REMAKE_S);
+    let won = it.next()?.win;
+    Some((won, 1 + it.take_while(|g| g.win == won).count()))
+}
+
+const TIERS: [&str; 7] = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND"];
+const DIVISIONS: [&str; 4] = ["IV", "III", "II", "I"];
+
+/// The division after `tier division` (`Gold I` → `Platinum IV`, `Diamond I` → `Master`); `None`
+/// for apex tiers, which have no divisions.
+pub fn next_division(tier: &str, division: &str) -> Option<String> {
+    let t = TIERS.iter().position(|&x| x == tier)?;
+    let d = DIVISIONS.iter().position(|&x| x == division)?;
+    Some(match (DIVISIONS.get(d + 1), TIERS.get(t + 1)) {
+        (Some(next), _) => format!("{} {next}", title(tier)),
+        (None, Some(up)) => format!("{} IV", title(up)),
+        (None, None) => "Master".to_string(),
+    })
+}
+
+/// A team's damage and frontline from Data Dragon's champion ratings and tags (Riot's
+/// coarse labels, not this patch's builds).
+#[derive(Default, Clone, Copy)]
+pub struct Comp {
+    pub n: usize,
+    /// `info.attack` above `info.magic`.
+    pub ad: usize,
+    /// `info.magic` above `info.attack`.
+    pub ap: usize,
+    /// Both rated the same.
+    pub mixed: usize,
+    /// Tagged `Tank`.
+    pub tanks: usize,
+}
+
+impl Comp {
+    pub fn of(data: &StaticData, champions: impl IntoIterator<Item = i64>) -> Comp {
+        let mut c = Comp::default();
+        for ch in champions.into_iter().filter_map(|id| data.champions.get(&id)) {
+            c.n += 1;
+            match ch.attack.cmp(&ch.magic) {
+                std::cmp::Ordering::Greater => c.ad += 1,
+                std::cmp::Ordering::Less => c.ap += 1,
+                std::cmp::Ordering::Equal => c.mixed += 1,
+            }
+            c.tanks += ch.tags.iter().any(|t| t == "Tank") as usize;
+        }
+        c
+    }
+
+    /// `AD 3 · AP 1 · mixed 1 · 1 tank`
+    pub fn summary(&self) -> String {
+        let mut s = format!("AD {} · AP {}", self.ad, self.ap);
+        if self.mixed > 0 {
+            s += &format!(" · mixed {}", self.mixed);
+        }
+        s + &format!(" · {} tank{}", self.tanks, if self.tanks == 1 { "" } else { "s" })
+    }
+
+    /// Gaps worth a look once most of the team is known.
+    pub fn warnings(&self) -> Vec<&'static str> {
+        let mut w = Vec::new();
+        if self.n >= 3 && self.ap == 0 && self.mixed == 0 {
+            w.push("All physical damage");
+        }
+        if self.n >= 3 && self.ad == 0 && self.mixed == 0 {
+            w.push("All magic damage");
+        }
+        if self.n >= 4 && self.tanks == 0 {
+            w.push("No tank");
+        }
+        w
+    }
+}
+
 pub fn as_lol_game(d: &MatchDetail, p: &MatchPlayer) -> LolGame {
     LolGame {
         game_id: d.game_id,
@@ -116,6 +210,7 @@ pub fn as_lol_game(d: &MatchDetail, p: &MatchPlayer) -> LolGame {
         damage_taken: p.damage_taken,
         vision: p.vision,
         items: p.items,
+        position: "",
     }
 }
 
@@ -161,6 +256,7 @@ pub fn position_label(p: &str) -> &str {
         "BOTTOM" => "Bot",
         "UTILITY" => "Support",
         "NONE" => "Any role",
+        "FILL" => "Fill",
         other => other,
     }
 }
@@ -203,10 +299,14 @@ pub fn datetime(unix_ms: i64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", t.0, t.1, t.2, t.3, t.4)
 }
 
+/// Current Unix time in milliseconds.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
 /// `5m ago`, `3h ago`, `2d ago`; the date after a week.
 pub fn ago(unix_ms: i64) -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-    let mins = (now - unix_ms).max(0) / 60_000;
+    let mins = (now_ms() - unix_ms).max(0) / 60_000;
     match mins {
         0 => "just now".into(),
         1..=59 => format!("{mins}m ago"),

@@ -2,14 +2,15 @@
 
 use eframe::egui::{Align, Grid, Layout, RichText, Ui, vec2};
 
-use super::home::void;
+use super::home::{session_line, void};
 use super::matches::match_table;
-use super::stats::{as_lol_game, averages, datetime, mmss, queue_name};
+use super::stats::{as_lol_game, averages, datetime, mmss, now_ms, queue_name};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
-use crate::lcu::RankedQueue;
-use crate::worker::Snapshot;
+use crate::lcu::{MatchPlayer, RankedQueue};
+use crate::lp;
+use crate::worker::{Action, Snapshot};
 
 impl App {
     pub(super) fn post_game(&mut self, ui: &mut Ui, s: &Snapshot) {
@@ -80,7 +81,25 @@ impl App {
             stat_tile(ui, "Vision", me.vision.to_string(), CYAN, None);
         });
         ui.add_space(4.0);
-        g.items(ui, &me.items, 30.0);
+        ui.horizontal(|ui| {
+            g.items(ui, &me.items, 30.0);
+            if matches!(s.phase.as_str(), "EndOfGame" | "PreEndOfGame") {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(s.busy.is_none(), Btn::primary("Play again").icon(Icon::Play))
+                        .on_hover_text("Leaves the end of game screen for a lobby of the same queue")
+                        .clicked()
+                    {
+                        self.request(Action::PlayAgain);
+                    }
+                });
+            }
+        });
+        let session = lp::session(&s.lp_log, now_ms());
+        if !session.is_empty() {
+            ui.add_space(6.0);
+            session_line(ui, session);
+        }
 
         let root = s.league_root();
         section_with(ui, "Insights", |ui| {
@@ -99,8 +118,7 @@ impl App {
         card(ui, |ui| match base {
             None => void(note(ui, "Play a few more games for a baseline.")),
             Some(a) => {
-                let team_kills = d.team_sum(me.team, |p| p.kills).max(1);
-                let team_dmg = d.team_sum(me.team, |p| p.damage).max(1);
+                let team = |f: fn(&MatchPlayer) -> i64| d.team_sum(me.team, f).max(1) as f64;
                 card_head(ui, &format!("Compared with {what} ({} games)", a.n), |_| {});
                 ui.add_space(4.0);
                 Grid::new("insights").striped(true).spacing([28.0, 6.0]).min_col_width(80.0).show(ui, |ui| {
@@ -128,10 +146,15 @@ impl App {
                     }
                 });
                 ui.add_space(10.0);
-                let kp = (me.kills + me.assists) as f64 / team_kills as f64;
-                let share = me.damage as f64 / team_dmg as f64;
+                let shares = [
+                    ("Kill participation", (me.kills + me.assists) as f64 / team(|p| p.kills), CYAN),
+                    ("Share of your team's damage", me.damage as f64 / team(|p| p.damage), ACCENT),
+                    ("Share of your team's gold", me.gold as f64 / team(|p| p.gold), SOON),
+                    ("Share of damage taken", me.damage_taken as f64 / team(|p| p.damage_taken), LOSS),
+                    ("Share of your team's vision", me.vision as f64 / team(|p| p.vision), WIN),
+                ];
                 tiles(ui, |ui| {
-                    for (label, frac, c) in [("Kill participation", kp, CYAN), ("Share of your team's damage", share, ACCENT)] {
+                    for (label, frac, c) in shares {
                         ui.vertical(|ui| {
                             ui.set_width(260.0);
                             ui.horizontal(|ui| {

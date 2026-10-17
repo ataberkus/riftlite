@@ -6,6 +6,7 @@ use eframe::egui::{DragValue, RichText, TextEdit, Ui, vec2};
 
 use super::theme::*;
 use super::widgets::*;
+use super::live_tab::FULLSCREEN_WARNING;
 use super::{App, set_overlay_edit};
 use crate::itemset;
 use crate::riot::Product;
@@ -99,6 +100,9 @@ impl App {
                 } else {
                     void_msg(ui, false, "Ctrl+Shift+E is taken by another program; use the tray icon menu or the switch below for edit mode.");
                 }
+            }
+            if s.window_mode == Some(0) {
+                void_msg(ui, false, FULLSCREEN_WARNING);
             }
             ui.add_space(4.0);
             let mut edit = self.shared.overlay_edit.load(Ordering::Relaxed);

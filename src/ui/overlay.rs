@@ -11,13 +11,13 @@ use eframe::egui::{
     Sense, Shadow, Stroke, StrokeKind, Ui, UiBuilder, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
 
-use super::live_tab::{diff_color, objective_text, scouts};
+use super::live_tab::{diff_color, feed_color, item_color, loadout, objective_text, scouts};
 use super::stats::{cs_baseline, kilo, mmss, signed};
 use super::theme::*;
 use super::widgets::*;
 use super::{App, OVERLAY_TITLE, OverlayDecl, loading_screen, overlay_game, overlay_id, set_overlay_edit};
 use crate::augments::{Offer, Tier};
-use crate::live::{LiveGame, LiveItem, LivePlayer, Objective};
+use crate::live::{FeedEvent, ItemCallout, LiveGame, LiveItem, LivePlayer, Objective};
 use crate::settings::{OVERLAY_MIN_SIZE, OverlaySections};
 use crate::worker::{Shared, Snapshot};
 
@@ -360,8 +360,9 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
     let objectives: Vec<_> = game
         .objectives
         .iter()
-        // A respawned objective stays listed for one minute, then drops off until the next kill.
-        .filter(|o| show.objectives && !o.ready_at.is_some_and(|t| game.game_time - t > 60.0))
+        // A respawned objective stays listed for one minute, then drops off until the next kill;
+        // one that leaves the map (Voidgrubs, Herald) stays until it does.
+        .filter(|o| show.objectives && (o.until.is_some() || !o.ready_at.is_some_and(|t| game.game_time - t > 60.0)))
         .collect();
     if !objectives.is_empty() {
         separate(ui, &mut above);
@@ -384,6 +385,38 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
                 ui.label(RichText::new(format!("{:.0}s", p.respawn)).font(semibold(11.5)).color(LOSS));
             }
         });
+    }
+    if show.enemy_spells {
+        let enemies: Vec<_> = game.players.iter().filter(|p| p.team == enemy).collect();
+        if !enemies.is_empty() {
+            separate(ui, &mut above);
+            for p in enemies {
+                ui.horizontal(|ui| {
+                    g.champ_key(ui, &p.champion_key, &p.champion, 20.0);
+                    loadout(ui, g, p, 18.0);
+                });
+            }
+        }
+    }
+    if show.events && !game.feed.is_empty() {
+        separate(ui, &mut above);
+        for e in game.feed.iter().take(3) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(mmss(e.time)).size(11.0).color(MUTED));
+                ui.label(RichText::new(&e.text).size(11.5).color(feed_color(e)));
+            });
+        }
+    }
+    let fresh: Vec<_> = game.item_callouts.iter().filter(|c| game.game_time - c.time < 60.0).take(3).collect();
+    if show.enemy_items && !fresh.is_empty() {
+        separate(ui, &mut above);
+        for c in fresh {
+            ui.horizontal(|ui| {
+                g.champ_key(ui, &c.champion_key, &c.champion, 20.0);
+                g.item(ui, c.item, 20.0);
+                ui.label(RichText::new(g.data.item_name(c.item)).size(11.5).color(item_color(game.game_time - c.time)));
+            });
+        }
     }
     if show.scouts {
         if sample {
@@ -456,6 +489,8 @@ fn sample_game() -> LiveGame {
         items: vec![LiveItem { id: 0, name: String::new(), price: items, count: 1, consumable: false }],
         dead: respawn > 0.0,
         respawn,
+        spells: ["SummonerFlash".to_string(), "SummonerDot".to_string()],
+        keystone: 8112,
         is_me,
     };
     let game_time = 14.0 * 60.0 + 32.0;
@@ -475,9 +510,27 @@ fn sample_game() -> LiveGame {
             player("Caitlyn", "CHAOS", "BOTTOM", [1, 3, 2], 124, 5000, 24.0, false),
         ],
         objectives: vec![
-            Objective { label: "Dragon".to_string(), ready_at: Some(game_time + 95.0), since: game_time - 205.0, taken_by: Some("ORDER".to_string()) },
-            Objective { label: "Baron".to_string(), ready_at: Some(game_time + 328.0), since: 0.0, taken_by: None },
+            Objective {
+                label: "Dragon".to_string(),
+                ready_at: Some(game_time + 95.0),
+                since: game_time - 205.0,
+                taken_by: Some("ORDER".to_string()),
+                until: None,
+                kill_tracked: true,
+            },
+            Objective { label: "Rift Herald".to_string(), ready_at: Some(game_time + 28.0), since: 0.0, taken_by: None, until: Some(1185.0), kill_tracked: true },
+            Objective { label: "Baron".to_string(), ready_at: Some(game_time + 328.0), since: 0.0, taken_by: None, until: None, kill_tracked: true },
         ],
         dragons: (1, 0),
+        feed: vec![
+            FeedEvent { time: game_time - 12.0, text: "Ahri killed Zed".to_string(), team: Some("ORDER".to_string()) },
+            FeedEvent { time: game_time - 70.0, text: "Darius destroyed the blue top outer turret".to_string(), team: Some("CHAOS".to_string()) },
+        ],
+        item_callouts: vec![ItemCallout {
+            time: game_time - 20.0,
+            champion: "Darius".to_string(),
+            champion_key: "Darius".to_string(),
+            item: 3071,
+        }],
     }
 }

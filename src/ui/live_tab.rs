@@ -3,12 +3,17 @@
 use eframe::egui::{Align, Align2, Color32, Grid, Layout, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
 
 use super::matches::trunc;
-use super::stats::{Scout, cs_baseline, kilo, live_puuid, mmss, scout, signed};
+use super::home::void;
+use super::stats::{Scout, cs_baseline, kilo, live_puuid, mastery_on, mmss, scout, signed};
 use super::theme::*;
 use super::widgets::*;
 use super::{App, loading_screen};
-use crate::live::{LiveGame, Objective};
+use crate::live::{FeedEvent, LiveGame, LivePlayer, Objective};
 use crate::worker::Snapshot;
+
+/// League in exclusive fullscreen: no other window, the overlay included, draws over it.
+pub(super) const FULLSCREEN_WARNING: &str =
+    "League is set to Fullscreen (WindowMode=0 in Config/game.cfg), which hides the overlay. Use Borderless or Windowed in the game's Video settings.";
 
 /// Enemy (or, before teams are known, all) players of the gameflow session with their ranks.
 pub(super) fn scouts(s: &Snapshot, my_team: Option<i64>) -> Vec<(i64, Option<Scout>)> {
@@ -37,7 +42,11 @@ pub(super) fn objective_text(o: &Objective, now: f64) -> (String, Color32) {
             let left = t - now;
             (format!("{} in {}{by}", o.label, mmss(left)), if left <= 30.0 { SOON } else { TEXT })
         }
-        Some(_) => (format!("{} up", o.label), WIN),
+        Some(_) => match o.until {
+            Some(u) if !o.kill_tracked => (format!("{} spawned · gone by {}", o.label, mmss(u)), BODY),
+            Some(u) => (format!("{} up until {}", o.label, mmss(u)), WIN),
+            None => (format!("{} up", o.label), WIN),
+        },
         None => (format!("{} down for {}", o.label, mmss(now - o.since)), MUTED),
     }
 }
@@ -51,8 +60,22 @@ pub(super) fn diff_color(v: i64) -> Color32 {
     }
 }
 
+/// Color of a feed line: the side it favors.
+pub(super) fn feed_color(e: &FeedEvent) -> Color32 {
+    match e.team.as_deref() {
+        Some("ORDER") => BLUE_TEAM,
+        Some("CHAOS") => RED_TEAM,
+        _ => MUTED,
+    }
+}
+
 fn team_color(team: &str) -> Color32 {
     if team == "CHAOS" { RED_TEAM } else { BLUE_TEAM }
+}
+
+/// A callout stands out for its first minute.
+pub(super) fn item_color(age: f64) -> Color32 {
+    if age < 60.0 { SOON } else { BODY }
 }
 
 impl App {
@@ -67,12 +90,16 @@ impl App {
             };
             empty_state(ui, Icon::Live, "Live game", msg, |_| {});
             if loading_screen(s) && !scouts(s, None).is_empty() {
-                section(ui, "Enemy ranks");
-                card(ui, |ui| scouting(ui, &g, s, None));
+                section(ui, "Players");
+                card(ui, |ui| loading_players(ui, &g, s));
             }
             return;
         };
         live_header(ui, &g, s, game);
+        if self.settings.overlay_enabled && s.window_mode == Some(0) {
+            ui.add_space(6.0);
+            error(ui, FULLSCREEN_WARNING);
+        }
         if !game.objectives.is_empty() {
             section(ui, "Objectives");
             card(ui, |ui| {
@@ -88,6 +115,33 @@ impl App {
                         });
                     }
                 });
+            });
+        }
+        if !game.feed.is_empty() {
+            section(ui, "Recent events");
+            card(ui, |ui| {
+                for e in game.feed.iter().take(10) {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([44.0, 18.0], eframe::egui::Label::new(RichText::new(mmss(e.time)).size(11.5).color(MUTED)));
+                        let (r, _) = ui.allocate_exact_size(vec2(3.0, 14.0), Sense::hover());
+                        ui.painter().rect_filled(r, 1, feed_color(e));
+                        ui.label(RichText::new(&e.text).color(BODY));
+                    });
+                }
+            });
+        }
+        if !game.item_callouts.is_empty() {
+            section(ui, "Enemy items finished");
+            card(ui, |ui| {
+                for c in game.item_callouts.iter().take(10) {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([44.0, 18.0], eframe::egui::Label::new(RichText::new(mmss(c.time)).size(11.5).color(MUTED)));
+                        g.champ_key(ui, &c.champion_key, &c.champion, 20.0);
+                        ui.label(RichText::new(&c.champion).font(semibold(12.5)).color(TEXT));
+                        g.item(ui, c.item, 20.0);
+                        ui.label(RichText::new(s.data.item_name(c.item)).color(item_color(game.game_time - c.time)));
+                    });
+                }
             });
         }
         let mut teams: Vec<&str> = game.players.iter().map(|p| p.team.as_str()).collect();
@@ -110,7 +164,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 Grid::new(team).striped(true).spacing([12.0, 4.0]).min_row_height(34.0).show(ui, |ui| {
-                    for h in ["", "Player", "Rank", "Lvl", "K / D / A", "CS", "Wards", "Items"] {
+                    for h in ["", "Player", "Spells", "Rank", "Lvl", "K / D / A", "CS", "Wards", "Items"] {
                         ui.label(RichText::new(h.to_uppercase()).font(semibold(10.5)).color(MUTED));
                     }
                     ui.end_row();
@@ -135,10 +189,15 @@ impl App {
                                 ui.label(RichText::new(&p.champion).size(11.0).color(MUTED));
                             }
                         });
+                        loadout(ui, &g, p, 20.0);
                         ui.horizontal(|ui| {
-                            if let Some(r) = live_puuid(s, p).and_then(|id| scout(s, id)) {
+                            let puuid = live_puuid(s, p);
+                            if let Some(r) = puuid.and_then(|id| scout(s, id)) {
                                 rank_emblem(ui, &r.tier, 20.0);
                                 ui.label(RichText::new(r.text).size(11.5).color(if r.tier.is_empty() { MUTED } else { tier_color(&r.tier) }));
+                            }
+                            if let (Some(id), Some(champ)) = (puuid, s.data.champion_by_key(&p.champion_key)) {
+                                mastery_tag(ui, s, id, champ);
                             }
                         });
                         ui.label(RichText::new(p.level.to_string()).font(semibold(13.0)).color(BODY));
@@ -159,6 +218,21 @@ impl App {
             });
         }
     }
+}
+
+/// A live player's summoner spells and keystone, as far as the game names them.
+pub(super) fn loadout(ui: &mut Ui, g: &Gfx, p: &LivePlayer, size: f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for key in &p.spells {
+            if let Some(id) = g.data.spell_by_key(key) {
+                g.spell(ui, id, size);
+            }
+        }
+        if p.keystone > 0 {
+            g.perk(ui, p.keystone, size + 2.0);
+        }
+    });
 }
 
 /// Your champion, level, timer and the headline numbers.
@@ -250,21 +324,35 @@ fn live_header(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: &LiveGame) {
     });
 }
 
-/// Enemy ranks as a list for the Live tab.
-fn scouting(ui: &mut Ui, g: &Gfx, s: &Snapshot, my_team: Option<i64>) {
-    for (champ, r) in scouts(s, my_team) {
-        ui.horizontal(|ui| {
-            g.champ(ui, champ, 28.0);
-            ui.label(RichText::new(s.data.champion_name(champ)).font(semibold(13.0)).color(TEXT));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match r {
-                Some(r) => {
-                    ui.label(RichText::new(&r.text).color(if r.tier.is_empty() { MUTED } else { tier_color(&r.tier) }));
-                    rank_emblem(ui, &r.tier, 22.0);
-                }
-                None => {
-                    ui.label(RichText::new("…").color(MUTED));
-                }
-            });
-        });
+/// A player's mastery on their champion as a small tag; nothing until it is loaded.
+pub(super) fn mastery_tag(ui: &mut Ui, s: &Snapshot, puuid: &str, champion: i64) {
+    if let Some((text, level)) = mastery_on(s, puuid, champion) {
+        pill(ui, text, if level >= 10 { SOON } else if level == 0 { FAINT } else { MUTED }).on_hover_text("Champion mastery level and points on this champion");
     }
+}
+
+/// Loading screen: both teams of the gameflow session with rank and mastery on their champion.
+fn loading_players(ui: &mut Ui, g: &Gfx, s: &Snapshot) {
+    let Some(session) = &s.session else { return };
+    ui.columns(2, |cols| {
+        for (ui, (team, label, color)) in cols.iter_mut().zip([(100, "Blue side", BLUE_TEAM), (200, "Red side", RED_TEAM)]) {
+            ui.label(RichText::new(label).font(semibold(13.0)).color(color));
+            for p in session.players.iter().filter(|p| p.team == team) {
+                ui.horizontal(|ui| {
+                    g.champ(ui, p.champion_id, 28.0);
+                    ui.label(RichText::new(s.data.champion_name(p.champion_id)).font(semibold(13.0)).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        mastery_tag(ui, s, &p.puuid, p.champion_id);
+                        match scout(s, &p.puuid) {
+                            Some(r) => {
+                                ui.label(RichText::new(&r.text).size(11.5).color(if r.tier.is_empty() { MUTED } else { tier_color(&r.tier) }));
+                                rank_emblem(ui, &r.tier, 20.0);
+                            }
+                            None => void(ui.label(RichText::new("…").color(MUTED))),
+                        }
+                    });
+                });
+            }
+        }
+    });
 }

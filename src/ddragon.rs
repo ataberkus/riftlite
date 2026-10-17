@@ -3,18 +3,25 @@
 //! item stats used to classify builds and the image paths the UI shows are kept
 //! in memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde_json::Value;
 
 const CDN: &str = "https://ddragon.leagueoflegends.com";
+/// Cheapest legendary item price; tier-2/3 boots (≤ 1250) and support items (400) are below it.
+const COMPLETED_GOLD: i64 = 2000;
 
 #[derive(Clone, Default)]
 pub struct Champion {
     /// Data Dragon id, also the folder name under `Config/Champions` (e.g. `MonkeyKing`).
     pub id: String,
     pub name: String,
+    /// Riot's class tags (`Mage`, `Tank`, …).
+    pub tags: Vec<String>,
+    /// Riot's 0–10 ratings `info.attack` and `info.magic`: how physical or magic its damage is.
+    pub attack: i64,
+    pub magic: i64,
 }
 
 /// What an item gives, from Data Dragon's `stats` and `tags`; used to tell an AP
@@ -41,6 +48,8 @@ pub struct StaticData {
     pub champions: HashMap<i64, Champion>,
     pub items: HashMap<i64, String>,
     pub item_stats: HashMap<i64, ItemStats>,
+    /// Finished (legendary) items, for enemy item callouts.
+    pub completed_items: HashSet<i64>,
     /// Summoner spells by numeric key.
     pub spells: HashMap<i64, String>,
     /// Summoner spell Data Dragon ids (`SummonerFlash`) by numeric key, for spell images.
@@ -73,6 +82,11 @@ impl StaticData {
 
     pub fn spell_name(&self, id: i64) -> String {
         self.spells.get(&id).cloned().unwrap_or_else(|| format!("#{id}"))
+    }
+
+    /// Numeric id of a summoner spell's Data Dragon id (`SummonerFlash`).
+    pub fn spell_by_key(&self, key: &str) -> Option<i64> {
+        self.spell_keys.iter().find(|(_, k)| k.as_str() == key).map(|(&id, _)| id)
     }
 
     pub fn perk_name(&self, id: i64) -> String {
@@ -193,7 +207,14 @@ pub fn load(agent: &ureq::Agent) -> Result<StaticData, String> {
         .flatten()
         .filter_map(|(_, c)| {
             let key = c["key"].as_str()?.parse().ok()?;
-            Some((key, Champion { id: c["id"].as_str()?.to_string(), name: c["name"].as_str()?.to_string() }))
+            let champion = Champion {
+                id: c["id"].as_str()?.to_string(),
+                name: c["name"].as_str()?.to_string(),
+                tags: c["tags"].as_array().into_iter().flatten().filter_map(|t| Some(t.as_str()?.to_string())).collect(),
+                attack: c["info"]["attack"].as_i64().unwrap_or(0),
+                magic: c["info"]["magic"].as_i64().unwrap_or(0),
+            };
+            Some((key, champion))
         })
         .collect();
     let item_data: Vec<(i64, &Value)> =
@@ -214,6 +235,17 @@ pub fn load(agent: &ureq::Agent) -> Result<StaticData, String> {
         })
         .collect();
     let items = item_data.iter().filter_map(|&(id, i)| Some((id, i["name"].as_str()?.to_string()))).collect();
+    // Built from components, builds into nothing and costs a legendary's price: boots and
+    // support quest items stay out.
+    let completed_items = item_data
+        .iter()
+        .filter(|(_, i)| {
+            i["from"].as_array().is_some_and(|a| !a.is_empty())
+                && i["into"].as_array().is_none_or(|a| a.is_empty())
+                && i["gold"]["total"].as_i64().unwrap_or(0) >= COMPLETED_GOLD
+        })
+        .map(|&(id, _)| id)
+        .collect();
     let spell_data: Vec<(i64, &Value)> = spells["data"]
         .as_object()
         .into_iter()
@@ -236,7 +268,18 @@ pub fn load(agent: &ureq::Agent) -> Result<StaticData, String> {
             perk_icons.insert(id, icon.to_string());
         }
     }
-    Ok(StaticData { version, champions, items, item_stats, spells, spell_keys, perks, perk_icons, has_client_assets: false })
+    Ok(StaticData {
+        version,
+        champions,
+        items,
+        item_stats,
+        completed_items,
+        spells,
+        spell_keys,
+        perks,
+        perk_icons,
+        has_client_assets: false,
+    })
 }
 
 /// Bytes of one Data Dragon image (`path` from the `StaticData` image helpers),

@@ -5,10 +5,11 @@ use eframe::egui::{Align, Key, Layout, RichText, ScrollArea, TextEdit, Ui, vec2}
 use super::champ_select::rec_page_lines;
 use super::home::{lol_summary, mastery_list, ranked_list, void};
 use super::matches::trunc;
-use super::stats::{averages, position_label};
+use super::stats::{averages, position_label, queue_name};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
+use crate::lcu::Friend;
 use crate::worker::{Action, LcuStatus, Snapshot};
 use crate::itemset;
 
@@ -35,6 +36,7 @@ impl App {
             });
             small_note(ui, "Uses the League client's own lookup; works for players on your region.");
         });
+        self.friends_card(ui, s, &g);
         let Some(r) = &s.lookup else { return };
         let l = match r {
             Err(e) => return void(error(ui, e)),
@@ -97,6 +99,54 @@ impl App {
         }
     }
 
+    /// Friends signed in to League with their client status; look up or spectate them.
+    fn friends_card(&mut self, ui: &mut Ui, s: &Snapshot, g: &Gfx) {
+        let Some(friends) = &s.friends else { return };
+        section_with(ui, "Friends online", |ui| {
+            if ui.add(Btn::ghost("Refresh").icon(Icon::Refresh).small()).clicked() {
+                self.request(Action::LoadFriends);
+            }
+        });
+        let mut friends: Vec<&Friend> = match friends {
+            Err(e) => return void(error(ui, e)),
+            Ok(f) if f.is_empty() => return void(note(ui, "No friends are signed in to League.")),
+            Ok(f) => f.iter().collect(),
+        };
+        // In a game first, then in champ select / queue, then idle.
+        friends.sort_by_key(|f| (status_rank(&f.game_status), f.name.to_lowercase()));
+        let mut look = None;
+        card(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for f in &friends {
+                ui.horizontal(|ui| {
+                    g.profile(ui, f.icon, &f.name, 30.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        trunc(ui, RichText::new(&f.name).font(semibold(12.5)).color(TEXT), 220.0);
+                        let color = if status_rank(&f.game_status) == 0 { WIN } else { MUTED };
+                        trunc(ui, RichText::new(friend_status(f, s)).size(11.5).color(color), 320.0);
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(Btn::ghost("Look up").icon(Icon::Search).small()).clicked() {
+                            look = Some(f.name.clone());
+                        }
+                        if spectatable(&f.game_status)
+                            && ui
+                                .add(Btn::secondary("Spectate").icon(Icon::Eye).small())
+                                .on_hover_text("Asks the League client to start spectating this friend")
+                                .clicked()
+                        {
+                            self.request(Action::Spectate(f.puuid.clone()));
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(id) = look {
+            self.lookup(id);
+        }
+    }
+
     pub(super) fn champions(&mut self, ui: &mut Ui, s: &Snapshot) {
         if s.data.champions.is_empty() {
             return ui.horizontal(|ui| {
@@ -109,11 +159,18 @@ impl App {
         let g = Gfx::new(&icons, &s.data);
         let history = s.lol_history.as_deref().unwrap_or(&[]);
         let filter = self.champ_filter.to_lowercase();
+        let access = |id: i64| s.champion_access.iter().find(|c| c.id == id);
+        let scope = self.champ_scope;
         let mut list: Vec<(i64, &str)> = s
             .data
             .champions
             .iter()
             .filter(|(_, c)| filter.is_empty() || c.name.to_lowercase().contains(&filter))
+            .filter(|(id, _)| match scope {
+                ChampScope::All => true,
+                ChampScope::Owned => access(**id).is_some_and(|c| c.owned),
+                ChampScope::Free => access(**id).is_some_and(|c| c.free),
+            })
             .map(|(&id, c)| (id, c.name.as_str()))
             .collect();
         list.sort_by(|a, b| a.1.cmp(b.1));
@@ -130,7 +187,29 @@ impl App {
                             .margin(vec2(10.0, 7.0)),
                     );
                     ui.add_space(4.0);
-                    small_note(ui, format!("{} champions", list.len()));
+                    if !s.champion_access.is_empty() {
+                        ui.horizontal(|ui| {
+                            for (label, sc) in [("All", ChampScope::All), ("Owned", ChampScope::Owned), ("Free this week", ChampScope::Free)] {
+                                if ui.add(Btn::secondary(label).small().selected(self.champ_scope == sc)).clicked() {
+                                    self.champ_scope = sc;
+                                }
+                            }
+                        });
+                        let owned = s.champion_access.iter().filter(|c| c.owned).count();
+                        let free: Vec<_> = s.champion_access.iter().filter(|c| c.free).collect();
+                        let free_owned = free.iter().filter(|c| c.owned).count();
+                        small_note(
+                            ui,
+                            format!(
+                                "{} shown · you own {owned} · {} free this week, {} of them new to you",
+                                list.len(),
+                                free.len(),
+                                free.len() - free_owned
+                            ),
+                        );
+                    } else {
+                        small_note(ui, format!("{} champions", list.len()));
+                    }
                     ScrollArea::vertical().id_salt("champ-list").max_height(if narrow { 300.0 } else { 600.0 }).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for (id, name) in &list {
@@ -150,6 +229,11 @@ impl App {
                                     if let Some(a) = &a {
                                         ui.label(RichText::new(format!("{}G", a.n)).size(11.0).color(MUTED));
                                         ui.label(RichText::new(format!("{:.0}%", a.win_rate() * 100.0)).font(semibold(12.0)).color(wr_color(a.win_rate())));
+                                    }
+                                    match access(*id) {
+                                        Some(c) if c.free && !c.owned => void(pill(ui, "Free", WIN)),
+                                        Some(c) if c.free => void(pill(ui, "Free", MUTED)),
+                                        _ => {}
                                     }
                                 });
                             });
@@ -241,4 +325,67 @@ impl App {
             _ => void(note(ui, "Recommended runes need the League client running.")),
         }
     }
+}
+
+/// Statuses before the game itself: the client has no game to spectate yet.
+fn pre_game(status: &str) -> bool {
+    matches!(status, "outOfGame" | "inQueue" | "championSelect" | "") || status.starts_with("hosting")
+}
+
+fn spectatable(status: &str) -> bool {
+    !pre_game(status)
+}
+
+fn status_rank(status: &str) -> u8 {
+    match status {
+        s if spectatable(s) => 0,
+        "outOfGame" | "" => 2,
+        _ => 1,
+    }
+}
+
+/// `In game · Ranked Solo/Duo · Ahri`, `Champion select`, `Away`…
+fn friend_status(f: &Friend, s: &Snapshot) -> String {
+    let mut parts = Vec::new();
+    match f.game_status.as_str() {
+        "" | "outOfGame" => parts.push(match f.availability.as_str() {
+            "away" => "Away".to_string(),
+            "dnd" => "Busy".to_string(),
+            _ => "Online".to_string(),
+        }),
+        st => parts.push(humanize(st)),
+    }
+    if !matches!(f.game_status.as_str(), "" | "outOfGame") && f.queue_id > 0 {
+        parts.push(queue_name(f.queue_id));
+    }
+    if spectatable(&f.game_status) && f.champion_id > 0 {
+        parts.push(s.data.champion_name(f.champion_id));
+    }
+    parts.join(" · ")
+}
+
+/// `championSelect` → `Champion select`.
+fn humanize(camel: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in camel.chars().enumerate() {
+        if i == 0 {
+            out.extend(c.to_uppercase());
+        } else if c.is_uppercase() {
+            out.push(' ');
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Which champions the browser lists.
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub(super) enum ChampScope {
+    #[default]
+    All,
+    Owned,
+    /// This week's free rotation.
+    Free,
 }
