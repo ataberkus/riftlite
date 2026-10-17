@@ -294,6 +294,11 @@ impl eframe::App for App {
                 self.seen_phase = snap.phase.clone();
             }
         }
+        // The close button minimizes; only the tray menu's Quit exits.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.shared.quitting.load(Ordering::Relaxed) {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        }
         // While minimized eframe skips `ui`, which is where the overlay viewport
         // is declared. Request one hidden pass only when it must appear, go away, or
         // change mode, place or size; its contents repaint on their own.

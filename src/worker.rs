@@ -204,6 +204,8 @@ pub struct Shared {
     pub overlay_layout_dirty: AtomicBool,
     /// The League game window is the foreground window; maintained by the tray thread's WinEvent hook.
     pub game_focused: AtomicBool,
+    /// Set by the tray menu's Quit; otherwise the window's close button only minimizes.
+    pub quitting: AtomicBool,
     pub settings: Mutex<Settings>,
     actions: Mutex<Vec<Action>>,
 }
@@ -232,6 +234,7 @@ pub fn spawn(ctx: eframe::egui::Context, settings: Settings) -> Arc<Shared> {
         overlay_edit: AtomicBool::new(false),
         overlay_layout_dirty: AtomicBool::new(false),
         game_focused: AtomicBool::new(false),
+        quitting: AtomicBool::new(false),
         settings: Mutex::new(settings),
         actions: Mutex::new(Vec::new()),
     });

@@ -232,6 +232,7 @@ unsafe fn menu(hwnd: HWND, c: &Ctx) {
             CMD_EDIT => toggle_edit(c),
             CMD_QUIT => {
                 Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
+                c.shared.quitting.store(true, Ordering::Relaxed);
                 c.egui.send_viewport_cmd(egui::ViewportCommand::Close);
                 c.egui.request_repaint();
             }
