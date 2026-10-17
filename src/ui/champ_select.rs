@@ -1,7 +1,7 @@
 //! Champ select: teams, bans, ARAM cards and bench, OP.GG builds, Riot's
 //! recommended pages, automation log, your record on the pick and suggestions.
 
-use eframe::egui::{Align, Align2, Color32, Frame, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
+use eframe::egui::{Align, Align2, Color32, Label, Layout, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, vec2};
 
 use super::home::void;
 use super::matches::trunc;
@@ -56,44 +56,46 @@ fn option_stats(ui: &mut Ui, stats: &str, few: bool) {
     });
 }
 
+/// Outer size of a [`pick_tile`]. Fixed, so the wrapping [`tiles`] row knows it before placing
+/// the tile and moves it to the next row instead of squeezing it into the space left.
+const PICK_TILE: Vec2 = vec2(184.0, 56.0);
+
 /// A clickable champion tile (ARAM cards, bench, suggestions) with your record on it.
 fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>) -> eframe::egui::Response {
-    let bg = ui.painter().add(eframe::egui::Shape::Noop);
-    let inner = Frame::new().inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            g.champ(ui, champ, 40.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.label(RichText::new(g.data.champion_name(champ)).font(semibold(13.0)).color(TEXT));
-                match record {
-                    Some(a) => {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(RichText::new(format!("{:.0}%", a.win_rate() * 100.0)).font(semibold(12.0)).color(wr_color(a.win_rate())));
-                            ui.label(RichText::new(format!("{}G · KDA {:.1}", a.n, a.kda())).size(11.5).color(MUTED));
-                        });
-                    }
-                    None => {
-                        ui.label(RichText::new("no recent games").size(11.5).color(FAINT));
-                    }
-                }
-            });
-            ui.add_space(4.0);
-        });
-    });
-    let rect = inner.response.rect;
-    let resp = ui.interact(rect, inner.response.id.with("pick"), Sense::click());
+    // Narrower than a tile only when the whole row is; then the tile takes the row.
+    let size = vec2(PICK_TILE.x.min(ui.max_rect().width()), PICK_TILE.y);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
     let hovered = resp.hovered();
-    ui.painter().set(
-        bg,
-        eframe::egui::epaint::RectShape::new(
-            rect,
-            10,
-            if hovered { HOVER } else { RAISED },
-            Stroke::new(1.0, if hovered { alpha(ACCENT, 0.7) } else { BORDER_STRONG }),
-            StrokeKind::Inside,
-        ),
+    ui.painter().rect(
+        rect,
+        10,
+        if hovered { HOVER } else { RAISED },
+        Stroke::new(1.0, if hovered { alpha(ACCENT, 0.7) } else { BORDER_STRONG }),
+        StrokeKind::Inside,
     );
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 8.0))).layout(Layout::left_to_right(Align::Center)));
+    // Selectable text would take clicks meant for the tile.
+    child.style_mut().interaction.selectable_labels = false;
+    g.champ(&mut child, champ, 40.0);
+    child.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.add(Label::new(RichText::new(g.data.champion_name(champ)).font(semibold(13.0)).color(TEXT)).truncate());
+        match record {
+            Some(a) => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(RichText::new(format!("{:.0}%", a.win_rate() * 100.0)).font(semibold(12.0)).color(wr_color(a.win_rate())));
+                    ui.add(Label::new(RichText::new(format!("{}G · KDA {:.1}", a.n, a.kda())).size(11.5).color(MUTED)).truncate());
+                });
+            }
+            None => {
+                ui.add(Label::new(RichText::new("no recent games").size(11.5).color(FAINT)).truncate());
+            }
+        }
+    });
     resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
 }
 
