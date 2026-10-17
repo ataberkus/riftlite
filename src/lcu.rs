@@ -1,6 +1,7 @@
 //! League Client (LCU) API: credential discovery and the endpoints riftlite uses.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -107,6 +108,10 @@ pub fn perk_position(assigned: &str) -> &'static str {
 
 const FLASH: i64 = 4;
 const PAGE_PREFIX: &str = "riftlite";
+/// Match-history endpoints make the client query Riot's servers (always for
+/// other players, and for uncached pages of our own), so they outlast the
+/// agent's loopback timeout. Connect timeout still comes from the agent.
+const MATCH_HISTORY_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Lcu {
     pub fn new(agent: ureq::Agent, creds: &Creds) -> Self {
@@ -115,7 +120,15 @@ impl Lcu {
 
     /// One request. Empty bodies (204, or the client's empty 200s) become `Null`.
     fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, LcuError> {
-        let req = self.agent.request(method, &format!("{}{path}", self.base)).set("Authorization", &self.auth);
+        self.send_timed(method, path, body, None)
+    }
+
+    /// `send`, with `timeout` overriding the agent's overall timeout for this request only.
+    fn send_timed(&self, method: &str, path: &str, body: Option<&Value>, timeout: Option<Duration>) -> Result<Value, LcuError> {
+        let mut req = self.agent.request(method, &format!("{}{path}", self.base)).set("Authorization", &self.auth);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
         let resp = match body {
             Some(b) => req.send_json(b),
             None => req.call(),
@@ -139,6 +152,10 @@ impl Lcu {
 
     pub fn get(&self, path: &str) -> Result<Value, LcuError> {
         self.send("GET", path, None)
+    }
+
+    fn get_match_history(&self, path: &str) -> Result<Value, LcuError> {
+        self.send_timed("GET", path, None, Some(MATCH_HISTORY_TIMEOUT))
     }
 
     pub fn phase(&self) -> Result<String, LcuError> {
@@ -190,24 +207,24 @@ impl Lcu {
 
     /// Games `beg..=end` (newest first) of the local player.
     pub fn lol_history(&self, puuid: &str, beg: usize, end: usize) -> Result<Vec<LolGame>, LcuError> {
-        let v = self.get(&format!("/lol-match-history/v1/products/lol/current-summoner/matches?begIndex={beg}&endIndex={end}"))?;
+        let v = self.get_match_history(&format!("/lol-match-history/v1/products/lol/current-summoner/matches?begIndex={beg}&endIndex={end}"))?;
         Ok(parse_lol_history(&v, puuid))
     }
 
     /// Games `beg..=end` of any player.
     pub fn lol_history_of(&self, puuid: &str, beg: usize, end: usize) -> Result<Vec<LolGame>, LcuError> {
-        let v = self.get(&format!("/lol-match-history/v1/products/lol/{puuid}/matches?begIndex={beg}&endIndex={end}"))?;
+        let v = self.get_match_history(&format!("/lol-match-history/v1/products/lol/{puuid}/matches?begIndex={beg}&endIndex={end}"))?;
         Ok(parse_lol_history(&v, puuid))
     }
 
     pub fn tft_history(&self, puuid: &str) -> Result<Vec<TftGame>, LcuError> {
-        let v = self.get(&format!("/lol-match-history/v1/products/tft/{puuid}/matches?begin=0&count=20"))?;
+        let v = self.get_match_history(&format!("/lol-match-history/v1/products/tft/{puuid}/matches?begin=0&count=20"))?;
         Ok(parse_tft_history(&v, puuid))
     }
 
     /// All ten players of one finished game.
     pub fn match_detail(&self, game_id: u64) -> Result<MatchDetail, LcuError> {
-        parse_match_detail(&self.get(&format!("/lol-match-history/v1/games/{game_id}"))?)
+        parse_match_detail(&self.get_match_history(&format!("/lol-match-history/v1/games/{game_id}"))?)
             .ok_or_else(|| LcuError::Transport("match has no participants".into()))
     }
 
