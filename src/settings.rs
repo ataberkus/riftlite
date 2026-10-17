@@ -13,6 +13,17 @@ pub fn local_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("riftlite")
 }
 
+/// Where lock-in runes and summoner spells come from.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PageSource {
+    /// Riot's recommended page for the pick.
+    #[default]
+    Riot,
+    /// The OP.GG rune page and spells selected in champ select; Riot's page when OP.GG
+    /// has none or does not answer in time.
+    OpGg,
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -23,16 +34,20 @@ pub struct Settings {
     pub switch_tabs_automatically: bool,
     /// Accept the matchmaking ready check automatically (unless you already answered it).
     pub auto_accept: bool,
-    /// On lock-in, write Riot's recommended rune page into riftlite's own page.
+    /// On lock-in, write the `page_source` rune page into riftlite's own page.
     pub auto_runes: bool,
-    /// On lock-in, set Riot's recommended summoner spells (Flash stays on its key).
+    /// On lock-in, set the `page_source` summoner spells (Flash stays on its key).
     pub auto_spells: bool,
+    /// Runes and spells for `auto_runes` / `auto_spells`.
+    pub page_source: PageSource,
     /// On lock-in, write an item set: OP.GG's build when `meta_builds` is on and it has
-    /// one, otherwise the build from your best recent game on the champion.
+    /// one, otherwise the build from your best recent game on the champion in this mode.
     pub auto_item_set: bool,
-    /// Fetch OP.GG's aggregated build for the pick: written as the lock-in item set
+    /// Fetch OP.GG's aggregated builds for the pick: written as the lock-in item set
     /// (with your best game as an extra block) and offered as a rune page.
     pub meta_builds: bool,
+    /// Rank OP.GG builds by the 95 % lower bound of their win rate instead of the win rate.
+    pub meta_sort_confident: bool,
     /// League install folder chosen by hand; empty = detect automatically.
     pub league_folder: String,
 }
@@ -47,8 +62,10 @@ impl Default for Settings {
             auto_accept: false,
             auto_runes: true,
             auto_spells: false,
+            page_source: PageSource::Riot,
             auto_item_set: true,
             meta_builds: true,
+            meta_sort_confident: false,
             league_folder: String::new(),
         }
     }

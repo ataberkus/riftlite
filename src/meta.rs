@@ -1,17 +1,21 @@
 //! Aggregated champion builds from OP.GG.
 //!
-//! Source: `https://lol-api-champion.op.gg/api/global/champions/{mode}/{id}/{lane}`,
-//! the JSON endpoint behind op.gg's champion pages. It lists up to 15 core
-//! builds per champion with games, wins and pick rate. OP.GG's public MCP server
-//! (`mcp-api.op.gg`) returns only the single most played core build, so it cannot
-//! offer several builds to pick from. OP.GG permits use of its data with the
-//! source cited and without excessive requests: riftlite sends one request per
-//! picked champion, containing only the champion id, mode and lane, and labels
-//! everything it writes "OP.GG".
+//! Source: `https://lol-api-champion.op.gg/api/global/champions/{mode}/{id}/{lane}`
+//! (`arena/{id}` for Arena), the JSON endpoint behind op.gg's champion pages. It
+//! lists up to 15 core builds per champion with games, wins and pick rate, plus
+//! the most played starting items, boots, rune pages, summoner spells, skill
+//! orders and lane matchups. OP.GG's public MCP server (`mcp-api.op.gg`) returns
+//! only the single most played core build, so it cannot offer several builds to
+//! pick from. OP.GG permits use of its data with the source cited and without
+//! excessive requests: riftlite sends one request per picked champion, containing
+//! only the champion id, mode and lane, and labels everything it writes "OP.GG".
 //!
 //! Builds are classified from Data Dragon item data (`ddragon::ItemStats`), never
 //! from item names: AP or AD by which damage stat the core items mostly give, and
 //! Crit / On-hit / Tank by the item tags.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -20,11 +24,15 @@ use crate::ddragon::StaticData;
 const BASE: &str = "https://lol-api-champion.op.gg/api/global/champions";
 /// op.gg's default rank filter for ranked tables.
 const RANKED_TIER: &str = "emerald_plus";
-/// Below this many games OP.GG still lists a build, but its win rate is noise.
+/// Below this many games OP.GG still lists an option, but its win rate is noise.
 pub const MIN_GAMES: u64 = 100;
+/// A win rate whose 95 % margin is at least this many percentage points is flagged "few games".
+pub const FEW_GAMES_MARGIN: f64 = 2.5;
+/// z for a 95 % interval.
+const Z: f64 = 1.96;
 
 /// What to ask OP.GG for: its game mode and lane names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Query {
     pub mode: &'static str,
     pub position: &'static str,
@@ -39,28 +47,39 @@ impl Query {
     }
 
     fn url(&self, champion_id: i64) -> String {
-        let base = format!("{BASE}/{}/{champion_id}/{}", self.mode, self.position);
-        // ARAM, URF and Nexus Blitz have no rank tiers; a tier filter only shrinks the sample.
-        if matches!(self.mode, "ranked" | "flex") { format!("{base}?tier={RANKED_TIER}") } else { base }
+        match self.mode {
+            // Arena has no lanes; OP.GG rejects any position for it.
+            "arena" => format!("{BASE}/arena/{champion_id}"),
+            // Only ranked tables have rank tiers; elsewhere a tier filter only shrinks the sample.
+            "ranked" | "flex" => format!("{BASE}/{}/{champion_id}/{}?tier={RANKED_TIER}", self.mode, self.position),
+            _ => format!("{BASE}/{}/{champion_id}/{}", self.mode, self.position),
+        }
     }
 }
 
-/// OP.GG mode for a queue, and its lane from the champ-select position
-/// (`TOP`/`JUNGLE`/`MIDDLE`/`BOTTOM`/`UTILITY`/`NONE`, see `lcu::perk_position`).
-pub fn query_for(queue_id: i64, map_id: i64, position: &str) -> Result<Query, String> {
-    let mode = match queue_id {
+/// OP.GG mode for a queue. `map_id` 0 (unknown, as in match history) counts as Summoner's Rift.
+pub fn mode_for(queue_id: i64, map_id: i64) -> Result<&'static str, String> {
+    Ok(match queue_id {
         // ARAM Mayhem has no OP.GG table of its own; its item pool is ARAM's.
         450 | 2400 => "aram",
         900 | 1900 | 1010 => "urf",
         1300 => "nexus_blitz",
         440 => "flex",
-        1700 | 1710 | 1810..=1840 => return Err("OP.GG has no builds for this mode".into()),
+        1700 | 1710 => "arena",
+        1810..=1840 => return Err("OP.GG has no builds for this mode".into()),
         _ if map_id == 12 => "aram",
+        _ if map_id == 30 => "arena",
         _ if map_id == 11 || map_id == 0 => "ranked",
         _ => return Err("OP.GG has no builds for this map".into()),
-    };
+    })
+}
+
+/// OP.GG mode for a queue, and its lane from the champ-select position
+/// (`TOP`/`JUNGLE`/`MIDDLE`/`BOTTOM`/`UTILITY`/`NONE`, see `lcu::perk_position`).
+pub fn query_for(queue_id: i64, map_id: i64, position: &str) -> Result<Query, String> {
+    let mode = mode_for(queue_id, map_id)?;
     let position = match mode {
-        "aram" | "urf" | "nexus_blitz" => "NONE",
+        "aram" | "urf" | "nexus_blitz" | "arena" => "NONE",
         _ => match position {
             "TOP" => "TOP",
             "JUNGLE" => "JUNGLE",
@@ -71,6 +90,42 @@ pub fn query_for(queue_id: i64, map_id: i64, position: &str) -> Result<Query, St
         },
     };
     Ok(Query { mode, position })
+}
+
+fn rate(wins: u64, games: u64) -> f64 {
+    if games == 0 { 0.0 } else { wins as f64 / games as f64 }
+}
+
+/// 95 % margin of a win rate, in percentage points.
+fn margin(wins: u64, games: u64) -> f64 {
+    if games == 0 {
+        return 100.0;
+    }
+    let p = rate(wins, games);
+    Z * (p * (1.0 - p) / games as f64).sqrt() * 100.0
+}
+
+/// Lower end of the 95 % Wilson interval: a win rate that small samples cannot inflate.
+fn wilson_lower(wins: u64, games: u64) -> f64 {
+    if games == 0 {
+        return 0.0;
+    }
+    let (n, p) = (games as f64, rate(wins, games));
+    let z2 = Z * Z;
+    (p + z2 / (2.0 * n) - Z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt()) / (1.0 + z2 / n)
+}
+
+/// "53.2% ±0.3 WR · 39.0% pick · 92,134 games" (avg place appended for Arena).
+fn stats_line(wins: u64, games: u64, pick_rate: Option<f64>, total_place: u64) -> String {
+    let mut s = format!("{:.1}% ±{:.1} WR", rate(wins, games) * 100.0, margin(wins, games));
+    if let Some(p) = pick_rate {
+        s += &format!(" · {:.1}% pick", p * 100.0);
+    }
+    s += &format!(" · {} games", thousands(games));
+    if total_place > 0 && games > 0 {
+        s += &format!(" · avg place {:.1}", total_place as f64 / games as f64);
+    }
+    s
 }
 
 /// One OP.GG option: items (or spells) with how often it was played and won.
@@ -84,16 +139,27 @@ pub struct Choice {
     pub wins: u64,
     /// Share of the champion's games in this mode and lane that used it (0–1).
     pub pick_rate: f64,
+    /// Arena only: sum of final placements (1–8).
+    pub total_place: u64,
 }
 
 impl Choice {
     pub fn win_rate(&self) -> f64 {
-        if self.games == 0 { 0.0 } else { self.wins as f64 / self.games as f64 }
+        rate(self.wins, self.games)
     }
 
-    /// "53% WR · 39% pick · 92,134 games"
+    /// The win rate's 95 % margin is at least `FEW_GAMES_MARGIN` points.
+    pub fn few_games(&self) -> bool {
+        margin(self.wins, self.games) >= FEW_GAMES_MARGIN
+    }
+
+    /// Ranking key: the win rate, or its 95 % lower bound when `confident`.
+    fn score(&self, confident: bool) -> f64 {
+        if confident { wilson_lower(self.wins, self.games) } else { self.win_rate() }
+    }
+
     pub fn stats(&self) -> String {
-        format!("{:.1}% WR · {:.1}% pick · {} games", self.win_rate() * 100.0, self.pick_rate * 100.0, thousands(self.games))
+        stats_line(self.wins, self.games, Some(self.pick_rate), self.total_place)
     }
 }
 
@@ -106,6 +172,25 @@ pub struct Skills {
     pub games: u64,
     #[serde(rename = "win")]
     pub wins: u64,
+    pub pick_rate: f64,
+}
+
+impl Skills {
+    pub fn few_games(&self) -> bool {
+        margin(self.wins, self.games) >= FEW_GAMES_MARGIN
+    }
+
+    pub fn stats(&self) -> String {
+        stats_line(self.wins, self.games, Some(self.pick_rate), 0)
+    }
+}
+
+/// OP.GG's max order (`ids`, e.g. Q > E > W) and the level orders that follow it.
+#[derive(Clone, PartialEq, Debug, Default, Deserialize)]
+#[serde(default)]
+struct Mastery {
+    ids: Vec<String>,
+    builds: Vec<Skills>,
 }
 
 #[derive(Clone, PartialEq, Debug, Default, Deserialize)]
@@ -120,6 +205,7 @@ pub struct Runes {
     pub games: u64,
     #[serde(rename = "win")]
     pub wins: u64,
+    pub pick_rate: f64,
 }
 
 impl Runes {
@@ -127,6 +213,31 @@ impl Runes {
     pub fn perks(&self) -> Option<Vec<i64>> {
         let p: Vec<i64> = self.primary_rune_ids.iter().chain(&self.secondary_rune_ids).chain(&self.stat_mod_ids).copied().collect();
         (self.primary_rune_ids.len() == 4 && self.secondary_rune_ids.len() == 2 && self.stat_mod_ids.len() == 3).then_some(p)
+    }
+
+    pub fn few_games(&self) -> bool {
+        margin(self.wins, self.games) >= FEW_GAMES_MARGIN
+    }
+
+    pub fn stats(&self) -> String {
+        stats_line(self.wins, self.games, Some(self.pick_rate), 0)
+    }
+}
+
+/// The picked champion against another one in the same lane, from the picked champion's side.
+#[derive(Clone, PartialEq, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Matchup {
+    pub champion_id: i64,
+    #[serde(rename = "play")]
+    pub games: u64,
+    #[serde(rename = "win")]
+    pub wins: u64,
+}
+
+impl Matchup {
+    pub fn stats(&self) -> String {
+        stats_line(self.wins, self.games, None, 0)
     }
 }
 
@@ -233,26 +344,39 @@ impl CoreBuild {
         parts.join(" · ")
     }
 
-    /// Whether a later item fits this build's damage (an AP build skips AD items and vice versa).
+    /// Whether a later item fits this build's damage. An AP build skips AD items and crit
+    /// items without ability power (crit scales attacks); an AD build skips AP items.
     fn fits(&self, s: &crate::ddragon::ItemStats) -> bool {
         match self.damage {
-            Damage::Ap => s.ad <= s.ap,
+            Damage::Ap => s.ap > s.ad || (s.ap == s.ad && (s.ap > 0.0 || !s.crit)),
             Damage::Ad => s.ap <= s.ad,
             Damage::None => s.ap == 0.0 && s.ad == 0.0,
         }
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Summary {
-    id: i64,
+/// What the player picked among a build's options; indices into the `MetaBuild` lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Picks {
+    pub build: usize,
+    pub runes: usize,
+    pub spells: usize,
+    pub skills: usize,
+}
+
+/// One selection the player makes in the OP.GG panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pick {
+    Build(usize),
+    Runes(usize),
+    Spells(usize),
+    Skills(usize),
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct Mastery {
-    ids: Vec<String>,
+struct Summary {
+    id: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -267,11 +391,20 @@ struct RawData {
     skill_masteries: Vec<Mastery>,
     runes: Vec<Runes>,
     summoner_spells: Vec<Choice>,
+    counters: Vec<Matchup>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Info {
+    version: String,
 }
 
 #[derive(Deserialize)]
 struct Envelope {
     data: RawData,
+    #[serde(default)]
+    meta: Info,
 }
 
 /// A champion's OP.GG builds for one mode and lane.
@@ -279,35 +412,54 @@ struct Envelope {
 pub struct MetaBuild {
     pub champion_id: i64,
     pub query: Query,
-    /// Core builds with at least `MIN_GAMES` games, highest win rate first. Never empty.
+    /// Patch OP.GG aggregated, e.g. `16.20`; empty when it did not say.
+    pub patch: String,
+    /// Core builds with at least `MIN_GAMES` games, best first (see `confident`). Never empty.
     pub cores: Vec<CoreBuild>,
-    pub starter: Option<Choice>,
-    /// Boots options, most played first.
+    /// `cores` are ranked by the 95 % lower bound of their win rate instead of the win rate.
+    pub confident: bool,
+    /// Options below, most played first: the first one always, others with `MIN_GAMES`.
+    pub starters: Vec<Choice>,
     pub boots: Vec<Choice>,
+    pub skills: Vec<Skills>,
+    /// Complete pages only.
+    pub runes: Vec<Runes>,
+    /// Two-spell pairs only.
+    pub spells: Vec<Choice>,
     /// Single items players finished with, most played first.
     pub last_items: Vec<Choice>,
-    pub skills: Option<Skills>,
-    /// Max order, e.g. `["Q","E","W"]`.
-    pub skill_priority: Vec<String>,
-    pub runes: Option<Runes>,
-    pub spells: Option<Choice>,
+    /// Lane matchups with at least `MIN_GAMES` games (none outside ranked and flex).
+    pub counters: Vec<Matchup>,
+    masteries: Vec<Mastery>,
 }
 
 impl MetaBuild {
-    /// Groups that have at least one build, ordered by their top build: win rate, then
-    /// games, then `Group::ORDER`.
+    /// Re-ranks `cores` by win rate or, when `confident`, by its 95 % lower bound.
+    pub fn sort(&mut self, confident: bool) {
+        self.confident = confident;
+        self.cores.sort_by(|a, b| b.items.score(confident).total_cmp(&a.items.score(confident)).then(b.items.games.cmp(&a.items.games)));
+    }
+
+    /// Groups that have at least one build, ordered by their top build (same key as `cores`),
+    /// then games, then `Group::ORDER`.
     pub fn groups(&self) -> Vec<Group> {
-        // `cores` is sorted by win rate then games, so a group's first member is its top build.
+        // `cores` is already ranked, so a group's first member is its top build.
         let mut groups: Vec<(Group, &Choice)> =
             Group::ORDER.into_iter().filter_map(|g| Some((g, &self.cores.iter().find(|c| c.in_group(g))?.items))).collect();
-        // Stable sort: equal win rate and games keep `Group::ORDER`.
-        groups.sort_by(|(_, a), (_, b)| b.win_rate().total_cmp(&a.win_rate()).then(b.games.cmp(&a.games)));
+        // Stable sort: equal scores and games keep `Group::ORDER`.
+        let key = |c: &Choice| c.score(self.confident);
+        groups.sort_by(|(_, a), (_, b)| key(b).total_cmp(&key(a)).then(b.games.cmp(&a.games)));
         groups.into_iter().map(|(g, _)| g).collect()
     }
 
-    /// Indices into `cores` of a group's builds, highest win rate first.
+    /// Indices into `cores` of a group's builds, best first.
     pub fn in_group(&self, g: Group) -> Vec<usize> {
         (0..self.cores.len()).filter(|&i| self.cores[i].in_group(g)).collect()
+    }
+
+    /// Index of the core build with exactly these items.
+    pub fn index_of(&self, ids: &[i64]) -> Option<usize> {
+        self.cores.iter().position(|c| c.items.ids == ids)
     }
 
     /// Most played boots.
@@ -343,13 +495,29 @@ impl MetaBuild {
             .take(6)
             .collect()
     }
+
+    /// OP.GG's max order (e.g. Q > E > W) for skill order `i`; empty when OP.GG lists none.
+    pub fn skill_priority(&self, i: usize) -> Vec<String> {
+        let Some(order) = self.skills.get(i).map(|s| &s.order) else { return Vec::new() };
+        self.masteries.iter().find(|m| m.builds.iter().any(|b| &b.order == order)).map(|m| m.ids.clone()).unwrap_or_default()
+    }
+
+    pub fn matchup(&self, champion_id: i64) -> Option<&Matchup> {
+        self.counters.iter().find(|m| m.champion_id == champion_id)
+    }
+
+    /// OP.GG's patch is the Data Dragon patch (`16.20` for `16.20.1`); unknown counts as matching.
+    pub fn patch_matches(&self, ddragon_version: &str) -> bool {
+        if self.patch.is_empty() || ddragon_version.is_empty() {
+            return true;
+        }
+        ddragon_version == self.patch || ddragon_version.strip_prefix(self.patch.as_str()).is_some_and(|rest| rest.starts_with('.'))
+    }
 }
 
-/// Fetches, validates and classifies the builds. Blocking (about a second); call it off the poll thread.
-pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Query) -> Result<MetaBuild, String> {
-    if data.item_stats.is_empty() {
-        return Err("Data Dragon item data is not loaded yet; builds cannot be classified".into());
-    }
+/// Fetches, validates and classifies the builds. Blocking (about a second); call it off the
+/// poll thread, and only once `data` holds Data Dragon's items (classification needs them).
+pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Query, confident: bool) -> Result<MetaBuild, String> {
     let resp = match agent.get(&query.url(champion_id)).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Err("OP.GG does not know this champion".into()),
@@ -357,17 +525,31 @@ pub fn fetch(agent: &ureq::Agent, data: &StaticData, champion_id: i64, query: Qu
         Err(e) => return Err(format!("OP.GG unreachable: {e}")),
     };
     let text = resp.into_string().map_err(|e| format!("OP.GG read: {e}"))?;
-    parse_build(champion_id, query, &text, data)
+    parse_build(champion_id, query, &text, data, confident)
+}
+
+/// Most played first; the most played option always stays, others need `MIN_GAMES`.
+fn trusted<T>(mut v: Vec<T>, games: impl Fn(&T) -> u64) -> Vec<T> {
+    v.sort_by_key(|x| std::cmp::Reverse(games(x)));
+    let mut first = true;
+    v.retain(|x| std::mem::take(&mut first) || games(x) >= MIN_GAMES);
+    v
 }
 
 /// Turns OP.GG's JSON into classified builds, rejecting other champions and tiny samples.
-pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData) -> Result<MetaBuild, String> {
-    let raw = serde_json::from_str::<Envelope>(json).map_err(|e| format!("OP.GG build: {e}"))?.data;
+pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData, confident: bool) -> Result<MetaBuild, String> {
+    let changed = |why: String| format!("OP.GG's data format changed ({why}); riftlite needs an update to read it");
+    let env = serde_json::from_str::<Envelope>(json).map_err(|e| changed(e.to_string()))?;
+    let raw = env.data;
+    // Every field is optional, so a reshaped answer parses into defaults; no champion id gives it away.
+    if raw.summary.id == 0 {
+        return Err(changed("no champion id".into()));
+    }
     if raw.summary.id != champion_id {
         return Err(format!("OP.GG answered for champion {} instead of {champion_id}", raw.summary.id));
     }
     let most = raw.core_items.iter().map(|c| c.games).max().unwrap_or(0);
-    let mut cores: Vec<CoreBuild> = raw
+    let cores: Vec<CoreBuild> = raw
         .core_items
         .into_iter()
         .filter(|c| !c.ids.is_empty() && c.games >= MIN_GAMES)
@@ -380,20 +562,50 @@ pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData
             n => format!("OP.GG has only {n} games of this build ({}); too few to trust", query.label()),
         });
     }
-    cores.sort_by(|a, b| b.items.win_rate().total_cmp(&a.items.win_rate()).then(b.items.games.cmp(&a.items.games)));
-    let first = |v: Vec<Choice>| v.into_iter().find(|c| !c.ids.is_empty());
-    Ok(MetaBuild {
+    let items = |v: Vec<Choice>| trusted(v.into_iter().filter(|c| !c.ids.is_empty()).collect(), |c| c.games);
+    let mut build = MetaBuild {
         champion_id,
         query,
+        patch: env.meta.version,
         cores,
-        starter: first(raw.starter_items),
-        boots: raw.boots.into_iter().filter(|b| !b.ids.is_empty()).collect(),
+        confident,
+        starters: items(raw.starter_items),
+        boots: items(raw.boots),
+        skills: trusted(raw.skills.into_iter().filter(|s| !s.order.is_empty()).collect(), |s| s.games),
+        runes: trusted(raw.runes.into_iter().filter(|r| r.perks().is_some()).collect(), |r| r.games),
+        spells: trusted(raw.summoner_spells.into_iter().filter(|c| c.ids.len() == 2).collect(), |c| c.games),
         last_items: raw.last_items,
-        skills: raw.skills.into_iter().find(|s| !s.order.is_empty()),
-        skill_priority: raw.skill_masteries.into_iter().next().map(|m| m.ids).unwrap_or_default(),
-        runes: raw.runes.into_iter().next(),
-        spells: first(raw.summoner_spells).filter(|c| c.ids.len() == 2),
-    })
+        counters: raw.counters.into_iter().filter(|m| m.games >= MIN_GAMES).collect(),
+        masteries: raw.skill_masteries,
+    };
+    build.sort(confident);
+    Ok(build)
+}
+
+fn choices_path() -> PathBuf {
+    crate::settings::local_dir().join("builds.json")
+}
+
+/// `"<championId>:<mode>"` → core item ids of the OP.GG build picked last.
+fn load_choices() -> HashMap<String, Vec<i64>> {
+    std::fs::read(choices_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Core items of the build last picked for this champion and OP.GG mode.
+pub fn saved_build(champion_id: i64, mode: &str) -> Option<Vec<i64>> {
+    load_choices().remove(&format!("{champion_id}:{mode}"))
+}
+
+/// Remembers a picked build, in `%LOCALAPPDATA%\riftlite\builds.json`; nothing leaves the machine.
+pub fn save_build(champion_id: i64, mode: &str, ids: &[i64]) -> Result<(), String> {
+    let mut all = load_choices();
+    all.insert(format!("{champion_id}:{mode}"), ids.to_vec());
+    let p = choices_path();
+    std::fs::create_dir_all(p.parent().expect("builds path has a parent")).map_err(|e| e.to_string())?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&all).expect("builds serialize"))
+        .and_then(|_| std::fs::rename(&tmp, &p))
+        .map_err(|e| e.to_string())
 }
 
 fn thousands(n: u64) -> String {
@@ -428,6 +640,7 @@ mod tests {
             (3087, item(45.0, 45.0, false, true, false, false)), // Statikk Shiv
             (3032, item(0.0, 50.0, true, false, false, false)),  // Yun Tal Wildarrows
             (3031, item(0.0, 75.0, true, false, false, false)),  // Infinity Edge
+            (3046, item(0.0, 0.0, true, false, false, false)),   // Phantom Dancer
             (3085, item(0.0, 0.0, true, true, false, false)),    // Runaan's Hurricane
             (3089, item(130.0, 0.0, false, false, false, false)), // Rabadon's Deathcap
             (3006, item(0.0, 0.0, false, false, false, true)),   // Berserker's Greaves
@@ -442,25 +655,27 @@ mod tests {
     }
 
     /// Trimmed from a real answer for Kai'Sa, ranked ADC, emerald+.
-    const KAISA: &str = r#"{"data":{"summary":{"id":145},
+    const KAISA: &str = r#"{"meta":{"version":"16.20"},"data":{"summary":{"id":145},
         "core_items":[
           {"ids":[6672,3124,3302],"play":92134,"win":49015,"pick_rate":0.3896},
           {"ids":[3087,3124,3115],"play":23020,"win":12707,"pick_rate":0.0973},
           {"ids":[3032,3031,3085],"play":1176,"win":707,"pick_rate":0.005},
           {"ids":[3068,3075,3047],"play":40,"win":30,"pick_rate":0.0002}],
-        "starter_items":[{"ids":[1055,2003],"play":9000,"win":4600,"pick_rate":0.9}],
+        "starter_items":[{"ids":[1055,2003],"play":23399,"win":11406},{"ids":[1086,2003,2003],"play":255880,"win":126541},{"ids":[1083,2003],"play":40,"win":20}],
         "boots":[{"ids":[3006],"play":90000,"win":47000,"pick_rate":0.8},{"ids":[3020],"play":9000,"win":4800,"pick_rate":0.08}],
-        "last_items":[{"ids":[3006],"play":50000,"win":1},{"ids":[3115],"play":30000,"win":1},{"ids":[3031],"play":20000,"win":1},{"ids":[3089],"play":9000,"win":1}],
-        "skills":[{"order":["Q","E","W","Q"],"play":10,"win":5}],
-        "skill_masteries":[{"ids":["Q","E","W"],"play":10,"win":5}],
-        "runes":[{"primary_page_id":8000,"primary_rune_ids":[8008,9111,9104,8017],"secondary_page_id":8100,"secondary_rune_ids":[8139,8135],"stat_mod_ids":[5005,5008,5011],"play":100,"win":50}],
-        "summoner_spells":[{"ids":[4,7],"play":100,"win":50,"pick_rate":0.9}]}}"#;
+        "last_items":[{"ids":[3006],"play":50000,"win":1},{"ids":[3115],"play":30000,"win":1},{"ids":[3031],"play":20000,"win":1},{"ids":[3046],"play":15000,"win":1},{"ids":[3089],"play":9000,"win":1}],
+        "skills":[{"order":["Q","W","E","Q","Q","R","Q","E"],"play":70297,"win":41378},{"order":["Q","W","E","W","W","R","W","Q"],"play":900,"win":400}],
+        "skill_masteries":[{"ids":["Q","E","W"],"builds":[{"order":["Q","W","E","Q","Q","R","Q","E"]}]},{"ids":["W","Q","E"],"builds":[{"order":["Q","W","E","W","W","R","W","Q"]}]}],
+        "runes":[{"primary_page_id":8000,"primary_rune_ids":[8008,9111,9104,8017],"secondary_page_id":8100,"secondary_rune_ids":[8139,8135],"stat_mod_ids":[5005,5008,5011],"play":100,"win":50},
+                 {"primary_page_id":8000,"primary_rune_ids":[8008],"play":5000,"win":2500}],
+        "summoner_spells":[{"ids":[4,7],"play":100,"win":50,"pick_rate":0.9},{"ids":[4],"play":999,"win":1}],
+        "counters":[{"champion_id":202,"play":26943,"win":13935},{"champion_id":51,"play":60,"win":40}]}}"#;
 
     const ADC: Query = Query { mode: "ranked", position: "ADC" };
 
     #[test]
     fn kaisa_builds_split_into_ap_ad_on_hit_and_crit_sorted_by_win_rate() {
-        let b = parse_build(145, ADC, KAISA, &data()).expect("parses");
+        let b = parse_build(145, ADC, KAISA, &data(), false).expect("parses");
         // The 40-game tank line is under MIN_GAMES; the rest is highest win rate first.
         let order: Vec<_> = b.cores.iter().map(|c| (c.items.ids.clone(), c.label())).collect();
         assert_eq!(
@@ -475,10 +690,40 @@ mod tests {
         assert_eq!(b.groups(), [Group::Ad, Group::Crit, Group::Ap, Group::OnHit]);
         assert_eq!(b.in_group(Group::Ad), [0, 2]);
         assert_eq!(b.in_group(Group::Ap), [1]);
-        // An AP build keeps AP finishing items and drops Infinity Edge; boots are never doubled.
+        // An AP build keeps AP finishing items and drops Infinity Edge and Phantom Dancer
+        // (crit without ability power); boots are never doubled.
         assert_eq!(b.full_build(1, &data()), [3087, 3124, 3115, 3006, 3089]);
-        // Nashor's Tooth (AP) stays out of the AD build.
-        assert_eq!(b.full_build(2, &data()), [6672, 3124, 3302, 3006, 3031]);
+        // Nashor's Tooth (AP) stays out of the AD build; Phantom Dancer fits it.
+        assert_eq!(b.full_build(2, &data()), [6672, 3124, 3302, 3006, 3031, 3046]);
+    }
+
+    #[test]
+    fn options_keep_the_most_played_and_trusted_alternatives() {
+        let b = parse_build(145, ADC, KAISA, &data(), false).expect("parses");
+        // Most played first; the 40-game start is dropped, the incomplete rune page and
+        // the one-spell entry are skipped, the 60-game matchup is too small.
+        assert_eq!(b.starters.iter().map(|s| s.ids.clone()).collect::<Vec<_>>(), [vec![1086, 2003, 2003], vec![1055, 2003]]);
+        assert_eq!((b.runes.len(), b.spells.len()), (1, 1));
+        assert_eq!(b.counters.iter().map(|m| m.champion_id).collect::<Vec<_>>(), [202]);
+        // Each level order maps to the max order OP.GG lists it under.
+        assert_eq!(b.skill_priority(0), ["Q", "E", "W"]);
+        assert_eq!(b.skill_priority(1), ["W", "Q", "E"]);
+        assert!(b.skill_priority(9).is_empty());
+    }
+
+    #[test]
+    fn confident_ranking_discounts_small_samples() {
+        let json = r#"{"data":{"summary":{"id":145},"core_items":[
+            {"ids":[3087,3124,3115],"play":100,"win":65},
+            {"ids":[6672,3124,3302],"play":10000,"win":6000}]}}"#;
+        let mut b = parse_build(145, ADC, json, &data(), false).expect("parses");
+        assert_eq!(b.cores[0].items.ids, [3087, 3124, 3115], "65% beats 60% on raw win rate");
+        assert!(b.cores[0].items.few_games() && !b.cores[1].items.few_games());
+        assert_eq!(b.groups()[0], Group::Ap);
+        // 65 of 100 has a lower bound near 55%; 6,000 of 10,000 stays near 59%.
+        b.sort(true);
+        assert_eq!(b.cores[0].items.ids, [6672, 3124, 3302]);
+        assert_eq!(b.groups()[0], Group::Ad);
     }
 
     #[test]
@@ -490,11 +735,24 @@ mod tests {
         // No damage and not tank (Runaan's carries only tags): still listed, under Utility.
         let utility = CoreBuild::classify(Choice { ids: vec![3085, 3006], ..Choice::default() }, &d);
         assert!(Group::ORDER.iter().filter(|&&g| utility.in_group(g)).eq([&Group::Utility]));
-        assert!(parse_build(62, ADC, KAISA, &d).unwrap_err().contains("instead of 62"));
+        assert!(parse_build(62, ADC, KAISA, &d, false).unwrap_err().contains("instead of 62"));
         let sona = r#"{"data":{"summary":{"id":37},"core_items":[{"ids":[3070,3100,3040],"play":1,"win":1}]}}"#;
-        assert!(parse_build(37, Query { mode: "ranked", position: "JUNGLE" }, sona, &d).unwrap_err().contains("only 1 game "));
+        assert!(parse_build(37, Query { mode: "ranked", position: "JUNGLE" }, sona, &d, false).unwrap_err().contains("only 1 game "));
         let none = r#"{"data":{"summary":{"id":37},"core_items":[]}}"#;
-        assert!(parse_build(37, ADC, none, &d).unwrap_err().contains("no build"));
+        assert!(parse_build(37, ADC, none, &d, false).unwrap_err().contains("no build"));
+        assert!(parse_build(37, ADC, r#"{"data":[]}"#, &d, false).unwrap_err().contains("format changed"));
+        assert!(parse_build(37, ADC, r#"{"data":{"champion":{"id":37}}}"#, &d, false).unwrap_err().contains("format changed"));
+        assert!(parse_build(37, ADC, "<html>", &d, false).unwrap_err().contains("format changed"));
+    }
+
+    #[test]
+    fn patch_check_compares_whole_version_parts() {
+        let b = parse_build(145, ADC, KAISA, &data(), false).expect("parses");
+        assert!(b.patch_matches("16.20.1"));
+        assert!(!b.patch_matches("16.21.1"));
+        assert!(!b.patch_matches("16.2.1"));
+        let older = MetaBuild { patch: "16.2".into(), ..b };
+        assert!(!older.patch_matches("16.20.1"), "16.2 is not a prefix match for 16.20");
     }
 
     #[test]
@@ -503,9 +761,13 @@ mod tests {
         assert_eq!(query_for(440, 11, "UTILITY"), Ok(Query { mode: "flex", position: "SUPPORT" }));
         assert_eq!(query_for(2400, 12, "NONE"), Ok(Query { mode: "aram", position: "NONE" }));
         assert_eq!(query_for(1900, 11, "TOP"), Ok(Query { mode: "urf", position: "NONE" }));
+        assert_eq!(query_for(1700, 30, "NONE"), Ok(Query { mode: "arena", position: "NONE" }));
         assert!(query_for(430, 11, "NONE").is_err(), "blind pick without a lane");
-        assert!(query_for(1700, 30, "NONE").is_err(), "Arena");
+        assert!(query_for(1830, 33, "NONE").is_err(), "Swarm");
+        // Match history has no map: its queues still map to the item pool's mode.
+        assert_eq!((mode_for(450, 0), mode_for(400, 0)), (Ok("aram"), Ok("ranked")));
         assert_eq!(Query { mode: "aram", position: "NONE" }.url(115), format!("{BASE}/aram/115/NONE"));
+        assert_eq!(Query { mode: "arena", position: "NONE" }.url(145), format!("{BASE}/arena/145"));
         assert_eq!(Query { mode: "ranked", position: "ADC" }.url(145), format!("{BASE}/ranked/145/ADC?tier=emerald_plus"));
     }
 }

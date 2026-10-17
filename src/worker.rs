@@ -4,7 +4,7 @@
 //! Polling interval adapts: 1 s during champ select or a game, 2 s while the
 //! client is open, 5 s when nothing Riot is running.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -20,13 +20,16 @@ use crate::lcu::{
 };
 use crate::live::{self, LiveGame};
 use crate::riot::{self, Installs, Running};
-use crate::settings::Settings;
+use crate::settings::{PageSource, Settings};
 use crate::skills::{Recorder, SkillHint};
-use crate::meta::{self, MetaBuild, Query};
+use crate::meta::{self, MetaBuild, Pick, Picks, Query};
 use crate::{itemset, net, win};
 
-/// How long a lock-in item set waits for OP.GG before falling back to your own build.
+/// How long lock-in work that uses OP.GG (the item set, OP.GG runes and spells) waits for
+/// its answer before falling back to your own build and Riot's page.
 const META_WAIT: Duration = Duration::from_secs(20);
+/// Label prefix of the OP.GG rune page among `rec_pages`.
+const OPGG_LABEL: &str = "OP.GG";
 
 const PAGE: usize = 20;
 
@@ -60,8 +63,10 @@ pub enum Action {
     SwiftplayRunes,
     /// Riot's recommended pages for a champion in each of its positions and in ARAM.
     BrowseChampion(i64),
-    /// Show (and use for the lock-in item set) OP.GG build `cores[i]`.
-    SelectBuild(usize),
+    /// Select an option in the OP.GG panel (build, rune page, spells, skill order).
+    SelectMeta(Pick),
+    /// Ask OP.GG again after a failed answer.
+    RetryMeta,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -78,16 +83,16 @@ pub struct Lookup {
     pub mastery: Vec<Mastery>,
 }
 
-/// OP.GG's build for the current pick.
+/// OP.GG's builds for the current pick.
 #[derive(Clone, PartialEq, Debug)]
 pub struct MetaState {
     pub champion_id: i64,
     /// `Err` when OP.GG has no table for this queue or no lane is known.
     pub query: Result<Query, String>,
-    /// `None` while the request is in flight.
+    /// `None` while loading (or waiting for Data Dragon's items).
     pub build: Option<Result<MetaBuild, String>>,
-    /// Index into the build's `cores` shown and written on lock-in; 0 = highest win rate.
-    pub selected: usize,
+    /// What is shown, offered as the OP.GG rune page and written on lock-in.
+    pub picks: Picks,
 }
 
 pub struct Snapshot {
@@ -247,11 +252,32 @@ struct Auto {
     applied: Option<i64>,
     /// Lane used for the pick's recommendations (`lcu::perk_position` form).
     position: String,
-    /// OP.GG answers for this session by champion; requests run on their own threads.
-    meta_cache: HashMap<i64, Result<MetaBuild, String>>,
-    meta_chan: Option<(mpsc::Sender<(i64, Result<MetaBuild, String>)>, mpsc::Receiver<(i64, Result<MetaBuild, String>)>)>,
-    /// Locked champion whose lock-in item set waits for OP.GG, and since when.
-    items_pending: Option<(i64, Instant)>,
+    /// OP.GG builds for this session by champion and mode/lane. Only answers that worked are
+    /// kept, so a failed request is asked again (next pick of the champion, or Retry).
+    meta_cache: HashMap<(i64, Query), MetaBuild>,
+    /// Requests running on their own threads.
+    meta_inflight: HashSet<(i64, Query)>,
+    meta_chan: Option<(mpsc::Sender<MetaAnswer>, mpsc::Receiver<MetaAnswer>)>,
+    /// Lock-in work waiting for OP.GG.
+    lockin: Option<LockIn>,
+}
+
+type MetaAnswer = ((i64, Query), Result<MetaBuild, String>);
+
+/// What OP.GG gives lock-in work: the build and picks, why there is none, or `None` when
+/// OP.GG builds are off for this pick.
+type MetaUse = Option<Result<(MetaBuild, Picks), String>>;
+
+/// Lock-in work that needs OP.GG's answer (or `META_WAIT` to pass) before it runs.
+#[derive(Clone, Copy, Debug)]
+struct LockIn {
+    champion: i64,
+    since: Instant,
+    /// Apply the OP.GG rune page / spells (`PageSource::OpGg`).
+    runes: bool,
+    spells: bool,
+    /// Write the item set.
+    items: bool,
 }
 
 struct State {
@@ -541,111 +567,216 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
             None => None,
             Some(c) => {
                 let query = meta::query_for(cs.queue_id, auto.map_id, &auto.position);
-                let build = match (&query, auto.meta_cache.get(&c)) {
-                    (Err(e), _) => Some(Err(e.clone())),
-                    (Ok(_), Some(cached)) => Some(cached.clone()),
-                    (Ok(q), None) => request_meta(auto, shared.snap.lock().data.clone(), c, *q).err().map(Err),
+                let build = match &query {
+                    Err(e) => Some(Err(e.clone())),
+                    // Not cached yet: `sync_meta` requests it.
+                    Ok(q) => auto.meta_cache.get(&(c, *q)).cloned().map(Ok),
                 };
-                Some(MetaState { champion_id: c, query, build, selected: 0 })
+                Some(MetaState { champion_id: c, query, build, picks: Picks::default() })
             }
         };
+        let confident = shared.settings.lock().meta_sort_confident;
         let mut s = shared.snap.lock();
         s.rec_pages = pages;
         s.meta = meta;
+        if let Some(m) = s.meta.as_mut() {
+            adopt_build(m, confident);
+        }
         sync_meta_page(&mut s);
         changed = true;
     }
-    if let Some((_, rx)) = &auto.meta_chan {
-        for (c, r) in rx.try_iter() {
-            auto.meta_cache.insert(c, r.clone());
-            let mut s = shared.snap.lock();
-            if let Some(m) = s.meta.as_mut().filter(|m| m.champion_id == c) {
-                m.build = Some(r);
-                sync_meta_page(&mut s);
-                changed = true;
-            }
-        }
-    }
+    changed |= sync_meta(shared, auto);
     if cs.locked && champ.is_some() && auto.applied != champ {
         auto.applied = champ;
-        let champ = champ.expect("checked");
+        let champion = champ.expect("checked");
         let prefs = shared.settings.lock().clone();
-        // Outcomes are recorded in `champ_log` for the Champ select tab.
-        if prefs.auto_runes {
-            let _ = apply_runes(shared, lcu, 0, cs);
+        let opgg_pages = prefs.page_source == PageSource::OpGg && prefs.meta_builds;
+        if !opgg_pages {
+            // Riot's page is already here. Outcomes are recorded in `champ_log` for the Champ select tab.
+            if prefs.auto_runes {
+                let _ = apply_runes(shared, lcu, 0, cs);
+            }
+            if prefs.auto_spells {
+                let _ = apply_spells(shared, lcu, 0, cs);
+            }
         }
-        if prefs.auto_spells {
-            let _ = apply_spells(shared, lcu, 0, cs);
-        }
-        if prefs.auto_item_set {
-            auto.items_pending = Some((champ, Instant::now()));
-        }
+        let job = LockIn {
+            champion,
+            since: Instant::now(),
+            runes: opgg_pages && prefs.auto_runes,
+            spells: opgg_pages && prefs.auto_spells,
+            items: prefs.auto_item_set,
+        };
+        auto.lockin = (job.runes || job.spells || job.items).then_some(job);
         changed = true;
     }
-    if let Some((c, since)) = auto.items_pending {
+    if let Some(job) = auto.lockin {
         // A swap after lock-in re-arms the automation for the new champion.
-        if champ != Some(c) || lock_in_item_set(shared, c, since) {
-            auto.items_pending = None;
+        if champ != Some(job.champion) {
+            auto.lockin = None;
             changed = true;
+        } else {
+            let meta_on = shared.settings.lock().meta_builds;
+            let ready = lockin_meta(shared.snap.lock().meta.as_ref().filter(|_| meta_on), job.champion, job.since.elapsed());
+            if let Some(meta) = ready {
+                if job.runes || job.spells {
+                    apply_opgg_pages(shared, lcu, cs, job, &meta);
+                }
+                if job.items {
+                    lock_in_item_set(shared, job.champion, meta, meta::mode_for(cs.queue_id, auto.map_id).ok());
+                }
+                auto.lockin = None;
+                changed = true;
+            }
         }
     }
     changed
 }
 
-fn request_meta(auto: &mut Auto, data: Arc<StaticData>, champion_id: i64, query: Query) -> Result<(), String> {
+/// Requests the pick's OP.GG builds when they are missing, takes in answers, and keeps the
+/// shown builds ranked as Settings ask.
+fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
+    let mut changed = false;
+    let confident = shared.settings.lock().meta_sort_confident;
+    let want = {
+        let s = shared.snap.lock();
+        // Classifying needs Data Dragon's items; until they load the panel shows "loading".
+        s.meta
+            .as_ref()
+            .filter(|m| m.build.is_none() && !s.data.item_stats.is_empty())
+            .and_then(|m| Some(((m.champion_id, *m.query.as_ref().ok()?), s.data.clone())))
+    };
+    if let Some((key, data)) = want.filter(|(k, _)| !auto.meta_inflight.contains(k)) {
+        auto.meta_inflight.insert(key);
+        if let Err(e) = request_meta(auto, data, key, confident) {
+            auto.meta_inflight.remove(&key);
+            if let Some(m) = shared.snap.lock().meta.as_mut() {
+                m.build = Some(Err(e));
+            }
+            changed = true;
+        }
+    }
+    if let Some((_, rx)) = &auto.meta_chan {
+        for (key, r) in rx.try_iter() {
+            auto.meta_inflight.remove(&key);
+            if let Ok(b) = &r {
+                auto.meta_cache.insert(key, b.clone());
+            }
+            let mut s = shared.snap.lock();
+            if let Some(m) = s.meta.as_mut().filter(|m| m.champion_id == key.0 && m.query.as_ref().ok() == Some(&key.1)) {
+                m.build = Some(r);
+                adopt_build(m, confident);
+                sync_meta_page(&mut s);
+                changed = true;
+            }
+        }
+    }
+    // The ranking setting changed while builds are shown: re-rank, keeping the picked build.
+    let mut s = shared.snap.lock();
+    if let Some(m) = s.meta.as_mut()
+        && let Some(Ok(b)) = &mut m.build
+        && b.confident != confident
+    {
+        let picked = b.cores.get(m.picks.build).map(|c| c.items.ids.clone());
+        b.sort(confident);
+        m.picks.build = picked.and_then(|ids| b.index_of(&ids)).unwrap_or(0);
+        changed = true;
+    }
+    changed
+}
+
+/// A build just arrived for `m`: rank it as Settings ask and start on the build last picked
+/// for this champion and mode (else the best one) and OP.GG's most played options.
+fn adopt_build(m: &mut MetaState, confident: bool) {
+    let Some(Ok(b)) = &mut m.build else { return };
+    if b.confident != confident {
+        b.sort(confident);
+    }
+    let build = meta::saved_build(m.champion_id, b.query.mode).and_then(|ids| b.index_of(&ids)).unwrap_or(0);
+    m.picks = Picks { build, ..Picks::default() };
+}
+
+fn request_meta(auto: &mut Auto, data: Arc<StaticData>, key: (i64, Query), confident: bool) -> Result<(), String> {
     let (tx, _) = auto.meta_chan.get_or_insert_with(mpsc::channel);
     let tx = tx.clone();
     std::thread::Builder::new()
         .name("riftlite-opgg".into())
         .spawn(move || {
-            let r = meta::fetch(&net::public_agent(), &data, champion_id, query);
-            let _ = tx.send((champion_id, r));
+            let r = meta::fetch(&net::public_agent(), &data, key.0, key.1, confident);
+            let _ = tx.send((key, r));
         })
         .map(drop)
         .map_err(|e| format!("could not start the OP.GG request: {e}"))
 }
 
-/// Keeps exactly one OP.GG page (when its build has runes and spells) after Riot's pages.
+/// Keeps exactly one OP.GG page (the picked runes and spells, when OP.GG has both) after Riot's pages.
 fn sync_meta_page(s: &mut Snapshot) {
-    s.rec_pages.retain(|p| !p.label.starts_with("OP.GG"));
-    let build = s.meta.as_ref().and_then(|m| m.build.as_ref()).and_then(|b| b.as_ref().ok());
-    s.rec_pages.extend(build.and_then(meta_page));
+    s.rec_pages.retain(|p| !p.label.starts_with(OPGG_LABEL));
+    let page = s.meta.as_ref().and_then(|m| match &m.build {
+        Some(Ok(b)) => meta_page(b, m.picks),
+        _ => None,
+    });
+    s.rec_pages.extend(page);
 }
 
-fn meta_page(b: &MetaBuild) -> Option<RecPage> {
-    let r = b.runes.as_ref()?;
-    let spells = b.spells.as_ref()?;
-    let win_rate = if r.games == 0 { 0.0 } else { r.wins as f64 / r.games as f64 * 100.0 };
+fn meta_page(b: &MetaBuild, picks: Picks) -> Option<RecPage> {
+    let r = b.runes.get(picks.runes)?;
+    let spells = b.spells.get(picks.spells)?;
+    let which = if picks.runes == 0 { "most played runes".to_string() } else { format!("runes option {}", picks.runes + 1) };
     Some(RecPage {
         position: b.query.position.to_uppercase(),
         primary_style: r.primary_page_id,
         sub_style: r.secondary_page_id,
         perks: r.perks()?,
         spells: [spells.ids[0], spells.ids[1]],
-        label: format!("OP.GG {} · most played · {win_rate:.0}% WR · {} games", b.query.label(), r.games),
+        label: format!("{OPGG_LABEL} {} · {which} · {}", b.query.label(), r.stats()),
     })
 }
 
-/// Writes the lock-in item set; `false` while it should keep waiting for OP.GG.
-fn lock_in_item_set(shared: &Shared, champ: i64, since: Instant) -> bool {
-    let meta_on = shared.settings.lock().meta_builds;
+/// OP.GG's part of lock-in work: `None` while it should keep waiting (up to `META_WAIT`),
+/// else what it gets (see `MetaUse`).
+fn lockin_meta(meta: Option<&MetaState>, champion: i64, waited: Duration) -> Option<MetaUse> {
+    let Some(m) = meta.filter(|m| m.champion_id == champion) else { return Some(None) };
+    match &m.build {
+        None if waited < META_WAIT => None,
+        None => Some(Some(Err("OP.GG did not answer in time".into()))),
+        Some(r) => Some(Some(r.clone().map(|b| (b, m.picks)))),
+    }
+}
+
+/// Lock-in runes and spells from the picked OP.GG page, or from Riot's page (`rec_pages[0]`)
+/// when OP.GG has none for this pick; the reason is logged.
+fn apply_opgg_pages(shared: &Shared, lcu: &Lcu, cs: &ChampSelect, job: LockIn, meta: &MetaUse) {
+    let opgg = shared.snap.lock().rec_pages.iter().position(|p| p.label.starts_with(OPGG_LABEL));
+    let i = opgg.unwrap_or_else(|| {
+        let why = match meta {
+            Some(Err(e)) => e.clone(),
+            Some(Ok(_)) => "OP.GG has no rune page for this mode".into(),
+            None => "OP.GG builds are off".into(),
+        };
+        log(shared, format!("OP.GG runes and spells unavailable ({why}); using Riot's recommended page"), false);
+        0
+    });
+    if job.runes {
+        let _ = apply_runes(shared, lcu, i, cs);
+    }
+    if job.spells {
+        let _ = apply_spells(shared, lcu, i, cs);
+    }
+}
+
+/// Writes the lock-in item set from OP.GG's build, else from your best game on the champion
+/// in `mode` (the OP.GG mode of this queue).
+fn lock_in_item_set(shared: &Shared, champ: i64, meta: MetaUse, mode: Option<&str>) {
     let s = shared.snap.lock();
-    let meta = match s.meta.as_ref().filter(|m| meta_on && m.champion_id == champ) {
-        None => None,
-        Some(m) => match &m.build {
-            None if since.elapsed() < META_WAIT => return false,
-            None => Some(Err("OP.GG did not answer in time".to_string())),
-            Some(r) => Some(r.clone().map(|b| (b, m.selected))),
-        },
-    };
     let name = s.data.champion_name(champ);
     let history = s.lol_history.as_deref().unwrap_or(&[]);
-    let best = itemset::best_game(history, champ);
+    let best = itemset::best_game(history, champ, mode);
     let r = match (s.league_root(), meta) {
         (None, _) => Err("League install not found; set it in Settings".to_string()),
-        (Some(root), Some(Ok((b, i)))) => itemset::write_meta(&root, &s.data, &b, i, best).map(|_| {
+        (Some(root), Some(Ok((b, picks)))) => itemset::write_meta(&root, &s.data, &b, picks, best).map(|_| {
             let own = if best.is_some() { " + your best game" } else { "" };
-            let c = &b.cores[i];
+            let c = &b.cores[picks.build];
             format!("Item set for {name} written: OP.GG {} {} ({}){own}", b.query.label(), c.label(), c.items.stats())
         }),
         (Some(root), meta) => {
@@ -654,7 +785,7 @@ fn lock_in_item_set(shared: &Shared, champ: i64, since: Instant) -> bool {
                 _ => String::new(),
             };
             match best {
-                None => Err(format!("No {name} game with items in your last {} matches{why}", history.len())),
+                None => Err(format!("No {name} game with items in this mode in your last {} matches{why}", history.len())),
                 Some(g) => itemset::write_from_game(&root, &s.data, g).map(|_| format!("Item set for {name} written from your best game{why}")),
             }
         }
@@ -664,28 +795,55 @@ fn lock_in_item_set(shared: &Shared, champ: i64, since: Instant) -> bool {
         Ok(m) => log(shared, m, true),
         Err(m) => log(shared, format!("Item set: {m}"), false),
     }
-    true
 }
 
-/// Selects an OP.GG build; if the lock-in item set was already written, rewrites it with this build.
-fn select_build(shared: &Shared, auto: &Auto, i: usize) -> Result<String, String> {
-    let (champ, label) = {
+/// Applies a selection in the OP.GG panel. A picked build is remembered per champion and
+/// mode. A new build or skill order rewrites the lock-in item set if it was already written;
+/// rune pages and spells update the OP.GG page among the recommended pages.
+fn select_meta(shared: &Shared, auto: &Auto, pick: Pick) -> Result<String, String> {
+    let (champ, msg, save, rewrite) = {
         let mut s = shared.snap.lock();
         let m = s.meta.as_mut().ok_or("no OP.GG build loaded")?;
-        let label = match &m.build {
-            Some(Ok(b)) => b.cores.get(i).map(|c| c.label()).ok_or("no such OP.GG build")?,
-            _ => return Err("no OP.GG build loaded".into()),
+        let Some(Ok(b)) = &m.build else { return Err("no OP.GG build loaded".into()) };
+        let missing = || "no such OP.GG option".to_string();
+        let (msg, save, rewrite) = match pick {
+            Pick::Build(i) => {
+                let c = b.cores.get(i).ok_or_else(missing)?;
+                m.picks.build = i;
+                (format!("OP.GG {} build selected", c.label()), Some((b.query.mode, c.items.ids.clone())), true)
+            }
+            Pick::Runes(i) => {
+                b.runes.get(i).ok_or_else(missing)?;
+                m.picks.runes = i;
+                ("OP.GG rune page selected".to_string(), None, false)
+            }
+            Pick::Spells(i) => {
+                b.spells.get(i).ok_or_else(missing)?;
+                m.picks.spells = i;
+                ("OP.GG summoner spells selected".to_string(), None, false)
+            }
+            Pick::Skills(i) => {
+                b.skills.get(i).ok_or_else(missing)?;
+                m.picks.skills = i;
+                ("OP.GG skill order selected".to_string(), None, true)
+            }
         };
-        m.selected = i;
-        (m.champion_id, label)
+        let champ = m.champion_id;
+        sync_meta_page(&mut s);
+        (champ, msg, save, rewrite)
     };
-    let written = auto.applied == Some(champ) && auto.items_pending.is_none() && shared.settings.lock().auto_item_set;
-    if written {
-        lock_in_item_set(shared, champ, Instant::now());
-        Ok(format!("OP.GG {label} build selected; item set rewritten"))
-    } else {
-        Ok(format!("OP.GG {label} build selected; it is written on lock-in"))
+    if let Some((mode, ids)) = &save {
+        // Losing a remembered choice is harmless: the best build is the default.
+        let _ = meta::save_build(champ, mode, ids);
     }
+    let written = rewrite && auto.applied == Some(champ) && auto.lockin.is_none() && shared.settings.lock().auto_item_set;
+    if !written {
+        return Ok(msg);
+    }
+    let meta = lockin_meta(shared.snap.lock().meta.as_ref(), champ, META_WAIT).flatten();
+    let mode = meta.as_ref().and_then(|r| r.as_ref().ok()).map(|(b, _)| b.query.mode);
+    lock_in_item_set(shared, champ, meta, mode);
+    Ok(format!("{msg}; item set rewritten"))
 }
 
 fn apply_runes(shared: &Shared, lcu: &Lcu, i: usize, cs: &ChampSelect) -> Result<String, String> {
@@ -800,7 +958,18 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             .spectate(&puuid)
             .map(|_| "Spectator requested; the League client starts it".to_string())
             .map_err(|e| format!("Spectate: {e} (the player must be in a game that can be spectated)")),
-        Action::SelectBuild(i) => select_build(shared, &st.auto, i),
+        Action::SelectMeta(pick) => select_meta(shared, &st.auto, pick),
+        Action::RetryMeta => {
+            let mut s = shared.snap.lock();
+            match s.meta.as_mut() {
+                // `sync_meta` asks again on the next poll.
+                Some(m) if m.query.is_ok() && matches!(m.build, Some(Err(_))) => {
+                    m.build = None;
+                    Ok("Asking OP.GG again".to_string())
+                }
+                _ => Err("No failed OP.GG request to retry".to_string()),
+            }
+        }
         Action::BrowseChampion(champ) => {
             let mut positions = lcu.recommended_positions(champ);
             positions.truncate(2);
@@ -926,4 +1095,38 @@ fn refresh_profile(shared: &Shared, lcu: &Lcu, history_len: usize) -> bool {
     changed |= set(&mut s.mastery, mastery);
     changed |= set(&mut s.challenges, challenges);
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(build: Option<Result<MetaBuild, String>>) -> MetaState {
+        let q = Query { mode: "ranked", position: "ADC" };
+        MetaState { champion_id: 145, query: Ok(q), build, picks: Picks { build: 0, runes: 0, spells: 0, skills: 1 } }
+    }
+
+    #[test]
+    fn lockin_waits_for_opgg_then_falls_back_after_meta_wait() {
+        let q = Query { mode: "ranked", position: "ADC" };
+        let json = r#"{"data":{"summary":{"id":145},"core_items":[{"ids":[6672,3124,3302],"play":500,"win":260}]}}"#;
+        let b = meta::parse_build(145, q, json, &StaticData::default(), false).expect("parses");
+        let early = Duration::from_secs(5);
+        // Still loading before META_WAIT: keep waiting.
+        assert!(lockin_meta(Some(&state(None)), 145, early).is_none());
+        // Arriving late but within META_WAIT: used, with the player's picks.
+        match lockin_meta(Some(&state(Some(Ok(b.clone())))), 145, early) {
+            Some(Some(Ok((got, picks)))) => assert_eq!((got, picks.skills), (b, 1)),
+            other => panic!("expected the build, got {other:?}"),
+        }
+        // Never arriving: an explained fallback at META_WAIT, not a wait forever.
+        match lockin_meta(Some(&state(None)), 145, META_WAIT) {
+            Some(Some(Err(e))) => assert!(e.contains("did not answer in time")),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        // A failed answer falls back at once; OP.GG off or another champion's state: no OP.GG part.
+        assert!(matches!(lockin_meta(Some(&state(Some(Err("OP.GG HTTP 500".into())))), 145, early), Some(Some(Err(_)))));
+        assert!(matches!(lockin_meta(None, 145, early), Some(None)));
+        assert!(matches!(lockin_meta(Some(&state(None)), 62, early), Some(None)));
+    }
 }
