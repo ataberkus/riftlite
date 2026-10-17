@@ -78,6 +78,6 @@ The overlay is drawn over the game only in **Borderless** or **Windowed** displa
 cargo build --release
 ```
 
-The output is `target\release\riftlite.exe`, a single file with no installer. Start it with `--minimized` to start minimized.
+The output is `target\release\riftlite.exe`, a single file with no installer. Start it with `--minimized` to start minimized. `build.bat` runs the same build from any folder; it stops without building while `riftlite.exe` is running, because Windows cannot replace a running .exe.
 
 Embedded assets: `assets/logo.png`, `assets/banner.jpg` and `assets/riftlite.ico` (made for riftlite; `build.rs` embeds the icon and version info into the .exe with `embed-resource`, which needs the Windows SDK's `rc.exe`), and the Inter and Barlow Semi Condensed fonts in `assets/fonts/` (SIL Open Font License 1.1, license texts alongside). Rank emblems and UI icons are drawn in code.

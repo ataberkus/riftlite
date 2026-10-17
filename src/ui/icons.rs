@@ -26,6 +26,8 @@ struct Job {
     version: String,
     path: String,
     max_px: u32,
+    /// Desaturate the image (locked champions).
+    grey: bool,
 }
 
 /// A texture and its size in pixels.
@@ -72,17 +74,32 @@ impl Icons {
     /// The texture for a Data Dragon image path, downscaled to at most `max_px` on
     /// its longer side. `None` while it loads (a repaint follows) or when it failed.
     pub fn get(&self, version: &str, path: &str, max_px: u32) -> Option<Tex> {
+        self.lookup(version, path, max_px, false)
+    }
+
+    /// Like [`Icons::get`], but desaturated to greyscale.
+    pub fn get_grey(&self, version: &str, path: &str, max_px: u32) -> Option<Tex> {
+        self.lookup(version, path, max_px, true)
+    }
+
+    fn lookup(&self, version: &str, path: &str, max_px: u32, grey: bool) -> Option<Tex> {
+        let key = slot_key(path, grey);
         let mut slots = self.slots.lock();
-        match slots.get(path) {
+        match slots.get(key.as_ref()) {
             Some(Slot::Ready(t)) => return Some(t.into()),
             Some(Slot::Pending) => return None,
             Some(Slot::Failed(at)) if at.elapsed() < RETRY => return None,
             _ => {}
         }
-        slots.insert(path.to_string(), Slot::Pending);
-        let _ = self.jobs.send(Job { version: version.to_string(), path: path.to_string(), max_px });
+        slots.insert(key.into_owned(), Slot::Pending);
+        let _ = self.jobs.send(Job { version: version.to_string(), path: path.to_string(), max_px, grey });
         None
     }
+}
+
+/// Cache key of an image; greyscale variants live beside the colour one.
+fn slot_key(path: &str, grey: bool) -> std::borrow::Cow<'_, str> {
+    if grey { format!("{path}#grey").into() } else { path.into() }
 }
 
 /// One fetch thread; ends when the `Icons` (and so the sender) is dropped.
@@ -93,11 +110,17 @@ fn fetch_loop(rx: &Mutex<Receiver<Job>>, icons: &Weak<Icons>, ctx: &egui::Contex
         let image = crate::ddragon::fetch_image(&agent, &job.version, &job.path)
             .and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string()));
         let slot = match image {
-            Ok(img) => Slot::Ready(ctx.load_texture(&job.path, to_color_image(img, job.max_px), OPTIONS)),
+            Ok(img) => {
+                let mut color = to_color_image(img, job.max_px);
+                if job.grey {
+                    desaturate(&mut color);
+                }
+                Slot::Ready(ctx.load_texture(slot_key(&job.path, job.grey), color, OPTIONS))
+            }
             Err(_) => Slot::Failed(Instant::now()),
         };
         let Some(icons) = icons.upgrade() else { return };
-        icons.slots.lock().insert(job.path, slot);
+        icons.slots.lock().insert(slot_key(&job.path, job.grey).into_owned(), slot);
         ctx.request_repaint();
         ctx.request_repaint_of(super::overlay_id());
     }
@@ -107,6 +130,15 @@ fn decode(bytes: &[u8], max_px: u32) -> ColorImage {
     image::load_from_memory(bytes)
         .map(|i| to_color_image(i, max_px))
         .unwrap_or_else(|_| ColorImage::filled([1, 1], egui::Color32::TRANSPARENT))
+}
+
+/// Rec. 601 luma in place. Pixels are premultiplied, so luma never exceeds alpha.
+fn desaturate(img: &mut ColorImage) {
+    for px in &mut img.pixels {
+        let [r, g, b, a] = px.to_array();
+        let l = ((299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000) as u8;
+        *px = egui::Color32::from_rgba_premultiplied(l, l, l, a);
+    }
 }
 
 fn to_color_image(img: image::DynamicImage, max_px: u32) -> ColorImage {

@@ -61,15 +61,16 @@ fn option_stats(ui: &mut Ui, stats: &str, few: bool) {
 /// the tile and moves it to the next row instead of squeezing it into the space left.
 const PICK_TILE: Vec2 = vec2(184.0, 56.0);
 
-/// A clickable champion tile (ARAM cards, bench, suggestions) with your record on it.
-fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>) -> eframe::egui::Response {
+/// A champion tile (ARAM cards, bench) with your record on it. Clickable unless `locked` (a bench
+/// champion you can't swap to), which is drawn greyed out with a padlock.
+fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>, locked: bool) -> eframe::egui::Response {
     // Narrower than a tile only when the whole row is; then the tile takes the row.
     let size = vec2(PICK_TILE.x.min(ui.max_rect().width()), PICK_TILE.y);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(size, if locked { Sense::hover() } else { Sense::click() });
     if !ui.is_rect_visible(rect) {
         return resp;
     }
-    let hovered = resp.hovered();
+    let hovered = resp.hovered() && !locked;
     ui.painter().rect(
         rect,
         10,
@@ -80,10 +81,14 @@ fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>) -> eframe::
     let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 8.0))).layout(Layout::left_to_right(Align::Center)));
     // Selectable text would take clicks meant for the tile.
     child.style_mut().interaction.selectable_labels = false;
-    g.champ(&mut child, champ, 40.0);
+    if locked {
+        g.champ_locked(&mut child, champ, 40.0);
+    } else {
+        g.champ(&mut child, champ, 40.0);
+    }
     child.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
-        ui.add(Label::new(RichText::new(g.data.champion_name(champ)).font(semibold(13.0)).color(TEXT)).truncate());
+        ui.add(Label::new(RichText::new(g.data.champion_name(champ)).font(semibold(13.0)).color(if locked { MUTED } else { TEXT })).truncate());
         match record {
             Some(a) => {
                 ui.horizontal(|ui| {
@@ -97,7 +102,7 @@ fn pick_tile(ui: &mut Ui, g: &Gfx, champ: i64, record: Option<&Avg>) -> eframe::
             }
         }
     });
-    resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
+    if locked { resp } else { resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand) }
 }
 
 /// The party before champ select: members with rank and roles, and the queue timer.
@@ -329,7 +334,7 @@ impl App {
             }
             tiles(ui, |ui| {
                 for &c in &cs.card_choices {
-                    let resp = pick_tile(ui, &g, c, record(c).as_ref());
+                    let resp = pick_tile(ui, &g, c, record(c).as_ref(), false);
                     if resp.on_hover_text("Pick this champion (your record on it from recent games)").clicked() {
                         self.request(Action::PickCard(c));
                     }
@@ -344,8 +349,13 @@ impl App {
             }
             tiles(ui, |ui| {
                 for &c in &cs.bench {
-                    let resp = pick_tile(ui, &g, c, record(c).as_ref());
-                    if resp.on_hover_text("Swap to this champion (your record on it from recent games)").clicked() {
+                    // The bench carries no lock state; the client locks champions you can't pick
+                    // (not owned or rented). Until the pickable list loads, nothing is locked.
+                    let locked = !s.pickable.is_empty() && !s.pickable.contains(&c);
+                    let resp = pick_tile(ui, &g, c, record(c).as_ref(), locked);
+                    if locked {
+                        resp.on_hover_text("Locked: you don't own this champion, so you can't swap to it");
+                    } else if resp.on_hover_text("Swap to this champion (your record on it from recent games)").clicked() {
                         self.request(Action::BenchSwap(c));
                     }
                 }

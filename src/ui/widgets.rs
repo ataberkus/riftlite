@@ -633,6 +633,7 @@ pub enum Icon {
     ArrowUp,
     ArrowDown,
     Skull,
+    Lock,
 }
 
 /// Paints `icon` into `rect` (drawn on a 24-unit grid).
@@ -766,6 +767,10 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.circle_filled(at(9.0, 11.0), 1.9 * s, color);
             p.circle_filled(at(15.0, 11.0), 1.9 * s, color);
         }
+        Icon::Lock => {
+            p.add(Shape::line(arc(12.0, 10.5, 4.5, 5.0, 180.0, 360.0), st));
+            p.rect_filled(Rect::from_min_max(at(5.0, 11.0), at(19.0, 21.0)), (2.0 * s) as u8, color);
+        }
     }
 }
 
@@ -835,6 +840,28 @@ impl<'a> Gfx<'a> {
     pub fn champ_key(&self, ui: &mut Ui, key: &str, name: &str, size: f32) -> Response {
         let radius = (size * 0.22) as u8;
         self.tile(ui, || self.data.champion_icon_by_key(key), size, radius, 0.07, Fallback::Text(name)).on_hover_text(name)
+    }
+
+    /// A champion portrait you can't take: greyscale, dimmed, with a padlock badge on its bottom
+    /// edge (how the League client draws locked ARAM bench champions).
+    pub fn champ_locked(&self, ui: &mut Ui, id: i64, size: f32) -> Response {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return resp;
+        }
+        let p = ui.painter();
+        let radius = (size * 0.22) as u8;
+        match self.data.champion_icon(id).and_then(|path| self.icons.get_grey(&self.data.version, &path, 96)) {
+            Some(t) => paint_tex(p, rect, t, radius, Rect::from_min_max(pos2(0.07, 0.07), pos2(0.93, 0.93)), Color32::from_gray(150)),
+            None => {
+                p.rect_filled(rect, radius, RAISED);
+            }
+        }
+        p.rect_stroke(rect, radius, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+        let badge = Rect::from_center_size(rect.center_bottom(), Vec2::splat(size * 0.42));
+        p.circle(badge.center(), badge.width() / 2.0, BG, Stroke::new(1.0, BORDER_STRONG));
+        paint_icon(p, badge.shrink(badge.width() * 0.2), Icon::Lock, MUTED);
+        resp
     }
 
     /// Champion portrait painted at a given rect (no allocation), dimmed by `tint`.

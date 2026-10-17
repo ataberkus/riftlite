@@ -144,10 +144,6 @@ pub struct Choice {
 }
 
 impl Choice {
-    pub fn win_rate(&self) -> f64 {
-        rate(self.wins, self.games)
-    }
-
     /// The win rate's 95 % margin is at least `FEW_GAMES_MARGIN` points.
     pub fn few_games(&self) -> bool {
         margin(self.wins, self.games) >= FEW_GAMES_MARGIN
@@ -781,7 +777,8 @@ mod tests {
             {"ids":[3087,3124,3115],"play":100,"win":65},
             {"ids":[6672,3124,3302],"play":10000,"win":6000}]}}"#;
         let b = parse_build(145, ADC, json, &data()).expect("parses");
-        assert!(b.cores[1].items.win_rate() > b.cores[0].items.win_rate(), "65% beats 60% on raw win rate");
+        let raw = |c: &Choice| rate(c.wins, c.games);
+        assert!(raw(&b.cores[1].items) > raw(&b.cores[0].items), "65% beats 60% on raw win rate");
         assert!(b.cores[1].items.few_games() && !b.cores[0].items.few_games());
         // 65 of 100 has a lower bound near 55%; 6,000 of 10,000 stays near 59%.
         assert_eq!(b.cores[0].items.ids, [6672, 3124, 3302]);
