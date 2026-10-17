@@ -48,6 +48,8 @@ pub struct OverlaySections {
     pub dead_enemies: bool,
     /// Enemy ranks during loading and the first minute and a half.
     pub scouts: bool,
+    /// ARAM Mayhem: where the augment tiers come from (or why they are missing).
+    pub augment_line: bool,
 }
 
 impl Default for OverlaySections {
@@ -61,13 +63,14 @@ impl Default for OverlaySections {
             objectives: true,
             dead_enemies: true,
             scouts: true,
+            augment_line: true,
         }
     }
 }
 
 impl OverlaySections {
     /// Short label and flag of every section, in drawing order.
-    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 8] {
+    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 9] {
         [
             ("Clock", &mut self.clock),
             ("KDA / CS", &mut self.kda),
@@ -77,6 +80,7 @@ impl OverlaySections {
             ("Objectives", &mut self.objectives),
             ("Dead enemies", &mut self.dead_enemies),
             ("Enemy ranks", &mut self.scouts),
+            ("Augment source", &mut self.augment_line),
         ]
     }
 }
@@ -99,6 +103,9 @@ pub struct Settings {
     legacy_margin_top: Option<f32>,
     /// Show the overlay only while the League game window is the foreground window.
     pub overlay_focus_only: bool,
+    /// ARAM Mayhem: read the offered augment cards off the screen and show Blitz's tier
+    /// under each on the overlay.
+    pub augment_tiers: bool,
     pub switch_tabs_automatically: bool,
     /// Accept the matchmaking ready check automatically (unless you already answered it).
     pub auto_accept: bool,
@@ -128,6 +135,7 @@ impl Default for Settings {
             legacy_margin_right: None,
             legacy_margin_top: None,
             overlay_focus_only: true,
+            augment_tiers: true,
             switch_tabs_automatically: true,
             auto_accept: false,
             auto_runes: true,

@@ -3,6 +3,7 @@
 //! One native process with a background poller thread; no embedded browser,
 //! no script runtime, no injection, no elevation.
 
+mod augments;
 mod ddragon;
 mod itemset;
 mod lcu;

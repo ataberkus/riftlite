@@ -1,8 +1,9 @@
-//! The single background thread. It polls local state (processes, LCU, Live
+//! The background poller thread. It polls local state (processes, LCU, Live
 //! Client), runs champ-select automation and UI-requested actions, and
 //! publishes a `Snapshot`; the UI only reads it and queues `Action`s.
 //! Polling interval adapts: 1 s during champ select or a game, 2 s while the
-//! client is open, 5 s when nothing Riot is running.
+//! client is open, 5 s when nothing Riot is running. ARAM Mayhem augment cards
+//! are read on their own thread (`augments`), as OCR takes tens of milliseconds.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,7 @@ use crate::lcu::{
     self, Challenges, ChampSelect, Creds, GameSession, Lcu, LcuError, LolGame, LpChange, MatchDetail, Mastery, Mission,
     RankedQueue, RecPage, Summoner, TftGame,
 };
+use crate::augments::Offer;
 use crate::live::{self, LiveGame};
 use crate::riot::{self, Installs, Running};
 use crate::settings::{PageSource, Settings};
@@ -130,6 +132,10 @@ pub struct Snapshot {
     pub ranks: HashMap<String, Result<Vec<RankedQueue>, String>>,
     pub post_game: Option<PostGame>,
     pub live: Option<LiveGame>,
+    /// ARAM Mayhem augment cards on screen, with their tiers.
+    pub augments: Option<Offer>,
+    /// Why augment tiers are missing or incomplete during a Mayhem game.
+    pub augment_error: Option<String>,
     pub skill_hint: Option<SkillHint>,
     pub lookup: Option<Result<Lookup, String>>,
     pub busy: Option<&'static str>,
@@ -167,6 +173,8 @@ impl Default for Snapshot {
             ranks: HashMap::new(),
             post_game: None,
             live: None,
+            augments: None,
+            augment_error: None,
             skill_hint: None,
             lookup: None,
             busy: None,
@@ -207,7 +215,7 @@ impl Shared {
 }
 
 /// Assigns only when the value differs; returns whether it changed.
-fn set<T: PartialEq>(slot: &mut T, v: T) -> bool {
+pub(crate) fn set<T: PartialEq>(slot: &mut T, v: T) -> bool {
     if *slot != v {
         *slot = v;
         true
@@ -243,7 +251,14 @@ pub fn spawn(ctx: eframe::egui::Context, settings: Settings) -> Arc<Shared> {
         })
         .expect("spawn ddragon thread");
     let s = shared.clone();
-    std::thread::Builder::new().name("riftlite-poll".into()).spawn(move || poll_loop(&s, &ctx)).expect("spawn poll thread");
+    std::thread::Builder::new()
+        .name("riftlite-poll".into())
+        .spawn({
+            let ctx = ctx.clone();
+            move || poll_loop(&s, &ctx)
+        })
+        .expect("spawn poll thread");
+    crate::augments::spawn(shared.clone(), ctx);
     shared
 }
 

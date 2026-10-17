@@ -1,14 +1,18 @@
 //! Thin wrappers over the Win32 calls riftlite needs: process enumeration,
-//! another process's image path and command line, local time conversion and
-//! a single-instance mutex.
+//! another process's image path and command line, local time conversion, a
+//! single-instance mutex, and the pixels of a screen area (as a screenshot does).
 
 use std::path::PathBuf;
 use std::ptr::null_mut;
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
-    SYSTEMTIME, UNICODE_STRING, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT,
+    RECT, SYSTEMTIME, UNICODE_STRING, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
+    DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -19,8 +23,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetWindowTextW, GetWindowThreadProcessId, SW_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_NCCALCSIZE,
+    EnumWindows, FindWindowW, GetClientRect, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, SW_RESTORE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
+    WM_NCCALCSIZE,
 };
 
 pub struct Process {
@@ -136,6 +141,66 @@ pub fn is_league_game(hwnd: HWND) -> bool {
         && image_path(pid)
             .and_then(|p| p.file_name().map(|n| n.eq_ignore_ascii_case("League of Legends.exe")))
             .unwrap_or(false)
+}
+
+/// Screen rectangle `[left, top, width, height]` (physical pixels) of the League game's
+/// client area, when the game window is the foreground window.
+pub fn league_game_frame() -> Option<[i32; 4]> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if !is_league_game(hwnd) {
+        return None;
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut origin = POINT { x: 0, y: 0 };
+    let ok = unsafe { GetClientRect(hwnd, &mut r) != 0 && ClientToScreen(hwnd, &mut origin) != 0 };
+    (ok && r.right > 0 && r.bottom > 0).then_some([origin.x, origin.y, r.right, r.bottom])
+}
+
+/// BGRA pixels (top-down rows) of a screen area as composed on the desktop, read from the
+/// screen device context like a screenshot; no game process is opened.
+pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    unsafe {
+        let screen = GetDC(null_mut());
+        if screen.is_null() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let mut out = None;
+        if !mem.is_null() && !bmp.is_null() {
+            let old = SelectObject(mem, bmp);
+            if BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY) != 0 {
+                let mut info: BITMAPINFO = std::mem::zeroed();
+                info.bmiHeader = BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // negative: top-down rows
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..std::mem::zeroed()
+                };
+                let mut buf = vec![0u8; w as usize * h as usize * 4];
+                SelectObject(mem, old);
+                if GetDIBits(mem, bmp, 0, h as u32, buf.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS) == h {
+                    out = Some(buf);
+                }
+            } else {
+                SelectObject(mem, old);
+            }
+        }
+        if !bmp.is_null() {
+            DeleteObject(bmp);
+        }
+        if !mem.is_null() {
+            DeleteDC(mem);
+        }
+        ReleaseDC(null_mut(), screen);
+        out
+    }
 }
 
 /// This process's top-level window with exactly `title`, so a folder or browser tab

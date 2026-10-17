@@ -199,7 +199,9 @@ impl App {
         if placed {
             self.save_settings();
         }
-        Some(OverlayDecl { edit, pos, size: self.settings.overlay_size })
+        let frame = s.augments.as_ref().map(|o| o.frame);
+        // The augment-card viewport covers the game; it must stay click-through.
+        Some(OverlayDecl { frame, edit: edit && frame.is_none(), pos, size: self.settings.overlay_size })
     }
 
     /// Takes the layout the overlay changed in edit mode into these settings and saves it.
@@ -235,6 +237,8 @@ fn loading_screen(s: &Snapshot) -> bool {
 /// How the overlay viewport is declared; a change needs a main pass to redeclare it.
 #[derive(Clone, Copy, PartialEq)]
 struct OverlayDecl {
+    /// Augment cards are up: the viewport covers this game client area (physical pixels).
+    frame: Option<[i32; 4]>,
     /// Edit mode: not click-through, dragged and resized by the user.
     edit: bool,
     /// Panel position and size in points (`Settings::overlay_pos`, `overlay_size`).
@@ -245,8 +249,8 @@ struct OverlayDecl {
 impl OverlayDecl {
     /// What the builder sends to the window. In edit mode the window itself is moved and
     /// resized, so position and size are not redeclared (that would fight the drag).
-    fn window_key(self) -> (bool, Option<([f32; 2], [f32; 2])>) {
-        (self.edit, (!self.edit).then_some((self.pos, self.size)))
+    fn window_key(self) -> (Option<[i32; 4]>, bool, Option<([f32; 2], [f32; 2])>) {
+        (self.frame, self.edit, (!self.edit).then_some((self.pos, self.size)))
     }
 }
 

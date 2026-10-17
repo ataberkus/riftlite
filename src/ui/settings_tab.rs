@@ -109,7 +109,8 @@ impl App {
                 Some(
                     "The overlay stops being click-through and gets an accent border: drag it to move it, drag the \
                      corner grip to resize it and tick the sections to show. Outside a game it shows sample data. \
-                     Done, Ctrl+Shift+E or this switch ends it and it is click-through again.",
+                     Done, Ctrl+Shift+E or this switch ends it and it is click-through again. Not while ARAM Mayhem \
+                     augment cards are on screen.",
                 ),
             ) {
                 set_overlay_edit(ui.ctx(), &self.shared, edit);
@@ -160,6 +161,19 @@ impl App {
                     }
                 });
             });
+            ui.add_space(4.0);
+            changed |= toggle(
+                ui,
+                &mut self.settings.augment_tiers,
+                "ARAM Mayhem: show augment tiers under the offered cards",
+                Some(
+                    "Riot's game and client APIs do not list the offered augments, so riftlite copies the card titles' strip \
+                     of the screen (like a screenshot, about five times a second, only while a Mayhem game is focused) and reads it \
+                     with Windows' built-in OCR in the client's language. The S–D tiers come from Blitz \
+                     (data.v2.iesdev.com, the data behind blitz.gg's augment tier list); no game data is sent. \
+                     Riot's developer policy disallows augment win rates in overlays; use at your own discretion.",
+                ),
+            );
         });
 
         section(ui, "Behaviour");

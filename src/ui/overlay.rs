@@ -1,12 +1,14 @@
-//! The click-through in-game overlay: a separate always-on-top viewport.
+//! The click-through in-game overlay: a separate always-on-top viewport. While ARAM
+//! Mayhem augment cards are on screen it covers the game's client area, keeps the
+//! panel where the user put it, and draws each card's tier under it.
 //!
 //! Edit mode (Ctrl+Shift+E, tray menu, Settings) makes it clickable: drag to move, the
 //! corner grip resizes, checkboxes pick the sections. The window itself is moved and
 //! resized; its new place is written to `Shared::settings` and saved by the main window.
 
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, Frame, Id, Layout, Margin, Rect, ResizeDirection, RichText, Sense, Shadow, Stroke,
-    StrokeKind, Ui, UiBuilder, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Layout, Margin, Pos2, Rect, ResizeDirection, RichText,
+    Sense, Shadow, Stroke, StrokeKind, Ui, UiBuilder, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
 
 use super::live_tab::{diff_color, objective_text, scouts};
@@ -14,6 +16,7 @@ use super::stats::{cs_baseline, kilo, mmss, signed};
 use super::theme::*;
 use super::widgets::*;
 use super::{App, OVERLAY_TITLE, OverlayDecl, loading_screen, overlay_game, overlay_id, set_overlay_edit};
+use crate::augments::{Offer, Tier};
 use crate::live::{LiveGame, LiveItem, LivePlayer, Objective};
 use crate::settings::{OVERLAY_MIN_SIZE, OverlaySections};
 use crate::worker::{Shared, Snapshot};
@@ -33,8 +36,17 @@ impl App {
     /// `created`: the previous main pass did not declare the overlay, so eframe creates
     /// a new window for it after this pass.
     pub(super) fn show_overlay(&mut self, ctx: &egui::Context, created: bool, decl: OverlayDecl) {
-        let pos = pos2(decl.pos[0], decl.pos[1]);
+        let panel = pos2(decl.pos[0], decl.pos[1]);
         let size = vec2(decl.size[0], decl.size[1]);
+        // Screen pixels → points of the overlay's monitor.
+        let ppp = ctx
+            .input_for(overlay_id(), |i| i.viewport().native_pixels_per_point)
+            .or_else(|| ctx.native_pixels_per_point())
+            .unwrap_or(1.0);
+        let (pos, vp_size) = match decl.frame {
+            Some([l, t, w, h]) => (pos2(l as f32 / ppp, t as f32 / ppp), vec2(w as f32 / ppp, h as f32 / ppp)),
+            None => (panel, size),
+        };
         let mut builder = ViewportBuilder::default()
             .with_title(OVERLAY_TITLE)
             .with_decorations(false)
@@ -48,11 +60,12 @@ impl App {
         // In edit mode the user moves and resizes the window itself; redeclaring the
         // (one pass old) saved place would fight the drag.
         if !decl.edit || created {
-            builder = builder.with_position(pos).with_inner_size(size);
+            builder = builder.with_position(pos).with_inner_size(vp_size);
         }
         // egui-winit gives every undecorated window a DWM drop shadow on Windows, and no
         // builder option turns it off. Over the game that shadow outlines the otherwise
-        // invisible panel box, so the overlay callback switches it off once per window.
+        // invisible viewport (the panel box, or the whole client area while augment cards
+        // are up), so the overlay callback switches it off once per window.
         let shadow_off = Id::unique("riftlite-overlay-shadow-off");
         if created {
             ctx.data_mut(|d| d.remove::<bool>(shadow_off));
@@ -81,8 +94,12 @@ impl App {
                 return;
             }
             let g = Gfx::new(&icons, &snap.data);
-            // The window's actual size, which follows a resize in edit mode.
-            let outer = ctx.content_rect();
+            // Only the panel gets a backdrop; the rest of the viewport stays fully transparent.
+            let outer = match decl.frame {
+                Some(_) => Rect::from_min_size((panel - pos).to_pos2(), size),
+                // The window's actual size, which follows a resize in edit mode.
+                None => ctx.content_rect(),
+            };
             let panel_rect = outer.shrink(INSET);
             ui.scope_builder(UiBuilder::new().max_rect(panel_rect), |ui| {
                 // Edit mode fills the box; content that does not fit is cut at its border.
@@ -108,6 +125,10 @@ impl App {
                     move_and_resize(ui, &area, panel_rect);
                 }
             });
+            // Badges only once the viewport was declared over this exact frame.
+            if let Some(offer) = snap.augments.as_ref().filter(|o| Some(o.frame) == decl.frame) {
+                augment_badges(ui, offer, ppp);
+            }
         });
     }
 }
@@ -196,6 +217,37 @@ fn edit_bar(ui: &mut Ui, shared: &Shared, sample: bool) {
         ui.ctx().request_repaint();
     }
     rule(ui);
+}
+
+fn augment_tier_color(t: Option<Tier>) -> Color32 {
+    match t {
+        Some(Tier::S) => SOON,
+        Some(Tier::A) => ACCENT,
+        Some(Tier::B) => BLUE_TEAM,
+        Some(Tier::C) => WIN,
+        Some(Tier::D) | None => MUTED,
+    }
+}
+
+/// One tier badge under each offered card ("?" when Blitz has no tier for it).
+fn augment_badges(ui: &Ui, offer: &Offer, ppp: f32) {
+    let painter = ui.painter();
+    let size = offer.badge_size() / ppp;
+    let origin = Pos2::new(offer.frame[0] as f32, offer.frame[1] as f32);
+    for card in &offer.cards {
+        let center = pos2((card.at[0] - origin.x) / ppp, (card.at[1] - origin.y) / ppp);
+        let r = Rect::from_center_size(center, vec2(size, size));
+        let color = augment_tier_color(card.tier);
+        painter.rect(
+            r,
+            CornerRadius::same((size * 0.22) as u8),
+            Color32::from_rgba_unmultiplied(10, 13, 19, 235),
+            Stroke::new(2.0, color),
+            StrokeKind::Inside,
+        );
+        let letter = card.tier.map_or("?", Tier::letter);
+        painter.text(center, Align2::CENTER_CENTER, letter, display(size * 0.6), color);
+    }
 }
 
 /// A caption + value pair on one compact line.
@@ -338,6 +390,13 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             sample_scouts(ui, g, game, enemy);
         } else if game.game_time < SCOUT_SECS {
             overlay_scouts(ui, g, s, Some(if me.team == "ORDER" { 100 } else { 200 }));
+        }
+    }
+    if show.augment_line && (game.mode == "KIWI" || sample) {
+        if let Some(e) = s.augment_error.as_ref().filter(|_| !sample) {
+            ui.label(RichText::new(format!("Augment tiers: {e}")).size(11.0).color(LOSS));
+        } else if s.augments.is_some() || sample {
+            ui.label(RichText::new("Augment tiers: Blitz").size(11.0).color(MUTED));
         }
     }
 }
