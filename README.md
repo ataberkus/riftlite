@@ -32,7 +32,7 @@ It is one native Rust process (egui/OpenGL). There is no embedded browser, no sc
 | Post-game: result, LP change, scoreboard, insights versus your own averages in that queue | LCU `/lol-end-of-game/v1/eog-stats-block`, `/lol-ranked/v1/current-lp-change-notification`, your history |
 | Skill orders | Recorded by riftlite from the Live Client API while you play; `%LOCALAPPDATA%\riftlite\skills.json` |
 | Champion, item, summoner spell and rune names and images (portraits, splash art, item/spell/rune and profile icons) | Riot Data Dragon (`ddragon.leagueoflegends.com`), cached per patch (images in `%LOCALAPPDATA%\riftlite\ddragon\<patch>\img`); ids Data Dragon lacks (mode-only items, stat shards) from the client's `/lol-game-data/assets/v1/*.json` |
-| Tray icon (open / hide overlay / edit overlay layout / quit), start with Windows (minimized), settings | `Shell_NotifyIconW`, `RegisterHotKey`, `HKCU\…\Run`, `%LOCALAPPDATA%\riftlite\settings.json` |
+| Tray icon (open / hide overlay / edit overlay layout / quit), start with Windows (minimized), settings | `Shell_NotifyIconW`; Ctrl+Shift+O / Ctrl+Shift+E through a low-level keyboard hook (`SetWindowsHookExW(WH_KEYBOARD_LL)`, so they also work in the League game, which suppresses `RegisterHotKey` hotkeys), plus `RegisterHotKey` for elevated foreground windows; `HKCU\…\Run`, `%LOCALAPPDATA%\riftlite\settings.json` |
 
 ## Limitations
 

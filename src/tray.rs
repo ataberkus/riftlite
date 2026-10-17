@@ -1,8 +1,10 @@
 //! Notification-area icon, the global overlay hotkeys (Ctrl+Shift+O, Ctrl+Shift+E) and
 //! foreground tracking, all owned by one thread with a message-only window.
-//! Plain Win32; the WinEvent hook is out-of-context (nothing is injected).
+//! Plain Win32; the WinEvent and low-level keyboard hooks are out-of-context (nothing is
+//! injected).
 
-use std::sync::atomic::Ordering;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use eframe::egui;
@@ -10,15 +12,18 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, BringWindowToTop, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HWND_MESSAGE,
-    GetSystemMetrics, IDI_APPLICATION, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXSMICON, SM_CYSMICON,
-    IsIconic, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SW_SHOW,
-    SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP,
-    WINEVENT_OUTOFCONTEXT, WNDCLASSW,
+    AppendMenuW, BringWindowToTop, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    HC_ACTION, HWND_MESSAGE, GetSystemMetrics, IDI_APPLICATION, IMAGE_ICON, KBDLLHOOKSTRUCT, LR_SHARED, LoadImageW,
+    SM_CXSMICON, SM_CYSMICON, IsIconic, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+    RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WH_KEYBOARD_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYUP, WINEVENT_OUTOFCONTEXT, WNDCLASSW,
 };
 
 use crate::worker::Shared;
@@ -31,7 +36,8 @@ const CMD_OVERLAY: usize = 2;
 const CMD_QUIT: usize = 3;
 const CMD_EDIT: usize = 4;
 
-/// Which global hotkeys could be registered (another program may own them).
+/// Which global hotkeys are available: the keyboard hook is installed or the hotkey is
+/// registered (another program may own it).
 #[derive(Clone, Copy, Debug)]
 pub struct Hotkeys {
     /// Ctrl+Shift+O: hide/show the overlay.
@@ -49,12 +55,17 @@ struct Ctx {
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
+/// The message-only window; the keyboard hook posts its hotkeys there.
+static TRAY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Key of a hotkey the keyboard hook consumed and that is still held: auto-repeat and its
+/// release are consumed too, without toggling again (like `MOD_NOREPEAT`).
+static HELD: AtomicU32 = AtomicU32::new(0);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Starts the tray thread. Returns which hotkeys could be registered.
+/// Starts the tray thread. Returns which hotkeys are available.
 pub fn spawn(egui: egui::Context, shared: Arc<Shared>, main_title: &'static str) -> std::sync::mpsc::Receiver<Hotkeys> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -96,7 +107,15 @@ pub fn spawn(egui: egui::Context, shared: Arc<Shared>, main_title: &'static str)
                 return;
             }
             add_icon(hwnd);
-            let hotkey = |id, key: char| RegisterHotKey(hwnd, id, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, key as u32) != 0;
+            TRAY.store(hwnd, Ordering::Relaxed);
+            // The League game reads the keyboard through raw input without hotkey handling
+            // (`RIDEV_NOHOTKEYS`), so `WM_HOTKEY` never arrives while it has the foreground.
+            // The low-level hook sees the keys first and posts the hotkey itself. Windows
+            // does not call it while an elevated window has the foreground; the registered
+            // hotkeys cover that case. A key the hook consumes never reaches them, so a
+            // press toggles once.
+            let hook = !SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), hinst, 0).is_null();
+            let hotkey = |id, key: char| hook | (RegisterHotKey(hwnd, id, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, key as u32) != 0);
             let _ = tx.send(Hotkeys { overlay: hotkey(HOTKEY_OVERLAY, 'O'), edit: hotkey(HOTKEY_EDIT, 'E') });
             // Out-of-context callbacks arrive through this thread's message loop.
             SetWinEventHook(
@@ -116,6 +135,36 @@ pub fn spawn(egui: egui::Context, shared: Arc<Shared>, main_title: &'static str)
         })
         .expect("spawn tray thread");
     rx
+}
+
+/// Low-level keyboard hook: Ctrl+Shift+O / Ctrl+Shift+E become `WM_HOTKEY` for `wndproc`.
+/// Windows drops a hook that answers too slowly, so it only posts; the toggles run in
+/// `wndproc`.
+unsafe extern "system" fn on_key(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let vk = unsafe { (*(lp as *const KBDLLHOOKSTRUCT)).vkCode };
+        let msg = wp as u32;
+        if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+            if HELD.compare_exchange(vk, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return 1;
+            }
+        } else if msg == WM_KEYDOWN {
+            let id = match char::from_u32(vk) {
+                Some('O') => HOTKEY_OVERLAY,
+                Some('E') => HOTKEY_EDIT,
+                _ => 0,
+            };
+            let down = |k| unsafe { GetAsyncKeyState(k as i32) } < 0;
+            if id != 0 && down(VK_CONTROL) && down(VK_SHIFT) && !down(VK_MENU) && !down(VK_LWIN) && !down(VK_RWIN) {
+                if HELD.swap(vk, Ordering::Relaxed) != vk {
+                    let mods = (MOD_CONTROL | MOD_SHIFT) as usize;
+                    unsafe { PostMessageW(TRAY.load(Ordering::Relaxed), WM_HOTKEY, id as WPARAM, (mods | (vk as usize) << 16) as LPARAM) };
+                }
+                return 1;
+            }
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wp, lp) }
 }
 
 unsafe fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
