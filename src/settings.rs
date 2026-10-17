@@ -24,13 +24,79 @@ pub enum PageSource {
     OpGg,
 }
 
+/// Default overlay panel size, in points.
+pub const OVERLAY_SIZE: [f32; 2] = [320.0, 320.0];
+/// Smallest size the overlay can be resized to, in points.
+pub const OVERLAY_MIN_SIZE: [f32; 2] = [200.0, 120.0];
+
+/// Which overlay sections are drawn.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct OverlaySections {
+    /// Header: logo and game clock.
+    pub clock: bool,
+    /// Your KDA, CS and CS per minute against your average.
+    pub kda: bool,
+    /// Team kills and your current gold.
+    pub kills_gold: bool,
+    /// Item value, team and lane.
+    pub item_diff: bool,
+    /// "Level up X" from your last games on the champion.
+    pub skill_hint: bool,
+    pub objectives: bool,
+    /// Dead enemies with respawn timers.
+    pub dead_enemies: bool,
+    /// Enemy ranks during loading and the first minute and a half.
+    pub scouts: bool,
+}
+
+impl Default for OverlaySections {
+    fn default() -> Self {
+        OverlaySections {
+            clock: true,
+            kda: true,
+            kills_gold: true,
+            item_diff: true,
+            skill_hint: true,
+            objectives: true,
+            dead_enemies: true,
+            scouts: true,
+        }
+    }
+}
+
+impl OverlaySections {
+    /// Short label and flag of every section, in drawing order.
+    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 8] {
+        [
+            ("Clock", &mut self.clock),
+            ("KDA / CS", &mut self.kda),
+            ("Kills / gold", &mut self.kills_gold),
+            ("Item value", &mut self.item_diff),
+            ("Skill hint", &mut self.skill_hint),
+            ("Objectives", &mut self.objectives),
+            ("Dead enemies", &mut self.dead_enemies),
+            ("Enemy ranks", &mut self.scouts),
+        ]
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
     pub overlay_enabled: bool,
-    /// Overlay offset from the top-right corner of the primary monitor, in points.
-    pub overlay_margin_right: f32,
-    pub overlay_margin_top: f32,
+    /// Overlay panel's top-left corner in screen points (relative to the primary monitor's
+    /// top-left); `None` until it is first shown, then placed at the monitor's top-right.
+    pub overlay_pos: Option<[f32; 2]>,
+    /// Overlay panel size in points.
+    pub overlay_size: [f32; 2],
+    pub overlay_sections: OverlaySections,
+    /// Offsets from the top-right corner written by older versions; read once to place
+    /// `overlay_pos`, never written back.
+    #[serde(rename = "overlay_margin_right", skip_serializing)]
+    legacy_margin_right: Option<f32>,
+    #[serde(rename = "overlay_margin_top", skip_serializing)]
+    legacy_margin_top: Option<f32>,
     pub switch_tabs_automatically: bool,
     /// Accept the matchmaking ready check automatically (unless you already answered it).
     pub auto_accept: bool,
@@ -54,8 +120,11 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             overlay_enabled: true,
-            overlay_margin_right: 24.0,
-            overlay_margin_top: 120.0,
+            overlay_pos: None,
+            overlay_size: OVERLAY_SIZE,
+            overlay_sections: OverlaySections::default(),
+            legacy_margin_right: None,
+            legacy_margin_top: None,
             switch_tabs_automatically: true,
             auto_accept: false,
             auto_runes: true,
@@ -72,6 +141,20 @@ impl Settings {
     pub fn league_override(&self) -> Option<PathBuf> {
         let f = self.league_folder.trim();
         (!f.is_empty()).then(|| PathBuf::from(f))
+    }
+
+    /// Overlay panel position. The first call places it at the top-right corner of a
+    /// monitor `monitor_width` points wide (keeping an older version's offsets) and
+    /// returns `changed: true` so the caller saves it.
+    pub fn resolve_overlay_pos(&mut self, monitor_width: f32) -> ([f32; 2], bool) {
+        if let Some(p) = self.overlay_pos {
+            return (p, false);
+        }
+        let right = self.legacy_margin_right.take().unwrap_or(24.0);
+        let top = self.legacy_margin_top.take().unwrap_or(120.0);
+        let p = [monitor_width - self.overlay_size[0] - right, top];
+        self.overlay_pos = Some(p);
+        (p, true)
     }
 }
 

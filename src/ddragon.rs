@@ -1,6 +1,7 @@
 //! Champion and item names from Riot's official Data Dragon CDN, cached per
-//! patch under `%LOCALAPPDATA%\riftlite\ddragon`. Only the name maps and the few
-//! item stats used to classify builds are kept in memory.
+//! patch under `%LOCALAPPDATA%\riftlite\ddragon`. Only the name maps, the few
+//! item stats used to classify builds and the image paths the UI shows are kept
+//! in memory.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,8 +43,12 @@ pub struct StaticData {
     pub item_stats: HashMap<i64, ItemStats>,
     /// Summoner spells by numeric key.
     pub spells: HashMap<i64, String>,
+    /// Summoner spell Data Dragon ids (`SummonerFlash`) by numeric key, for spell images.
+    pub spell_keys: HashMap<i64, String>,
     /// Runes and rune paths (styles) by id.
     pub perks: HashMap<i64, String>,
+    /// Rune and rune path image paths under `cdn/img/` by id.
+    pub perk_icons: HashMap<i64, String>,
     /// The League client's local asset names have been merged in.
     pub has_client_assets: bool,
 }
@@ -72,6 +77,35 @@ impl StaticData {
 
     pub fn perk_name(&self, id: i64) -> String {
         self.perks.get(&id).cloned().unwrap_or_else(|| format!("#{id}"))
+    }
+
+    /// Image paths relative to the CDN root, for [`fetch_image`].
+    pub fn champion_icon(&self, id: i64) -> Option<String> {
+        self.champion_icon_by_key(&self.champions.get(&id)?.id)
+    }
+
+    pub fn champion_icon_by_key(&self, key: &str) -> Option<String> {
+        (!self.version.is_empty() && !key.is_empty()).then(|| format!("cdn/{}/img/champion/{key}.png", self.version))
+    }
+
+    pub fn champion_splash(&self, id: i64) -> Option<String> {
+        Some(format!("cdn/img/champion/splash/{}_0.jpg", self.champions.get(&id)?.id))
+    }
+
+    pub fn item_icon(&self, id: i64) -> Option<String> {
+        (id > 0 && !self.version.is_empty()).then(|| format!("cdn/{}/img/item/{id}.png", self.version))
+    }
+
+    pub fn spell_icon(&self, id: i64) -> Option<String> {
+        Some(format!("cdn/{}/img/spell/{}.png", self.version, self.spell_keys.get(&id)?))
+    }
+
+    pub fn perk_icon(&self, id: i64) -> Option<String> {
+        Some(format!("cdn/img/{}", self.perk_icons.get(&id)?))
+    }
+
+    pub fn profile_icon(&self, id: i64) -> Option<String> {
+        (id > 0 && !self.version.is_empty()).then(|| format!("cdn/{}/img/profileicon/{id}.png", self.version))
     }
 
     /// Fills ids Data Dragon lacks (mode-only items such as ARAM Mayhem's, stat
@@ -180,24 +214,49 @@ pub fn load(agent: &ureq::Agent) -> Result<StaticData, String> {
         })
         .collect();
     let items = item_data.iter().filter_map(|&(id, i)| Some((id, i["name"].as_str()?.to_string()))).collect();
-    let spells = spells["data"]
+    let spell_data: Vec<(i64, &Value)> = spells["data"]
         .as_object()
         .into_iter()
         .flatten()
-        .filter_map(|(_, s)| Some((s["key"].as_str()?.parse().ok()?, s["name"].as_str()?.to_string())))
+        .filter_map(|(_, s)| Some((s["key"].as_str()?.parse().ok()?, s)))
         .collect();
+    let spells = spell_data.iter().filter_map(|&(k, s)| Some((k, s["name"].as_str()?.to_string()))).collect();
+    let spell_keys = spell_data.iter().filter_map(|&(k, s)| Some((k, s["id"].as_str()?.to_string()))).collect();
     let mut perks = HashMap::new();
-    for style in runes.as_array().into_iter().flatten() {
-        if let (Some(id), Some(name)) = (style["id"].as_i64(), style["name"].as_str()) {
+    let mut perk_icons = HashMap::new();
+    let styles = runes.as_array().into_iter().flatten();
+    for p in styles.flat_map(|style| {
+        std::iter::once(style).chain(style["slots"].as_array().into_iter().flatten().flat_map(|s| s["runes"].as_array().into_iter().flatten()))
+    }) {
+        let Some(id) = p["id"].as_i64() else { continue };
+        if let Some(name) = p["name"].as_str() {
             perks.insert(id, name.to_string());
         }
-        for rune in style["slots"].as_array().into_iter().flatten().flat_map(|s| s["runes"].as_array().into_iter().flatten()) {
-            if let (Some(id), Some(name)) = (rune["id"].as_i64(), rune["name"].as_str()) {
-                perks.insert(id, name.to_string());
-            }
+        if let Some(icon) = p["icon"].as_str() {
+            perk_icons.insert(id, icon.to_string());
         }
     }
-    Ok(StaticData { version, champions, items, item_stats, spells, perks, has_client_assets: false })
+    Ok(StaticData { version, champions, items, item_stats, spells, spell_keys, perks, perk_icons, has_client_assets: false })
+}
+
+/// Bytes of one Data Dragon image (`path` from the `StaticData` image helpers),
+/// from the patch cache or the CDN. Cached next to the patch's JSON, so pruning
+/// an old patch drops its images too.
+pub fn fetch_image(agent: &ureq::Agent, version: &str, path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    const MAX: u64 = 4 << 20;
+    let file = cache_dir().join(version).join("img").join(path.replace('/', "_"));
+    if let Ok(b) = std::fs::read(&file) {
+        return Ok(b);
+    }
+    let resp = agent.get(&format!("{CDN}/{path}")).call().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    resp.into_reader().take(MAX).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&file, &bytes);
+    }
+    Ok(bytes)
 }
 
 /// `TFT13_Ahri` → `Ahri`, `TFT13_Sniper` → `Sniper`. Character/trait ids are

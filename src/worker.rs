@@ -186,6 +186,12 @@ pub struct Shared {
     pub refresh: AtomicBool,
     /// Toggled by the Ctrl+Shift+O hotkey / tray menu; not persisted.
     pub overlay_hidden: AtomicBool,
+    /// Overlay edit mode (drag, resize, section toggles); toggled by the Ctrl+Shift+E hotkey,
+    /// the tray menu or Settings; not persisted.
+    pub overlay_edit: AtomicBool,
+    /// The overlay changed its layout in `settings` during edit mode; the main window
+    /// copies it into its own settings and saves them.
+    pub overlay_layout_dirty: AtomicBool,
     pub settings: Mutex<Settings>,
     actions: Mutex<Vec<Action>>,
 }
@@ -211,6 +217,8 @@ pub fn spawn(ctx: eframe::egui::Context, settings: Settings) -> Arc<Shared> {
         snap: Mutex::new(Snapshot::default()),
         refresh: AtomicBool::new(true),
         overlay_hidden: AtomicBool::new(false),
+        overlay_edit: AtomicBool::new(false),
+        overlay_layout_dirty: AtomicBool::new(false),
         settings: Mutex::new(settings),
         actions: Mutex::new(Vec::new()),
     });
@@ -1011,6 +1019,7 @@ fn lookup(lcu: &Lcu, riot_id: &str) -> Result<Lookup, String> {
         tag_line: tag.trim().to_string(),
         level: 0,
         puuid: puuid.clone(),
+        profile_icon: 0,
     });
     Ok(Lookup {
         ranked: lcu.ranked_of(&puuid).unwrap_or_default(),

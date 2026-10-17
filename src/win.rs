@@ -7,16 +7,21 @@ use std::ptr::null_mut;
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME, UNICODE_STRING,
+    CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
+    SYSTEMTIME, UNICODE_STRING, WPARAM,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    CreateMutexW, GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, FindWindowW, GetWindowTextW, GetWindowThreadProcessId, SW_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_NCCALCSIZE,
+};
 
 pub struct Process {
     pub pid: u32,
@@ -118,6 +123,60 @@ pub fn command_line(pid: u32) -> Option<String> {
     }
     let chars = unsafe { std::slice::from_raw_parts(us.Buffer, us.Length as usize / 2) };
     Some(String::from_utf16_lossy(chars))
+}
+
+/// This process's top-level window with exactly `title`, so a folder or browser tab
+/// with the same name is never matched.
+pub fn own_window(title: &str) -> Option<HWND> {
+    struct Find {
+        title: Vec<u16>,
+        pid: u32,
+        found: HWND,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> windows_sys::core::BOOL {
+        let f = unsafe { &mut *(lp as *mut Find) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid != f.pid {
+            return 1;
+        }
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) } as usize;
+        if buf[..n] == f.title[..] {
+            f.found = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut f = Find { title: title.encode_utf16().collect(), pid: unsafe { GetCurrentProcessId() }, found: null_mut() };
+    unsafe { EnumWindows(Some(each), &mut f as *mut Find as LPARAM) };
+    (!f.found.is_null()).then_some(f.found)
+}
+
+/// Removes the drop shadow winit draws around this process's undecorated window `title`.
+///
+/// winit keeps `WS_CAPTION` on undecorated windows and, with its undecorated-shadow flag
+/// (which egui-winit always sets on Windows), leaves a 1 px non-client strip in
+/// `WM_NCCALCSIZE` so DWM draws a shadow. Answering `WM_NCCALCSIZE` with 0 makes the whole
+/// window client area: no strip, no shadow. Disabling DWM non-client rendering instead
+/// would paint that strip as a classic 1 px frame line. False if the window is not found (yet).
+pub fn remove_window_shadow(title: &str) -> bool {
+    unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+        if msg == WM_NCCALCSIZE && wp != 0 {
+            return 0;
+        }
+        unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+    }
+    let Some(hwnd) = own_window(title) else { return false };
+    unsafe {
+        // Must run on the window's thread (eframe's event loop thread, where viewport callbacks run).
+        if SetWindowSubclass(hwnd, Some(proc_), 1, 0) == 0 {
+            return false;
+        }
+        // Recompute the frame through the subclass now.
+        SetWindowPos(hwnd, null_mut(), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    true
 }
 
 /// Returns false if another riftlite instance already holds the mutex; in that

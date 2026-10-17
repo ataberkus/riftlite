@@ -175,6 +175,7 @@ impl Lcu {
             tag_line: v["tagLine"].as_str().unwrap_or("").to_string(),
             level: v["summonerLevel"].as_u64().unwrap_or(0),
             puuid: v["puuid"].as_str().unwrap_or("").to_string(),
+            profile_icon: v["profileIconId"].as_i64().unwrap_or(0),
         })
     }
 
@@ -326,6 +327,7 @@ impl Lcu {
             tag_line: v["tagLine"].as_str().unwrap_or("").to_string(),
             level: v["summonerLevel"].as_u64().unwrap_or(0),
             puuid: puuid.to_string(),
+            profile_icon: v["profileIconId"].as_i64().unwrap_or(0),
         })
     }
 
@@ -472,6 +474,8 @@ pub struct Summoner {
     pub tag_line: String,
     pub level: u64,
     pub puuid: String,
+    /// Profile icon id (Data Dragon `img/profileicon/<id>.png`); 0 when unknown.
+    pub profile_icon: i64,
 }
 
 #[derive(Clone, PartialEq, Debug)]

@@ -26,16 +26,17 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let start_minimized = std::env::args().any(|a| a == "--minimized");
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
-            .with_app_id("riftlite")
-            .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size([760.0, 480.0])
-            .with_transparent(true)
-            // Autostart / background start must not steal focus (e.g. from a running game).
-            .with_active(!start_minimized),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(TITLE)
+        .with_app_id("riftlite")
+        .with_inner_size([1180.0, 780.0])
+        .with_min_inner_size([760.0, 480.0])
+        .with_transparent(true)
+        // Autostart / background start must not steal focus (e.g. from a running game).
+        .with_active(!start_minimized);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/logo.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(TITLE, options, Box::new(move |cc| Ok(Box::new(ui::App::new(cc, start_minimized, TITLE)))))
 }
