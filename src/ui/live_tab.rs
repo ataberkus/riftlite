@@ -9,6 +9,7 @@ use super::theme::*;
 use super::widgets::*;
 use super::{App, loading_screen};
 use crate::live::{FeedEvent, LiveGame, LivePlayer, Objective};
+use crate::meta::MetaBuild;
 use crate::worker::Snapshot;
 
 /// League in exclusive fullscreen: no other window, the overlay included, draws over it.
@@ -78,6 +79,27 @@ pub(super) fn item_color(age: f64) -> Color32 {
     if age < 60.0 { SOON } else { BODY }
 }
 
+/// The OP.GG build picked in champ select and the index of its picked core, while it is
+/// for `champion` (any champion when `None`, e.g. on the loading screen).
+pub(super) fn picked_build(s: &Snapshot, champion: Option<i64>) -> Option<(&MetaBuild, usize)> {
+    let m = s.meta.as_ref().filter(|m| champion.is_none_or(|c| c == m.champion_id))?;
+    let Some(Ok(b)) = &m.build else { return None };
+    Some((b, m.picks.build.min(b.cores.len() - 1)))
+}
+
+/// Item tiles in build order; the ones in `owned` are outlined green.
+pub(super) fn build_items(ui: &mut Ui, g: &Gfx, ids: &[i64], owned: &[i64], size: f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for &id in ids {
+            let r = g.item(ui, id, size);
+            if owned.contains(&id) {
+                ui.painter().rect_stroke(r.rect, 5, Stroke::new(1.5, WIN), StrokeKind::Inside);
+            }
+        }
+    });
+}
+
 impl App {
     pub(super) fn live_tab(&mut self, ui: &mut Ui, s: &Snapshot) {
         let icons = self.icons.clone();
@@ -99,6 +121,28 @@ impl App {
         if self.settings.overlay_enabled && s.window_mode == Some(0) {
             ui.add_space(6.0);
             error(ui, FULLSCREEN_WARNING);
+        }
+        let me = game.me();
+        if let Some((b, sel)) = picked_build(s, me.and_then(|p| s.data.champion_by_key(&p.champion_key))) {
+            let owned: Vec<i64> = me.map(|p| p.items.iter().map(|it| it.id).collect()).unwrap_or_default();
+            let core = &b.cores[sel];
+            section(ui, "Your build");
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("OP.GG {} · {}", b.query.label(), core.label())).font(semibold(13.0)).color(TEXT));
+                    ui.label(RichText::new(core.items.stats()).size(11.5).color(MUTED));
+                });
+                ui.add_space(4.0);
+                build_items(ui, &g, &b.full_build(sel, &s.data), &owned, 28.0);
+                let situational = b.situational(sel, &s.data);
+                if !situational.is_empty() {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("SITUATIONAL").font(semibold(10.5)).color(MUTED));
+                        build_items(ui, &g, &situational, &owned, 22.0);
+                    });
+                }
+            });
         }
         if !game.objectives.is_empty() {
             section(ui, "Objectives");

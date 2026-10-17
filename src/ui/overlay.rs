@@ -11,7 +11,7 @@ use eframe::egui::{
     Sense, Shadow, Stroke, StrokeKind, Ui, UiBuilder, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
 
-use super::live_tab::{diff_color, feed_color, item_color, loadout, objective_text, scouts};
+use super::live_tab::{build_items, diff_color, feed_color, item_color, loadout, objective_text, picked_build, scouts};
 use super::stats::{cs_baseline, kilo, mmss, signed};
 use super::theme::*;
 use super::widgets::*;
@@ -290,6 +290,9 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
         if show.scouts {
             overlay_scouts(ui, g, s, None);
         }
+        if show.build {
+            overlay_build(ui, g, s, None, &[]);
+        }
         return;
     };
     if show.clock {
@@ -356,6 +359,19 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             icon(ui, Icon::Bolt, 13.0, SOON);
             ui.label(RichText::new(format!("Level up {next} (your last {} order)", me.champion)).font(semibold(12.0)).color(SOON));
         });
+    }
+    if show.build {
+        let owned: Vec<i64> = me.items.iter().map(|it| it.id).collect();
+        if sample {
+            separate(ui, &mut above);
+            ui.label(RichText::new("BUILD · AP").font(semibold(9.5)).color(MUTED));
+            build_items(ui, g, &[6655, 3020, 4645, 3089, 3157, 3135], &[6655, 3020], 22.0);
+        } else if let Some(champ) = g.data.champion_by_key(&me.champion_key) {
+            if picked_build(s, Some(champ)).is_some() {
+                separate(ui, &mut above);
+            }
+            overlay_build(ui, g, s, Some(champ), &owned);
+        }
     }
     let objectives: Vec<_> = game
         .objectives
@@ -432,6 +448,13 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             ui.label(RichText::new("Augment tiers: Blitz").size(11.0).color(MUTED));
         }
     }
+}
+
+/// The OP.GG build picked in champ select for `champ`: full build in order, owned items outlined.
+fn overlay_build(ui: &mut Ui, g: &Gfx, s: &Snapshot, champ: Option<i64>, owned: &[i64]) {
+    let Some((b, sel)) = picked_build(s, champ) else { return };
+    ui.label(RichText::new(format!("BUILD · {}", b.cores[sel].label())).font(semibold(9.5)).color(MUTED));
+    build_items(ui, g, &b.full_build(sel, &s.data), owned, 22.0);
 }
 
 /// Compact enemy ranks.

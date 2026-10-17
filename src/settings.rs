@@ -43,6 +43,8 @@ pub struct OverlaySections {
     pub item_diff: bool,
     /// "Level up X" from your last games on the champion.
     pub skill_hint: bool,
+    /// The OP.GG build picked in champ select, items you own outlined.
+    pub build: bool,
     pub objectives: bool,
     /// Dead enemies with respawn timers.
     pub dead_enemies: bool,
@@ -66,6 +68,7 @@ impl Default for OverlaySections {
             kills_gold: true,
             item_diff: true,
             skill_hint: true,
+            build: true,
             objectives: true,
             dead_enemies: true,
             enemy_spells: false,
@@ -79,13 +82,14 @@ impl Default for OverlaySections {
 
 impl OverlaySections {
     /// Short label and flag of every section, in drawing order.
-    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 12] {
+    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 13] {
         [
             ("Clock", &mut self.clock),
             ("KDA / CS", &mut self.kda),
             ("Kills / gold", &mut self.kills_gold),
             ("Item value", &mut self.item_diff),
             ("Skill hint", &mut self.skill_hint),
+            ("Build", &mut self.build),
             ("Objectives", &mut self.objectives),
             ("Dead enemies", &mut self.dead_enemies),
             ("Enemy spells", &mut self.enemy_spells),
