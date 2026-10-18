@@ -237,7 +237,7 @@ pub struct Shared {
     pub overlay_layout_dirty: AtomicBool,
     /// The League game window is the foreground window; maintained by the tray thread's WinEvent hook.
     pub game_focused: AtomicBool,
-    /// Set by the tray menu's Quit; otherwise the window's close button only minimizes.
+    /// Set by the tray menu's Quit; otherwise the window's close button only hides it to the tray.
     pub quitting: AtomicBool,
     pub settings: Mutex<Settings>,
     actions: Mutex<Vec<Action>>,

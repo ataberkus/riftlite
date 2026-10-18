@@ -125,7 +125,8 @@ pub struct App {
     title: &'static str,
     notice: Option<(String, bool, Instant)>,
     seen_action: u64,
-    start_minimized: bool,
+    /// `--minimized` (autostart): hide the window to the tray after the first frame.
+    start_in_tray: bool,
     /// How the last main `ui` pass declared the overlay viewport (`None`: not declared).
     declared_overlay: Option<OverlayDecl>,
     expanded: HashSet<u64>,
@@ -146,7 +147,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, start_minimized: bool, title: &'static str) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, start_in_tray: bool, title: &'static str) -> Self {
         theme::install(&cc.egui_ctx);
         let icons = Icons::new(&cc.egui_ctx);
         let settings = Settings::load();
@@ -162,7 +163,7 @@ impl App {
             title,
             notice: None,
             seen_action: 0,
-            start_minimized,
+            start_in_tray,
             declared_overlay: None,
             expanded: HashSet::new(),
             lookup_input: String::new(),
@@ -282,7 +283,7 @@ pub fn set_overlay_edit(ctx: &egui::Context, shared: &Shared, on: bool) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Phase transitions are handled here, not in `ui`, so they are seen while minimized.
+        // Phase transitions are handled here, not in `ui`, so they are seen while minimized or hidden.
         {
             let snap = self.shared.snap.lock();
             if snap.phase != self.seen_phase {
@@ -302,29 +303,33 @@ impl eframe::App for App {
                 self.seen_phase = snap.phase.clone();
             }
         }
-        // The close button minimizes; only the tray menu's Quit exits.
+        // The close button hides the window to the tray; only the tray menu's Quit exits.
         if ctx.input(|i| i.viewport().close_requested()) && !self.shared.quitting.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            crate::tray::hide_main(self.title);
         }
-        // While minimized eframe skips `ui`, which is where the overlay viewport
-        // is declared. Request one hidden pass only when it must appear, go away, or
-        // change mode, place or size; its contents repaint on their own.
+        // While minimized eframe skips `ui`, which is where the overlay viewport is
+        // declared (a window hidden to the tray still gets `ui`). Request one hidden pass
+        // only when it must appear, go away, or change mode, place or size; its contents
+        // repaint on their own.
         self.sync_overlay_layout();
         let shared = self.shared.clone();
         let snap = shared.snap.lock();
         let want = self.overlay_decl(ctx, &snap);
         drop(snap);
-        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        if minimized && want.map(OverlayDecl::window_key) != self.declared_overlay.map(OverlayDecl::window_key) {
+        // The same test eframe uses to skip `ui`.
+        let ui_skipped = ctx.input(|i| i.viewport().visible() == Some(false));
+        if ui_skipped && want.map(OverlayDecl::window_key) != self.declared_overlay.map(OverlayDecl::window_key) {
             ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
         }
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if std::mem::take(&mut self.start_minimized) {
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        if std::mem::take(&mut self.start_in_tray) {
+            // eframe shows the window right after painting this first frame; the queued
+            // hide runs after that, so the window is visible only for an instant.
+            crate::tray::hide_main_async(self.title);
         }
         if let Ok(h) = self.hotkeys_rx.try_recv() {
             self.hotkeys = Some(h);

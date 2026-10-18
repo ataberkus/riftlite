@@ -27,7 +27,8 @@ fn main() -> eframe::Result {
     if !win::acquire_single_instance(TITLE) {
         return Ok(());
     }
-    let start_minimized = std::env::args().any(|a| a == "--minimized");
+    // Autostart: start hidden in the tray.
+    let start_in_tray = std::env::args().any(|a| a == "--minimized");
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(TITLE)
         .with_app_id("riftlite")
@@ -37,10 +38,10 @@ fn main() -> eframe::Result {
         // The title bar, window buttons and resize edges are drawn by `ui::chrome`.
         .with_decorations(false)
         // Autostart / background start must not steal focus (e.g. from a running game).
-        .with_active(!start_minimized);
+        .with_active(!start_in_tray);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/logo.png")) {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native(TITLE, options, Box::new(move |cc| Ok(Box::new(ui::App::new(cc, start_minimized, TITLE)))))
+    eframe::run_native(TITLE, options, Box::new(move |cc| Ok(Box::new(ui::App::new(cc, start_in_tray, TITLE)))))
 }

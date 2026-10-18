@@ -31,7 +31,7 @@ const GRIP: f32 = 18.0;
 impl App {
     /// Deferred viewport: it has its own callback and is repainted by the
     /// worker (`request_repaint_of(overlay_id())`), so it keeps updating while
-    /// the main window is minimized and eframe skips the main `ui` pass.
+    /// the main window is minimized (eframe skips the main `ui` pass) or hidden in the tray.
     ///
     /// `created`: the previous main pass did not declare the overlay, so eframe creates
     /// a new window for it after this pass.
