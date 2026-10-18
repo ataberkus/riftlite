@@ -1,6 +1,7 @@
 //! egui UI: main window (sidebar navigation, one module per tab) and the click-through in-game overlay.
 
 mod champ_select;
+mod chrome;
 mod home;
 mod icons;
 mod live_tab;
@@ -339,6 +340,7 @@ impl eframe::App for App {
         }
 
         let compact = ctx.content_rect().width() < COMPACT_BELOW;
+        chrome::title_bar(ui, &self.icons);
         self.sidebar(ui, &snap, compact);
         self.header(ui, &snap);
         Panel::bottom("status")
@@ -385,6 +387,7 @@ impl eframe::App for App {
                 });
             });
         });
+        chrome::resize_edges(ui);
 
         self.toast(&ctx);
         let decl = self.overlay_decl(&ctx, &snap);

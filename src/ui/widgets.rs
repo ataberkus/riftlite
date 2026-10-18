@@ -634,6 +634,9 @@ pub enum Icon {
     ArrowDown,
     Skull,
     Lock,
+    Minimize,
+    Maximize,
+    Restore,
 }
 
 /// Paints `icon` into `rect` (drawn on a 24-unit grid).
@@ -770,6 +773,12 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Lock => {
             p.add(Shape::line(arc(12.0, 10.5, 4.5, 5.0, 180.0, 360.0), st));
             p.rect_filled(Rect::from_min_max(at(5.0, 11.0), at(19.0, 21.0)), (2.0 * s) as u8, color);
+        }
+        Icon::Minimize => line(&[(5.0, 12.0), (19.0, 12.0)]),
+        Icon::Maximize => closed(&[(5.0, 5.0), (19.0, 5.0), (19.0, 19.0), (5.0, 19.0)]),
+        Icon::Restore => {
+            closed(&[(5.0, 8.5), (15.5, 8.5), (15.5, 19.0), (5.0, 19.0)]);
+            line(&[(8.5, 8.5), (8.5, 5.0), (19.0, 5.0), (19.0, 15.5), (15.5, 15.5)]);
         }
     }
 }

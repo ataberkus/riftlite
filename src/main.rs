@@ -34,6 +34,8 @@ fn main() -> eframe::Result {
         .with_inner_size([1180.0, 780.0])
         .with_min_inner_size([760.0, 480.0])
         .with_transparent(true)
+        // The title bar, window buttons and resize edges are drawn by `ui::chrome`.
+        .with_decorations(false)
         // Autostart / background start must not steal focus (e.g. from a running game).
         .with_active(!start_minimized);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/logo.png")) {
