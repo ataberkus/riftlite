@@ -188,7 +188,7 @@ impl App {
                 "Switch to Champ select / Live game / Post-game tabs automatically",
                 None,
             );
-            if toggle(ui, &mut self.autostart, "Start with Windows (minimized)", None) {
+            if toggle(ui, &mut self.autostart, "Start with Windows (in the tray)", None) {
                 if let Err(e) = settings::set_autostart(self.autostart) {
                     self.autostart = settings::autostart_enabled();
                     self.notify(Err(format!("Autostart: {e}")));

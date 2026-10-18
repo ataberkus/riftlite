@@ -42,7 +42,7 @@ It is one native Rust process (egui/OpenGL). There is no embedded browser, no sc
 | Profile: honor level, Blue Essence, Orange Essence and RP | LCU `/lol-honor-v2/v1/profile`, `/lol-inventory/v1/wallet` |
 | Skill orders | Recorded by riftlite from the Live Client API while you play; `%LOCALAPPDATA%\riftlite\skills.json` |
 | Champion, item, summoner spell and rune names and images (portraits, splash art, item/spell/rune and profile icons) | Riot Data Dragon (`ddragon.leagueoflegends.com`), cached per patch (images in `%LOCALAPPDATA%\riftlite\ddragon\<patch>\img`); ids Data Dragon lacks (mode-only items, stat shards) from the client's `/lol-game-data/assets/v1/*.json` |
-| Tray icon (open / hide overlay / edit overlay layout / quit), start with Windows (minimized), settings | `Shell_NotifyIconW`; Ctrl+Shift+O / Ctrl+Shift+E through a low-level keyboard hook (`SetWindowsHookExW(WH_KEYBOARD_LL)`, so they also work in the League game, which suppresses `RegisterHotKey` hotkeys), plus `RegisterHotKey` for elevated foreground windows; `HKCU\…\Run`, `%LOCALAPPDATA%\riftlite\settings.json` |
+| Tray icon (open / hide overlay / edit overlay layout / quit; the window's close button hides riftlite to the tray), start with Windows (in the tray), settings | `Shell_NotifyIconW`; Ctrl+Shift+O / Ctrl+Shift+E through a low-level keyboard hook (`SetWindowsHookExW(WH_KEYBOARD_LL)`, so they also work in the League game, which suppresses `RegisterHotKey` hotkeys), plus `RegisterHotKey` for elevated foreground windows; `HKCU\…\Run`, `%LOCALAPPDATA%\riftlite\settings.json` |
 
 ## Limitations
 
@@ -78,6 +78,6 @@ The overlay is drawn over the game only in **Borderless** or **Windowed** displa
 cargo build --release
 ```
 
-The output is `target\release\riftlite.exe`, a single file with no installer. Start it with `--minimized` to start minimized. `build.bat` runs the same build from any folder; it stops without building while `riftlite.exe` is running, because Windows cannot replace a running .exe.
+The output is `target\release\riftlite.exe`, a single file with no installer. Start it with `--minimized` to start hidden in the tray. `build.bat` runs the same build from any folder; it stops without building while `riftlite.exe` is running, because Windows cannot replace a running .exe.
 
 Embedded assets: `assets/logo.png`, `assets/banner.jpg` and `assets/riftlite.ico` (made for riftlite; `build.rs` embeds the icon and version info into the .exe with `embed-resource`, which needs the Windows SDK's `rc.exe`), and the Inter and Barlow Semi Condensed fonts in `assets/fonts/` (SIL Open Font License 1.1, license texts alongside). Rank emblems and UI icons are drawn in code.

@@ -21,7 +21,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
     HC_ACTION, HWND_MESSAGE, GetSystemMetrics, IDI_APPLICATION, IMAGE_ICON, KBDLLHOOKSTRUCT, LR_SHARED, LoadImageW,
     SM_CXSMICON, SM_CYSMICON, IsIconic, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
+    RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
+    ShowWindowAsync,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WH_KEYBOARD_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYUP, WINEVENT_OUTOFCONTEXT, WNDCLASSW,
 };
@@ -222,6 +223,26 @@ fn toggle_overlay(c: &Ctx) {
 fn toggle_edit(c: &Ctx) {
     let on = !c.shared.overlay_edit.load(Ordering::Relaxed);
     crate::ui::set_overlay_edit(&c.egui, &c.shared, on);
+}
+
+/// Hides the main window to the tray: no window and no taskbar button, only the tray icon.
+/// Returns whether a visible window was hidden.
+///
+/// Plain `ShowWindow`, not `ViewportCommand::Visible(false)`: winit keeps its own
+/// visibility flag, and after `raise_main` shows the window again it would re-hide it on
+/// its next style change. eframe keeps running the main `ui` pass for a hidden window
+/// (it only skips minimized or occluded ones), so the overlay is still declared.
+pub fn hide_main(title: &str) -> bool {
+    let Some(h) = crate::win::own_window(title) else { return false };
+    unsafe { IsWindowVisible(h) != 0 && { ShowWindow(h, SW_HIDE); true } }
+}
+
+/// Queues `hide_main` to the window's thread, which runs it when it next processes
+/// messages, also after a later `ShowWindow` in the current eframe pass.
+pub fn hide_main_async(title: &str) {
+    if let Some(h) = crate::win::own_window(title) {
+        unsafe { ShowWindowAsync(h, SW_HIDE) };
+    }
 }
 
 /// Restores the main window if minimized or hidden and makes it the foreground window.
