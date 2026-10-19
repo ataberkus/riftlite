@@ -1088,7 +1088,8 @@ fn lock_in_item_set(shared: &Shared, champ: i64, meta: MetaUse, mode: Option<&st
 /// mode. A new build or skill order rewrites the lock-in item set if it was already written;
 /// a new build also moves a rune page not picked by hand to the build's suggestion (applied
 /// again if lock-in applied the OP.GG page). A rune page or spells update the OP.GG page among
-/// the recommended pages and go to the client (see `push_pick`).
+/// the recommended pages; a rune page goes to the client per `push_pick`, a spell pair always
+/// does (the click picks the spells to play, whatever `auto_spells` does on lock-in).
 fn select_meta(shared: &Shared, lcu: &Lcu, auto: &mut Auto, pick: Pick) -> Result<String, String> {
     let (champ, msg, save, runes_moved) = {
         let mut s = shared.snap.lock();
@@ -1129,7 +1130,7 @@ fn select_meta(shared: &Shared, lcu: &Lcu, auto: &mut Auto, pick: Pick) -> Resul
     let prefs = shared.settings.lock().clone();
     match pick {
         Pick::Runes(_) => push_pick(shared, lcu, champ, prefs.auto_runes, &mut auto.runes_set, apply_runes, msg),
-        Pick::Spells(_) => push_pick(shared, lcu, champ, prefs.auto_spells, &mut auto.spells_set, apply_spells, msg),
+        Pick::Spells(_) => push_pick(shared, lcu, champ, true, &mut auto.spells_set, apply_spells, msg),
         Pick::Build(_) | Pick::Skills(_) => {
             let mut msg = msg;
             let locked_in = auto.applied == Some(champ) && auto.lockin.is_none();
