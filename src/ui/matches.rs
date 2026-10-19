@@ -1,16 +1,17 @@
 //! League and TFT match history, the shared game cards and the ten-player scoreboard.
 
-use eframe::egui::{Align, Align2, Color32, Frame, Grid, Label, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, vec2};
+use eframe::egui::{Align, Align2, Color32, Frame, Grid, Label, Layout, Margin, Rect, RichText, Sense, Spinner, Stroke, Ui, vec2};
 
 use super::home::{lol_summary, void};
-use super::stats::{Avg, ago, averages, cs_per_min, datetime, mmss, no_data_hint, queue_name};
+use super::stats::{Avg, ago, averages, cs_per_min, datetime, mmss, no_data_hint, queue_name, signed};
 use super::theme::*;
 use super::widgets::*;
 use super::{App, Tab};
 use crate::ddragon::{StaticData, tft_label};
-use crate::lcu::{LolGame, MatchDetail};
-use crate::worker::{Action, Snapshot};
 use crate::itemset;
+use crate::lcu::{LANE_QUEUES, LolGame, MatchDetail};
+use crate::timeline::{Death, sr_minimap};
+use crate::worker::{Action, Clip, Snapshot};
 
 /// A fixed-width column inside a row.
 pub(super) fn col<R>(ui: &mut Ui, w: f32, f: impl FnOnce(&mut Ui) -> R) -> R {
@@ -227,8 +228,13 @@ impl App {
                         }
                         Some(Err(e)) => void(error(ui, e)),
                         Some(Ok(d)) => {
-                            if let Some(id) = match_table(ui, &g, &d.clone().with_me(viewer), &format!("{salt}-{}", game.game_id)) {
+                            let d = d.clone().with_me(viewer);
+                            if let Some(id) = match_table(ui, &g, &d, &format!("{salt}-{}", game.game_id)) {
                                 look = Some(id);
+                            }
+                            // Timelines and replays only for your own games, not a looked-up player's.
+                            if s.summoner.as_ref().is_some_and(|x| !viewer.is_empty() && x.puuid == viewer) {
+                                self.game_tools(ui, s, &g, &d);
                             }
                         }
                     }
@@ -236,6 +242,244 @@ impl App {
             });
         }
         look
+    }
+
+    /// The Timeline toggle and replay controls under one of your expanded games, then the
+    /// timeline itself while it is open.
+    fn game_tools(&mut self, ui: &mut Ui, s: &Snapshot, g: &Gfx, d: &MatchDetail) {
+        let id = d.game_id;
+        let open = self.timeline_open.contains(&id);
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            let toggle = Btn::ghost(if open { "Hide timeline" } else { "Timeline" }).icon(Icon::Chart).small().selected(open);
+            if ui.add(toggle).on_hover_text("Skill order, gold lead, lane difference and where you died").clicked() {
+                if open {
+                    self.timeline_open.remove(&id);
+                } else {
+                    self.timeline_open.insert(id);
+                    // Also retries a timeline that failed to load.
+                    if !matches!(s.timelines.get(&id), Some(Ok(_))) {
+                        self.request(Action::MatchTimeline(id));
+                    }
+                }
+            }
+            self.replay_controls(ui, s, id);
+        });
+        if self.timeline_open.contains(&id) {
+            ui.add_space(6.0);
+            self.timeline_view(ui, s, g, d);
+        }
+    }
+
+    /// The client's replay state of one game and the action it allows.
+    fn replay_controls(&self, ui: &mut Ui, s: &Snapshot, id: u64) {
+        // States that may change on their own get a way to ask again.
+        let recheck = match s.replays.get(&id) {
+            None => {
+                let ask = Btn::ghost("Replay").icon(Icon::Play).small();
+                if ui.add(ask).on_hover_text("Ask the League client whether this game's replay can be downloaded or watched").clicked() {
+                    self.request(Action::ReplayState(id));
+                }
+                false
+            }
+            Some(Err(e)) => {
+                error(ui, e);
+                true
+            }
+            Some(Ok(r)) => match r.state.as_str() {
+                "download" | "retryDownload" => {
+                    if ui.add(Btn::secondary("Download replay").icon(Icon::ArrowDown).small()).clicked() {
+                        self.request(Action::ReplayDownload(id));
+                    }
+                    false
+                }
+                "checking" | "found" => {
+                    ui.add(Spinner::new().size(12.0).color(ACCENT));
+                    small_note(ui, "Checking…");
+                    true
+                }
+                "downloading" => {
+                    let pct = r.progress.clamp(0, 100);
+                    progress(ui, pct as f32 / 100.0, 120.0, ACCENT);
+                    small_note(ui, format!("Downloading {pct}%"));
+                    false
+                }
+                "watch" => {
+                    if ui.add(Btn::primary("Watch replay").icon(Icon::Play).small()).on_hover_text("Opens the replay in the game").clicked() {
+                        self.request(Action::ReplayWatch(id));
+                    }
+                    false
+                }
+                "incompatible" => {
+                    small_note(ui, "Recorded on another patch; the client can only play the current patch's replays");
+                    false
+                }
+                "missingOrExpired" | "lost" => {
+                    small_note(ui, "No longer available");
+                    false
+                }
+                "unsupported" => {
+                    small_note(ui, "This game has no replay");
+                    false
+                }
+                "" => {
+                    small_note(ui, "Replay state unknown");
+                    true
+                }
+                other => {
+                    small_note(ui, format!("Replay: {other}"));
+                    true
+                }
+            },
+        };
+        if recheck && ui.add(Btn::ghost("Check again").icon(Icon::Refresh).small()).clicked() {
+            self.request(Action::ReplayState(id));
+        }
+    }
+
+    /// Skill order, team gold lead, lane difference at 10 and 15 minutes and your deaths, from
+    /// the game's timeline; deaths can be jumped to and clipped while this game's replay is open.
+    fn timeline_view(&self, ui: &mut Ui, s: &Snapshot, g: &Gfx, d: &MatchDetail) {
+        let t = match s.timelines.get(&d.game_id) {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.add(Spinner::new().size(14.0).color(ACCENT));
+                    note(ui, "Loading timeline…");
+                });
+                return;
+            }
+            Some(Err(e)) => return void(error(ui, e)),
+            Some(Ok(t)) => t,
+        };
+        let Some(me) = d.me().filter(|m| m.participant_id > 0) else {
+            return void(small_note(ui, "This game's details do not say which player you were, so its timeline cannot be read."));
+        };
+        let pid = me.participant_id;
+        let champ = |id: i64| d.players.iter().find(|p| id > 0 && p.participant_id == id).map(|p| p.champion_id);
+        inset_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let skills = t.skill_order(pid);
+            if !skills.is_empty() {
+                overline(ui, "Skill order");
+                skill_row(ui, &skills);
+                ui.add_space(8.0);
+            }
+
+            let team: Vec<i64> = d.players.iter().filter(|p| p.team == me.team && p.participant_id > 0).map(|p| p.participant_id).collect();
+            let lead: Vec<LinePoint> = t.gold_lead(&team).into_iter().map(|(m, v)| LinePoint { x: m as f64, y: v as f64, gap_before: false }).collect();
+            if lead.len() >= 2 {
+                overline(ui, "Team gold lead");
+                let size = vec2(ui.available_width().min(640.0), 90.0);
+                line_chart(ui, &lead, size, WIN, Some(Baseline { value: 0.0, below: Some(LOSS) }), &|i| {
+                    format!("{:.0} min · {}", lead[i].x, gold_k(lead[i].y))
+                });
+                let (lo, hi) = lead.iter().fold((0.0f64, 0.0f64), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+                let mut caption = vec![format!("{} at the end", gold_k(lead.last().map_or(0.0, |p| p.y)))];
+                if hi > 0.0 {
+                    caption.push(format!("biggest lead {}", gold_k(hi)));
+                }
+                if lo < 0.0 {
+                    caption.push(format!("biggest deficit {}", gold_k(lo)));
+                }
+                small_note(ui, caption.join(" · "));
+                ui.add_space(8.0);
+            }
+
+            let opponent = d.players.iter().find(|p| !me.position.is_empty() && p.team != me.team && p.position == me.position && p.participant_id > 0);
+            if let Some(opp) = opponent {
+                let diffs: Vec<_> = [10, 15].into_iter().filter_map(|m| t.lane_diff(pid, opp.participant_id, m)).collect();
+                if !diffs.is_empty() {
+                    overline(ui, "Lane difference");
+                    ui.horizontal_wrapped(|ui| {
+                        small_note(ui, "vs");
+                        g.champ(ui, opp.champion_id, 20.0);
+                        for x in diffs {
+                            let text = format!("@{} {} gold · {} CS · {} XP", x.minute, signed(x.gold), signed(x.cs), signed(x.xp));
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(text).font(semibold(12.5)).color(if x.gold >= 0 { WIN } else { LOSS }));
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+
+            let deaths = t.deaths(pid);
+            // Only an open replay as long as this game is this game's replay.
+            let playback = s.replay_playback.filter(|p| (p.length - d.duration_s as f64).abs() <= 15.0);
+            let recording = matches!(s.clip, Some(Clip::Recording { .. }));
+            let died = |x: &Death| {
+                let who = champ(x.killer).map_or_else(|| "a turret, minion or monster".to_string(), |c| s.data.champion_name(c));
+                let help = if x.assists.is_empty() { String::new() } else { format!(" (+{})", x.assists.len()) };
+                format!("Died {} to {who}{help}", mmss(x.time_ms as f64 / 1000.0))
+            };
+            overline(ui, &format!("Deaths ({})", deaths.len()));
+            ui.horizontal_top(|ui| {
+                let on_rift = d.map_id == 11 || (d.map_id == 0 && LANE_QUEUES.contains(&d.queue_id));
+                if on_rift {
+                    // Kills without a position would all pile up in a corner.
+                    let placed = |v: &[Death]| v.iter().filter(|x| x.x != 0 || x.y != 0).cloned().collect::<Vec<_>>();
+                    let shown = placed(&deaths);
+                    let marks: Vec<(f32, f32)> = shown.iter().map(|x| sr_minimap(x.x, x.y)).collect();
+                    let kills: Vec<(f32, f32)> = placed(&t.takedowns(pid)).iter().map(|x| sr_minimap(x.x, x.y)).collect();
+                    death_map(ui, g.tex(s.data.map_image(11), 512), 220.0, &marks, &kills, &|i| died(&shown[i]));
+                    ui.add_space(12.0);
+                }
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    if deaths.is_empty() {
+                        small_note(ui, "No deaths this game.");
+                    }
+                    for x in &deaths {
+                        let at = x.time_ms as f64 / 1000.0;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(mmss(at)).font(semibold(12.5)).color(TEXT)).on_hover_text(died(x));
+                            match champ(x.killer) {
+                                Some(c) => void(g.champ(ui, c, 20.0)),
+                                None => void(small_note(ui, "Executed")),
+                            }
+                            if !x.assists.is_empty() {
+                                small_note(ui, format!("+{}", x.assists.len())).on_hover_text("Enemies who assisted");
+                            }
+                            if playback.is_some() {
+                                if ui.add(Btn::ghost("Jump").icon(Icon::Play).small()).on_hover_text("Moves the replay to 10 seconds before this death").clicked() {
+                                    self.request(Action::ReplaySeek((at - 10.0).max(0.0)));
+                                }
+                                let (start, end) = ((at - self.clip_span.0).max(0.0), at + self.clip_span.1);
+                                let clip = ui
+                                    .add_enabled(!recording, Btn::ghost("Clip").icon(Icon::Save).small())
+                                    .on_hover_text(format!("Records {}–{} of the replay into your clips folder", mmss(start), mmss(end)));
+                                if clip.clicked() {
+                                    self.request(Action::ReplayClip { start, end });
+                                }
+                            }
+                        });
+                    }
+                    if playback.is_none() && !deaths.is_empty() {
+                        ui.add_space(2.0);
+                        small_note(
+                            ui,
+                            if s.replay_api != Some(true) {
+                                "Turn on the Replay API in Settings to jump to deaths and record clips"
+                            } else {
+                                "Watch this game's replay to jump to deaths and clip them"
+                            },
+                        );
+                    }
+                    if playback.is_some() {
+                        match &s.clip {
+                            Some(Clip::Recording { start, end, current }) => void(ui.horizontal(|ui| {
+                                ui.add(Spinner::new().size(12.0).color(LOSS));
+                                small_note(ui, format!("Recording {}–{} (at {})", mmss(*start), mmss(*end), mmss(*current)));
+                            })),
+                            Some(Clip::Saved(path)) => void(status_msg(ui, true, format!("Clip saved to {path}"))),
+                            Some(Clip::Failed(msg)) => void(error(ui, format!("Clip failed: {msg}"))),
+                            None => {}
+                        }
+                    }
+                });
+            });
+        });
     }
 
     pub(super) fn lookup(&mut self, riot_id: String) {
@@ -294,6 +538,26 @@ impl App {
             });
         }
     }
+}
+
+/// Skill points in level order as small key chips, ultimates highlighted; hover shows the level.
+fn skill_row(ui: &mut Ui, order: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+        for (i, key) in order.chars().enumerate() {
+            let ult = key == 'R';
+            let (r, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+            let (fill, stroke, text) = if ult { (alpha(ACCENT, 0.25), alpha(ACCENT, 0.7), ACCENT_TEXT) } else { (HOVER, BORDER_STRONG, BODY) };
+            ui.painter().rect(r, 5, fill, Stroke::new(1.0, stroke), eframe::egui::StrokeKind::Inside);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, key, semibold(11.5), text);
+            resp.on_hover_text(format!("Level {}", i + 1));
+        }
+    });
+}
+
+/// `+1.2k` / `-0.4k` gold.
+fn gold_k(v: f64) -> String {
+    format!("{}{:.1}k", if v < 0.0 { "-" } else { "+" }, v.abs() / 1000.0)
 }
 
 /// An active TFT trait: bronze, silver, gold, then prismatic by style.

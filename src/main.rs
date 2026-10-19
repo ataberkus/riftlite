@@ -4,16 +4,23 @@
 //! no script runtime, no injection, no elevation.
 
 mod augments;
+mod counters;
 mod ddragon;
+mod goals;
 mod itemset;
 mod lcu;
 mod live;
 mod lp;
+mod matchups;
 mod meta;
 mod net;
+mod notes;
+mod pool;
+mod replay;
 mod riot;
 mod settings;
 mod skills;
+mod timeline;
 mod tray;
 mod ui;
 mod win;

@@ -1,15 +1,16 @@
 //! Player lookup and the champion browser.
 
-use eframe::egui::{Align, Key, Layout, RichText, ScrollArea, TextEdit, Ui, vec2};
+use eframe::egui::{Align, Key, Label, Layout, RichText, ScrollArea, TextEdit, Ui, vec2};
 
 use super::champ_select::rec_page_lines;
-use super::home::{lol_summary, mastery_list, ranked_list, void};
+use super::home::{challenge_row, lol_summary, mastery_list, milestone_text, ranked_list, void};
 use super::matches::trunc;
 use super::stats::{averages, position_label, queue_name};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
-use crate::lcu::Friend;
+use crate::lcu::{self, Friend};
+use crate::notes;
 use crate::worker::{Action, LcuStatus, Snapshot};
 use crate::itemset;
 
@@ -76,7 +77,7 @@ impl App {
             });
             card(&mut cols[1], |ui| {
                 card_head(ui, "Top mastery", |_| {});
-                mastery_list(ui, &g, &l.mastery);
+                mastery_list(ui, &g, &l.mastery, false);
             });
         });
         if let Ok(h) = &l.history {
@@ -294,6 +295,32 @@ impl App {
                 });
             }
         });
+        let key = notes::champ_key(id);
+        let saved = card(ui, |ui| {
+            if let Some(line) = s.mastery.iter().find(|m| m.champion_id == id).and_then(milestone_text) {
+                overline(ui, "Next mastery level");
+                ui.add(Label::new(RichText::new(line).color(BODY)).wrap());
+                ui.add_space(6.0);
+            }
+            note_box(ui, &mut self.note_edit, &key, "Your note on it", s.notes.get(&key))
+        });
+        if let Some((key, text)) = saved {
+            self.request(Action::SaveNote { key, text });
+        }
+        // Hidden while the challenge list is missing, failed or empty (unverified endpoint).
+        if let Some(list) = s.challenge_list.as_ref().and_then(|r| r.as_ref().ok()).filter(|l| !l.is_empty()) {
+            card(ui, |ui| {
+                card_head(ui, "Challenges on it", |_| {});
+                let open = lcu::champion_challenges(list, id, "CLASSIC");
+                if open.is_empty() {
+                    return void(note(ui, "No open champion challenges it can advance."));
+                }
+                for c in open.into_iter().take(3) {
+                    challenge_row(ui, c);
+                }
+                small_note(ui, "Closest to their next level; counted in Summoner's Rift games.");
+            });
+        }
         section(ui, "Recommended runes");
         match &s.browse {
             Some((c, Ok(pages))) if *c == id => {

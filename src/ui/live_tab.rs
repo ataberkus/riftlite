@@ -1,16 +1,20 @@
 //! Live game tab (Live Client Data API) and enemy scouting shared with the overlay.
 
-use eframe::egui::{Align, Align2, Color32, Grid, Layout, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
+use eframe::egui::{Align, Align2, Color32, DragValue, Grid, Layout, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
 
 use super::matches::trunc;
 use super::home::void;
-use super::stats::{Scout, cs_baseline, kilo, live_puuid, mastery_on, mmss, scout, signed};
+use super::stats::{Scout, cs_baseline, kilo, live_puuid, mastery_on, mmss, position_label, scout, signed};
 use super::theme::*;
 use super::widgets::*;
-use super::{App, loading_screen};
+use super::{App, loading_screen, overlay};
+use crate::counters::CounterItem;
+use crate::ddragon::StaticData;
+use crate::goals::{self, GoalKind, Goals, Pace, Stats};
 use crate::live::{FeedEvent, LiveGame, LivePlayer, Objective};
 use crate::meta::MetaBuild;
-use crate::worker::Snapshot;
+use crate::notes;
+use crate::worker::{Action, Clip, Snapshot};
 
 /// League in exclusive fullscreen: no other window, the overlay included, draws over it.
 pub(super) const FULLSCREEN_WARNING: &str =
@@ -100,11 +104,83 @@ pub(super) fn build_items(ui: &mut Ui, g: &Gfx, ids: &[i64], owned: &[i64], size
     });
 }
 
+/// Counter-item options; the ones you hold (any variant) are outlined green.
+pub(super) fn counter_items(ui: &mut Ui, g: &Gfx, items: &[CounterItem], size: f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for it in items {
+            let r = g.item(ui, it.id, size);
+            if it.owned {
+                ui.painter().rect_stroke(r.rect, 5, Stroke::new(1.5, WIN), StrokeKind::Inside);
+            }
+        }
+    });
+}
+
+/// Your goals for `me`'s role (canonical position), when any is set.
+pub(super) fn role_goals<'a>(s: &'a Snapshot, me: &LivePlayer) -> Option<&'a Goals> {
+    match crate::lcu::canonical_position(&me.position) {
+        "" => None,
+        role => s.goals.goals(role),
+    }
+}
+
+/// Each set goal against the game so far. The Live Client API reports no purchases, so
+/// control wards are left to the post-game check.
+pub(super) fn goal_pace(set: &Goals, game: &LiveGame, me: &LivePlayer) -> Vec<(GoalKind, f64, f64, Pace)> {
+    let stats = Stats { cs: me.cs, deaths: me.deaths, vision: me.ward_score, control_wards: None, minutes: game.game_time / 60.0 };
+    goals::live_pace(set, &stats)
+}
+
+/// Actual vs target: "6.8 / 7.0" for CS, "0.74 / 0.80" for vision (a 1-decimal rounding
+/// could show a missed target as met), "2 / 4 max" for deaths.
+pub(super) fn goal_value(kind: GoalKind, target: f64, actual: f64) -> String {
+    match kind {
+        GoalKind::CsPerMin => format!("{actual:.1} / {target:.1}"),
+        GoalKind::VisionPerMin => format!("{actual:.2} / {target:.2}"),
+        GoalKind::MaxDeaths => format!("{actual:.0} / {target:.0} max"),
+        GoalKind::ControlWards => format!("{actual:.0} / {target:.0}"),
+    }
+}
+
+pub(super) fn pace_color(p: Pace) -> Color32 {
+    match p {
+        Pace::Ahead => WIN,
+        Pace::OnTrack => mix(WIN, BODY, 0.35),
+        Pace::Behind => SOON,
+        Pace::Failed => LOSS,
+    }
+}
+
+fn pace_label(kind: GoalKind, p: Pace) -> &'static str {
+    match (kind, p) {
+        (GoalKind::MaxDeaths, Pace::OnTrack) => "under the limit",
+        (GoalKind::MaxDeaths, Pace::Behind) => "at the limit",
+        (GoalKind::MaxDeaths, Pace::Failed) => "over the limit",
+        (_, Pace::Ahead) => "ahead",
+        (_, Pace::OnTrack) => "on track",
+        (_, Pace::Behind) => "behind",
+        (_, Pace::Failed) => "missed",
+    }
+}
+
+/// Champion ids for notes: yours, the enemies' and your lane opponent's; `None` until your
+/// champion is known.
+pub(super) fn note_champions(data: &StaticData, game: &LiveGame) -> Option<(i64, Vec<i64>, Option<i64>)> {
+    let me = game.me()?;
+    let mine = data.champion_by_key(&me.champion_key)?;
+    let enemies = game.players.iter().filter(|p| p.team != me.team).filter_map(|p| data.champion_by_key(&p.champion_key)).collect();
+    let lane = game.lane_opponent().and_then(|p| data.champion_by_key(&p.champion_key));
+    Some((mine, enemies, lane))
+}
+
 impl App {
     pub(super) fn live_tab(&mut self, ui: &mut Ui, s: &Snapshot) {
         let icons = self.icons.clone();
         let g = Gfx::new(&icons, &s.data);
-        let Some(game) = &s.live else {
+        // Overlay edit mode outside a game previews the same sample game here.
+        let sample = (s.live.is_none() && self.shared.overlay_edit.load(std::sync::atomic::Ordering::Relaxed)).then(|| overlay::sample_game(&s.data));
+        let Some(game) = s.live.as_ref().or(sample.as_ref()) else {
             let msg = if s.running.any_game() {
                 "Game process found; waiting for the Live Client Data API (port 2999)…"
             } else {
@@ -115,14 +191,22 @@ impl App {
                 section(ui, "Players");
                 card(ui, |ui| loading_players(ui, &g, s));
             }
+            self.open_replay(ui, s);
             return;
         };
+        if sample.is_some() {
+            status_msg(ui, true, "Sample game: the overlay is in edit mode and no game is running.");
+        }
         live_header(ui, &g, s, game);
         if self.settings.overlay_enabled && s.window_mode == Some(0) {
             ui.add_space(6.0);
             error(ui, FULLSCREEN_WARNING);
         }
+        self.open_replay(ui, s);
         let me = game.me();
+        if let Some(me) = me {
+            live_goals(ui, s, game, me);
+        }
         if let Some((b, sel)) = picked_build(s, me.and_then(|p| s.data.champion_by_key(&p.champion_key))) {
             let owned: Vec<i64> = me.map(|p| p.items.iter().map(|it| it.id).collect()).unwrap_or_default();
             let core = &b.cores[sel];
@@ -144,6 +228,25 @@ impl App {
                 }
             });
         }
+        if !game.counters.is_empty() {
+            section(ui, "Counter items");
+            card(ui, |ui| {
+                for c in &game.counters {
+                    ui.horizontal(|ui| {
+                        counter_items(ui, &g, &c.items, 26.0);
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new(c.threat.label()).font(semibold(12.5)).color(TEXT));
+                            ui.label(RichText::new(&c.reason).size(11.5).color(BODY));
+                        });
+                    });
+                }
+                ui.add_space(2.0);
+                note(ui, "From the enemies' current items (Data Dragon stats); options, not a build order.");
+            });
+        }
+        self.live_notes(ui, s, game);
         if !game.objectives.is_empty() {
             section(ui, "Objectives");
             card(ui, |ui| {
@@ -262,6 +365,114 @@ impl App {
             });
         }
     }
+
+    /// A replay open in the game (Replay API on): its clock and a clip around the current moment.
+    fn open_replay(&mut self, ui: &mut Ui, s: &Snapshot) {
+        let Some(p) = s.replay_playback else { return };
+        let recording = matches!(s.clip, Some(Clip::Recording { .. }));
+        section(ui, "Replay");
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                icon(ui, Icon::Clock, 14.0, MUTED);
+                ui.label(RichText::new(format!("Replay {} / {}", mmss(p.time), mmss(p.length))).font(semibold(13.5)).color(TEXT));
+                if p.paused {
+                    pill(ui, "Paused", MUTED);
+                } else if (p.speed - 1.0).abs() > 0.01 {
+                    pill(ui, format!("{:.2}×", p.speed), MUTED);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (start, end) = ((p.time - self.clip_span.0).max(0.0), p.time + self.clip_span.1);
+                    let clip = ui
+                        .add_enabled(!recording, Btn::primary("Clip around now").small())
+                        .on_hover_text(format!("Records {}–{}", mmss(start), mmss(end)));
+                    if clip.clicked() {
+                        self.shared.request(Action::ReplayClip { start, end });
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size = vec2(64.0, 22.0);
+                ui.label(RichText::new("Clip span").size(11.5).color(MUTED));
+                ui.add(DragValue::new(&mut self.clip_span.0).range(0.0..=120.0).speed(0.5).suffix(" s before"));
+                ui.add(DragValue::new(&mut self.clip_span.1).range(0.0..=120.0).speed(0.5).suffix(" s after"));
+            });
+            match &s.clip {
+                Some(Clip::Recording { start, end, current }) => {
+                    ui.horizontal(|ui| {
+                        progress(ui, ((current - start) / (end - start).max(1.0)) as f32, 120.0, ACCENT);
+                        ui.label(RichText::new(format!("Recording {}–{} (at {}); keep the replay playing", mmss(*start), mmss(*end), mmss(*current))).size(11.5).color(BODY));
+                    });
+                }
+                Some(Clip::Saved(path)) => {
+                    status_msg(ui, true, format!("Clip saved: {path}"));
+                }
+                Some(Clip::Failed(e)) => {
+                    error(ui, format!("Clip failed: {e}"));
+                }
+                None => {
+                    small_note(ui, format!("Clips go to {}.", crate::replay::clips_dir().display()));
+                }
+            }
+        });
+    }
+
+    /// Your notes on your champion and this game's matchups. Your champion's and the lane
+    /// matchup's notes can be added here; other matchup notes show when they exist.
+    fn live_notes(&mut self, ui: &mut Ui, s: &Snapshot, game: &LiveGame) {
+        let Some((mine, enemies, lane)) = note_champions(&s.data, game) else { return };
+        let name = s.data.champion_name(mine);
+        let mut rows: Vec<(String, String, Option<String>)> = vec![(notes::champ_key(mine), name.clone(), None)];
+        if let Some(o) = lane {
+            rows.push((notes::vs_key(mine, o), format!("{name} vs {}", s.data.champion_name(o)), None));
+        }
+        for (key, title, text) in s.notes.for_game(mine, &enemies, lane, &s.data) {
+            if let Some(r) = rows.iter_mut().find(|r| r.0 == key) {
+                r.2 = Some(text);
+            } else {
+                rows.push((key, title, Some(text)));
+            }
+        }
+        section(ui, "Notes");
+        card(ui, |ui| {
+            for (i, (key, title, text)) in rows.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(6.0);
+                }
+                if let Some((key, text)) = note_box(ui, &mut self.note_edit, key, title, text.as_deref()) {
+                    self.shared.request(Action::SaveNote { key, text });
+                }
+            }
+            ui.add_space(2.0);
+            small_note(ui, "Kept on this PC; the overlay shows them during the first minute and a half.");
+        });
+    }
+}
+
+/// Your goals for your role and how this game is going; nothing without goals for the role.
+fn live_goals(ui: &mut Ui, s: &Snapshot, game: &LiveGame, me: &LivePlayer) {
+    let Some(set) = role_goals(s, me) else { return };
+    let role = crate::lcu::canonical_position(&me.position);
+    section(ui, "Goals");
+    card(ui, |ui| {
+        Grid::new("live-goals").spacing([16.0, 4.0]).show(ui, |ui| {
+            for (kind, target, actual, pace) in goal_pace(set, game, me) {
+                ui.label(RichText::new(kind.label()).color(BODY));
+                ui.label(RichText::new(goal_value(kind, target, actual)).font(semibold(13.0)).color(TEXT));
+                ui.label(RichText::new(pace_label(kind, pace)).font(semibold(12.0)).color(pace_color(pace)));
+                ui.end_row();
+            }
+            if let Some(n) = set.control_wards {
+                ui.label(RichText::new(GoalKind::ControlWards.label()).color(BODY));
+                ui.label(RichText::new(n.to_string()).font(semibold(13.0)).color(TEXT));
+                ui.label(RichText::new("checked after the game").size(11.5).color(MUTED));
+                ui.end_row();
+            }
+        });
+        ui.add_space(2.0);
+        let streak = s.goals.streak(Some(role));
+        let streak = if streak > 0 { format!(" · {streak} game(s) in a row with every goal met") } else { String::new() };
+        small_note(ui, format!("{} goals (Settings), so far vs target{streak}.", position_label(role)));
+    });
 }
 
 /// A live player's summoner spells and keystone, as far as the game names them.

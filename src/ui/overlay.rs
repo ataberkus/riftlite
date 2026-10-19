@@ -11,12 +11,17 @@ use eframe::egui::{
     Sense, Shadow, Stroke, StrokeKind, Ui, UiBuilder, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
 
-use super::live_tab::{build_items, diff_color, feed_color, item_color, loadout, objective_text, picked_build, scouts};
+use super::live_tab::{
+    build_items, counter_items, diff_color, feed_color, goal_pace, goal_value, item_color, loadout, note_champions, objective_text, pace_color,
+    picked_build, role_goals, scouts,
+};
 use super::stats::{cs_baseline, kilo, mmss, signed};
 use super::theme::*;
 use super::widgets::*;
 use super::{App, OVERLAY_TITLE, OverlayDecl, loading_screen, overlay_game, overlay_id, set_overlay_edit};
 use crate::augments::{Offer, Tier};
+use crate::ddragon::StaticData;
+use crate::goals::{GoalKind, Goals, Pace};
 use crate::live::{FeedEvent, ItemCallout, LiveGame, LiveItem, LivePlayer, Objective};
 use crate::settings::{OVERLAY_MIN_SIZE, OverlaySections};
 use crate::worker::{Shared, Snapshot};
@@ -27,6 +32,8 @@ const SCOUT_SECS: f64 = 90.0;
 const INSET: f32 = 6.0;
 /// Side of the edit-mode resize grip in the bottom-right corner.
 const GRIP: f32 = 18.0;
+/// Edit mode's sample game uses these when you have no goals for its role.
+const SAMPLE_GOALS: Goals = Goals { cs_per_min: Some(7.0), max_deaths: Some(4), vision_per_min: Some(1.0), control_wards: None };
 
 impl App {
     /// Deferred viewport: it has its own callback and is repainted by the
@@ -88,7 +95,7 @@ impl App {
             let live = overlay_game(&snap.live);
             let loading = loading_screen(&snap);
             // Edit mode outside a game: a sample game shows every section.
-            let sample = (decl.edit && live.is_none() && !loading).then(sample_game);
+            let sample = (decl.edit && live.is_none() && !loading).then(|| sample_game(&snap.data));
             let game = live.or(sample.as_ref());
             if game.is_none() && !loading {
                 return;
@@ -303,7 +310,8 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
     let Some(me) = game.me() else { return };
     let mut above = show.clock;
     let hint = if sample { Some('Q') } else { s.skill_hint.as_ref().and_then(|h| h.next) }.filter(|_| show.skill_hint);
-    if show.kda || show.kills_gold || show.item_diff || hint.is_some() {
+    let goals = if show.goals { overlay_goals(s, game, me, sample) } else { Vec::new() };
+    if show.kda || !goals.is_empty() || show.kills_gold || show.item_diff || hint.is_some() {
         separate(ui, &mut above);
     }
     if show.kda {
@@ -329,6 +337,19 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
                     }
                 });
             });
+        });
+    }
+    if !goals.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // One label per goal that never breaks inside: a whole goal moves to the next line.
+            for &(kind, target, actual, pace) in &goals {
+                let mut job = egui::text::LayoutJob::default();
+                let format = |size: f32, color: Color32| egui::TextFormat { font_id: semibold(size), color, valign: Align::Center, ..Default::default() };
+                job.append(&kind.label().to_uppercase(), 0.0, format(9.5, MUTED));
+                job.append(&goal_value(kind, target, actual), 4.0, format(11.5, pace_color(pace)));
+                ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+            }
         });
     }
     let enemy = if me.team == "ORDER" { "CHAOS" } else { "ORDER" };
@@ -371,6 +392,16 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
                 separate(ui, &mut above);
             }
             overlay_build(ui, g, s, Some(champ), &owned);
+        }
+    }
+    if show.counters && !game.counters.is_empty() {
+        separate(ui, &mut above);
+        ui.label(RichText::new("COUNTER ITEMS").font(semibold(9.5)).color(MUTED));
+        for c in &game.counters {
+            ui.horizontal(|ui| {
+                counter_items(ui, g, &c.items, 18.0);
+                ui.label(RichText::new(c.threat.label()).size(11.5).color(BODY));
+            });
         }
     }
     let objectives: Vec<_> = game
@@ -441,6 +472,18 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             overlay_scouts(ui, g, s, Some(if me.team == "ORDER" { 100 } else { 200 }));
         }
     }
+    if show.notes && (sample || game.game_time < SCOUT_SECS) {
+        let notes = overlay_notes(s, game, sample);
+        if !notes.is_empty() {
+            separate(ui, &mut above);
+            ui.label(RichText::new("NOTES").font(semibold(9.5)).color(MUTED));
+            for (title, text) in notes.iter().take(3) {
+                ui.label(RichText::new(title).font(semibold(11.5)).color(TEXT));
+                let first: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).take(2).collect();
+                ui.add(egui::Label::new(RichText::new(first.join("\n")).size(11.5).color(BODY)).wrap());
+            }
+        }
+    }
     if show.augment_line && (game.mode == "KIWI" || sample) {
         if let Some(e) = s.augment_error.as_ref().filter(|_| !sample) {
             ui.label(RichText::new(format!("Augment tiers: {e}")).size(11.0).color(LOSS));
@@ -448,6 +491,26 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             ui.label(RichText::new("Augment tiers: Blitz").size(11.0).color(MUTED));
         }
     }
+}
+
+/// Your goals for your role against the game so far; edit mode's sample game falls back to
+/// sample goals so the section can be placed.
+fn overlay_goals(s: &Snapshot, game: &LiveGame, me: &LivePlayer, sample: bool) -> Vec<(GoalKind, f64, f64, Pace)> {
+    match role_goals(s, me).copied().or(sample.then_some(SAMPLE_GOALS)) {
+        Some(set) => goal_pace(&set, game, me),
+        None => Vec::new(),
+    }
+}
+
+/// Notes for this game as (title, text); edit mode's sample game falls back to a sample note.
+fn overlay_notes(s: &Snapshot, game: &LiveGame, sample: bool) -> Vec<(String, String)> {
+    let notes: Vec<(String, String)> = note_champions(&s.data, game)
+        .map(|(mine, enemies, lane)| s.notes.for_game(mine, &enemies, lane, &s.data).into_iter().map(|(_, title, text)| (title, text)).collect())
+        .unwrap_or_default();
+    if notes.is_empty() && sample {
+        return vec![("Ahri vs Zed".to_string(), "Keep Charm for when he ults in.\nShort trades after level 6.".to_string())];
+    }
+    notes
 }
 
 /// The OP.GG build picked in champ select for `champ`: full build in order, owned items outlined.
@@ -496,8 +559,10 @@ fn sample_scouts(ui: &mut Ui, g: &Gfx, game: &LiveGame, enemy: &str) {
 }
 
 /// A mid-game Summoner's Rift game for edit mode outside a game, so every section shows.
-fn sample_game() -> LiveGame {
-    let player = |champ: &str, team: &str, position: &str, kda: [i64; 3], cs: i64, items: i64, respawn: f64, is_me: bool| LivePlayer {
+/// Items are real (Data Dragon 16.20 prices), so the counter-item section is computed
+/// from them whenever Data Dragon is loaded.
+pub(super) fn sample_game(data: &StaticData) -> LiveGame {
+    let player = |champ: &str, team: &str, position: &str, kda: [i64; 3], cs: i64, items: &[(i64, i64)], respawn: f64, is_me: bool| LivePlayer {
         name: champ.to_string(),
         champion: champ.to_string(),
         champion_key: champ.to_string(),
@@ -509,7 +574,7 @@ fn sample_game() -> LiveGame {
         assists: kda[2],
         cs,
         ward_score: 0.0,
-        items: vec![LiveItem { id: 0, name: String::new(), price: items, count: 1, consumable: false }],
+        items: items.iter().map(|&(id, price)| LiveItem { id, name: data.item_name(id), price, count: 1, consumable: false }).collect(),
         dead: respawn > 0.0,
         respawn,
         spells: ["SummonerFlash".to_string(), "SummonerDot".to_string()],
@@ -517,7 +582,7 @@ fn sample_game() -> LiveGame {
         is_me,
     };
     let game_time = 14.0 * 60.0 + 32.0;
-    LiveGame {
+    let mut game = LiveGame {
         game_time,
         mode: "CLASSIC".to_string(),
         map: crate::live::SUMMONERS_RIFT,
@@ -525,12 +590,16 @@ fn sample_game() -> LiveGame {
         my_level: 11,
         abilities: [4, 2, 4, 1],
         players: vec![
-            player("Ahri", "ORDER", "MIDDLE", [4, 1, 3], 128, 6100, 0.0, true),
-            player("Garen", "ORDER", "TOP", [2, 2, 1], 110, 5200, 0.0, false),
-            player("Jinx", "ORDER", "BOTTOM", [3, 1, 4], 131, 5900, 0.0, false),
-            player("Zed", "CHAOS", "MIDDLE", [2, 3, 1], 119, 5400, 18.0, false),
-            player("Darius", "CHAOS", "TOP", [3, 2, 0], 105, 5600, 0.0, false),
-            player("Caitlyn", "CHAOS", "BOTTOM", [1, 3, 2], 124, 5000, 24.0, false),
+            // Luden's Echo, Sorcerer's Shoes, Needlessly Large Rod.
+            player("Ahri", "ORDER", "MIDDLE", [4, 1, 3], 128, &[(6655, 2750), (3020, 1100), (1058, 1200)], 0.0, true),
+            player("Garen", "ORDER", "TOP", [2, 2, 1], 110, &[(6610, 3100), (3047, 1200)], 0.0, false),
+            player("Jinx", "ORDER", "BOTTOM", [3, 1, 4], 131, &[(6672, 3000), (3006, 1100), (1036, 350)], 0.0, false),
+            // Eclipse, Ionian Boots, Long Sword: a shield.
+            player("Zed", "CHAOS", "MIDDLE", [2, 3, 1], 119, &[(6692, 2900), (3158, 900), (1036, 350)], 18.0, false),
+            // Sundered Sky, Thornmail, Plated Steelcaps: healing and armor.
+            player("Darius", "CHAOS", "TOP", [3, 2, 0], 105, &[(6610, 3100), (3075, 2450), (3047, 1200)], 0.0, false),
+            // Bloodthirster, Berserker's Greaves: healing and a shield.
+            player("Caitlyn", "CHAOS", "BOTTOM", [1, 3, 2], 124, &[(3072, 3400), (3006, 1100)], 24.0, false),
         ],
         objectives: vec![
             Objective {
@@ -553,7 +622,12 @@ fn sample_game() -> LiveGame {
             time: game_time - 20.0,
             champion: "Darius".to_string(),
             champion_key: "Darius".to_string(),
-            item: 3071,
+            item: 6610,
         }],
-    }
+        counters: Vec::new(),
+    };
+    game.counters = crate::counters::suggest(&game, data);
+    // Some vision so the sample goals show a rate.
+    game.players[0].ward_score = 11.0;
+    game
 }

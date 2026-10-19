@@ -1,11 +1,11 @@
 //! Painted building blocks: cards, buttons, chips, stat tiles, toggles, bars,
-//! sparklines, rank emblems, vector icons and Data Dragon image tiles.
+//! sparklines, line and bar charts, rank emblems, vector icons and Data Dragon image tiles.
 
 use std::f32::consts::{PI, TAU};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Label, Layout, Margin, Mesh, Painter, Pos2, Rect, Response,
-    RichText, Sense, Shadow, Shape, Stroke, StrokeKind, TextFormat, Ui, UiBuilder, Vec2, Widget, WidgetInfo,
+    RichText, Sense, Shadow, Shape, Stroke, StrokeKind, TextEdit, TextFormat, Ui, UiBuilder, Vec2, Widget, WidgetInfo,
     epaint::RectShape, pos2, text::LayoutJob, vec2,
 };
 
@@ -153,6 +153,50 @@ pub fn empty_state(ui: &mut Ui, ic: Icon, title: &str, msg: &str, extra: impl Fn
             ui.add_space(12.0);
         });
     });
+}
+
+/// A note (`notes::champ_key`/`notes::vs_key`) with its title and an Edit/Add button; while
+/// `edit` holds this key, a text box with Save and Cancel. Returns `(key, text)` when saved, for
+/// the caller to send as `Action::SaveNote` (empty text removes the note).
+pub fn note_box(ui: &mut Ui, edit: &mut Option<(String, String)>, key: &str, title: &str, text: Option<&str>) -> Option<(String, String)> {
+    let mut saved = None;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        let editing = edit.as_ref().is_some_and(|(k, _)| k == key);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).font(semibold(12.5)).color(TEXT));
+            if !editing && ui.add(Btn::ghost(if text.is_some() { "Edit" } else { "Add note" }).small()).clicked() {
+                *edit = Some((key.to_string(), text.unwrap_or_default().to_string()));
+            }
+        });
+        let mut close = false;
+        match edit.as_mut().filter(|(k, _)| k == key) {
+            Some((_, draft)) => {
+                ui.add(TextEdit::multiline(draft).desired_rows(3).desired_width(f32::INFINITY).margin(vec2(10.0, 7.0)).hint_text("What to remember next time"));
+                ui.horizontal(|ui| {
+                    if ui.add(Btn::primary("Save").small()).clicked() {
+                        saved = Some((key.to_string(), draft.clone()));
+                        close = true;
+                    }
+                    if ui.add(Btn::ghost("Cancel").small()).clicked() {
+                        close = true;
+                    }
+                });
+            }
+            None => match text {
+                Some(t) => {
+                    ui.add(Label::new(RichText::new(t).color(BODY)).wrap());
+                }
+                None => {
+                    small_note(ui, "No note yet.");
+                }
+            },
+        }
+        if close {
+            *edit = None;
+        }
+    });
+    saved
 }
 
 // ---------------------------------------------------------------- buttons & chips
@@ -441,51 +485,232 @@ pub fn result_strip(ui: &mut Ui, wins: impl Iterator<Item = bool>) {
     });
 }
 
-/// A filled-area line chart; hovering shows each point's value. `reference` draws a dashed line.
+/// A filled-area line chart over games, oldest first; hovering shows each game's value.
+/// `reference` draws a dashed line. The [`line_chart`] with one point per game.
 pub fn sparkline(ui: &mut Ui, values: &[f64], size: Vec2, color: Color32, reference: Option<f64>, fmt: fn(f64) -> String) -> Response {
+    let points: Vec<LinePoint> = values.iter().enumerate().map(|(i, &y)| LinePoint { x: i as f64, y, gap_before: false }).collect();
+    let n = values.len();
+    let label = |i: usize| format!("Game {} of {n}: {}", i + 1, fmt(values[i]));
+    line_chart(ui, &points, size, color, reference.map(|value| Baseline { value, below: None }), &label)
+}
+
+/// One point of a [`line_chart`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LinePoint {
+    pub x: f64,
+    pub y: f64,
+    /// Data is missing between the previous point and this one: the line breaks, and a faint
+    /// dashed segment bridges the gap.
+    pub gap_before: bool,
+}
+
+/// The horizontal reference line of a [`line_chart`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Baseline {
+    pub value: f64,
+    /// `None`: a dashed line over an area filled down to the bottom (the sparkline look).
+    /// `Some(c)`: a solid zero line, the area filled between the line and it, and everything
+    /// below it drawn in `c` (e.g. `LOSS` for a gold deficit).
+    pub below: Option<Color32>,
+}
+
+/// A filled-area line chart (the sparkline look) over `points`, sorted by `x` and finite; x is
+/// scaled to the width, y to the height with the baseline always in view. Fewer than two
+/// points draw nothing. Hovering marks the nearest point by x and shows `label(index)`, which
+/// is only called on hover.
+pub fn line_chart(ui: &mut Ui, points: &[LinePoint], size: Vec2, color: Color32, baseline: Option<Baseline>, label: &dyn Fn(usize) -> String) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    if values.len() < 2 || !ui.is_rect_visible(rect) {
+    if points.len() < 2 || !ui.is_rect_visible(rect) {
         return resp;
     }
     let p = ui.painter_at(rect.expand(4.0));
-    let mut lo = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let mut hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if let Some(r) = reference {
-        lo = lo.min(r);
-        hi = hi.max(r);
+    let mut lo = points.iter().map(|q| q.y).fold(f64::INFINITY, f64::min);
+    let mut hi = points.iter().map(|q| q.y).fold(f64::NEG_INFINITY, f64::max);
+    if let Some(b) = baseline {
+        lo = lo.min(b.value);
+        hi = hi.max(b.value);
     }
     let span = (hi - lo).max(1e-6);
     let (lo, hi) = (lo - span * 0.12, hi + span * 0.12);
+    let (x0, x1) = (points[0].x, points[points.len() - 1].x);
+    let x = |v: f64| rect.left() + ((v - x0) / (x1 - x0).max(1e-9)) as f32 * rect.width();
     let y = |v: f64| rect.bottom() - ((v - lo) / (hi - lo)) as f32 * rect.height();
-    let step = rect.width() / (values.len() - 1) as f32;
-    let pts: Vec<Pos2> = values.iter().enumerate().map(|(i, &v)| pos2(rect.left() + i as f32 * step, y(v))).collect();
+    let pts: Vec<Pos2> = points.iter().map(|q| pos2(x(q.x), y(q.y))).collect();
+    // The area fills down to the bottom, or to a solid baseline that splits the colors.
+    let below = baseline.and_then(|b| b.below);
+    let fill_y = match baseline {
+        Some(b) if below.is_some() => y(b.value),
+        _ => rect.bottom(),
+    };
+    let side = |q: Pos2| match below {
+        Some(c) if q.y > fill_y => c,
+        _ => color,
+    };
     let mut m = Mesh::default();
-    let (top, bottom) = (alpha(color, 0.28), alpha(color, 0.0));
-    for w in pts.windows(2) {
+    let mut quad = |a: Pos2, b: Pos2, c: Color32| {
+        let (top, bottom) = (alpha(c, 0.28), alpha(c, 0.0));
         let base = m.vertices.len() as u32;
-        m.colored_vertex(w[0], top);
-        m.colored_vertex(w[1], top);
-        m.colored_vertex(pos2(w[1].x, rect.bottom()), bottom);
-        m.colored_vertex(pos2(w[0].x, rect.bottom()), bottom);
+        m.colored_vertex(a, top);
+        m.colored_vertex(b, top);
+        m.colored_vertex(pos2(b.x, fill_y), bottom);
+        m.colored_vertex(pos2(a.x, fill_y), bottom);
         m.add_triangle(base, base + 1, base + 2);
         m.add_triangle(base, base + 2, base + 3);
+    };
+    // Runs of one color without a gap, drawn as one polyline each.
+    let mut runs: Vec<(Color32, Vec<Pos2>)> = Vec::new();
+    for (i, &b) in pts.iter().enumerate() {
+        if i == 0 || points[i].gap_before {
+            if i > 0 {
+                p.add(Shape::dashed_line(&[pts[i - 1], b], Stroke::new(1.0, FAINT), 3.0, 3.0));
+            }
+            runs.push((side(b), vec![b]));
+            continue;
+        }
+        let a = pts[i - 1];
+        // A segment crossing the colored baseline is split there, one piece per color.
+        let crosses = below.is_some() && (a.y - fill_y) * (b.y - fill_y) < 0.0;
+        let mid = if crosses { a + (b - a) * ((fill_y - a.y) / (b.y - a.y)) } else { b };
+        for (a, b) in [(a, mid), (mid, b)] {
+            if a == b {
+                continue;
+            }
+            let c = side(a + (b - a) * 0.5);
+            quad(a, b, c);
+            match runs.last_mut() {
+                Some((rc, run)) if *rc == c && run.last() == Some(&a) => run.push(b),
+                Some((rc, run)) if run.len() == 1 && run[0] == a => {
+                    *rc = c;
+                    run.push(b);
+                }
+                _ => runs.push((c, vec![a, b])),
+            }
+        }
     }
     p.add(Shape::mesh(m));
-    if let Some(r) = reference {
-        let ry = y(r);
-        p.add(Shape::dashed_line(&[pos2(rect.left(), ry), pos2(rect.right(), ry)], Stroke::new(1.0, FAINT), 3.0, 3.0));
+    if let Some(b) = baseline {
+        let by = y(b.value);
+        let ends = [pos2(rect.left(), by), pos2(rect.right(), by)];
+        match below {
+            None => p.add(Shape::dashed_line(&ends, Stroke::new(1.0, FAINT), 3.0, 3.0)),
+            Some(_) => p.add(Shape::line_segment(ends, Stroke::new(1.0, FAINT))),
+        };
     }
-    p.add(Shape::line(pts.clone(), Stroke::new(1.8, color)));
-    let last = *pts.last().expect("two or more points");
-    p.circle(last, 3.0, color, Stroke::new(1.5, SURFACE));
+    for (c, run) in runs {
+        if run.len() == 1 {
+            p.circle_filled(run[0], 2.0, c);
+        } else {
+            p.add(Shape::line(run, Stroke::new(1.8, c)));
+        }
+    }
+    let last = pts[pts.len() - 1];
+    p.circle(last, 3.0, side(last), Stroke::new(1.5, SURFACE));
     if let Some(hover) = resp.hover_pos() {
-        let i = (((hover.x - rect.left()) / step).round() as usize).min(values.len() - 1);
+        let i = (0..pts.len()).min_by(|&a, &b| (pts[a].x - hover.x).abs().total_cmp(&(pts[b].x - hover.x).abs())).expect("two or more points");
         p.line_segment([pos2(pts[i].x, rect.top()), pos2(pts[i].x, rect.bottom())], Stroke::new(1.0, alpha(TEXT, 0.25)));
         p.circle_filled(pts[i], 3.5, TEXT);
-        let text = format!("Game {} of {}: {}", i + 1, values.len(), fmt(values[i]));
-        return resp.on_hover_text_at_pointer(text);
+        return resp.on_hover_text_at_pointer(label(i));
     }
     resp
+}
+
+/// Scale and colors of a [`bar_chart`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct BarAxis {
+    /// Bars grow up from this value (values above it) or down (values below), e.g. 0.5 for win
+    /// rates or 0 for counts.
+    pub base: f64,
+    /// Smallest value range drawn over the full height, so small differences stay small (e.g.
+    /// 0.1 = ten points of win rate).
+    pub span: f64,
+    pub above: Color32,
+    pub below: Color32,
+}
+
+/// Bars with their labels underneath, relative to `axis.base` (a dashed line). Hovering a bar
+/// highlights it and shows `hover(index)`, which is only called on hover.
+pub fn bar_chart(ui: &mut Ui, bars: &[(&str, f64)], size: Vec2, axis: BarAxis, hover: &dyn Fn(usize) -> String) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if bars.is_empty() || !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let p = ui.painter_at(rect.expand(2.0));
+    let plot = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - 15.0));
+    let mut lo = bars.iter().map(|b| b.1).fold(axis.base, f64::min);
+    let mut hi = bars.iter().map(|b| b.1).fold(axis.base, f64::max);
+    // Widen to `span` on the sides that have bars (both when all equal the base).
+    let pad = (axis.span - (hi - lo)).max(0.0);
+    match (lo < axis.base, hi > axis.base) {
+        (true, false) => lo -= pad,
+        (false, true) => hi += pad,
+        _ => {
+            lo -= pad / 2.0;
+            hi += pad / 2.0;
+        }
+    }
+    let range = (hi - lo).max(1e-9);
+    let y = |v: f64| plot.bottom() - ((v - lo) / range) as f32 * plot.height();
+    let base_y = y(axis.base);
+    let slot = rect.width() / bars.len() as f32;
+    let hovered = resp.hover_pos().filter(|h| rect.contains(*h)).map(|h| (((h.x - rect.left()) / slot) as usize).min(bars.len() - 1));
+    for (i, &(text, v)) in bars.iter().enumerate() {
+        let cx = rect.left() + slot * (i as f32 + 0.5);
+        let half = (slot * 0.3).min(16.0);
+        let vy = y(v);
+        // At least 2 px, so a bar at the base still shows.
+        let (top, bottom) = if vy <= base_y { (vy.min(base_y - 2.0), base_y) } else { (base_y, vy.max(base_y + 2.0)) };
+        let c = if v < axis.base { axis.below } else { axis.above };
+        let on = hovered == Some(i);
+        p.rect_filled(Rect::from_min_max(pos2(cx - half, top), pos2(cx + half, bottom)), 2, if on { c } else { alpha(c, 0.7) });
+        p.text(pos2(cx, rect.bottom()), Align2::CENTER_BOTTOM, text, body(10.5), if on { TEXT } else { MUTED });
+    }
+    p.add(Shape::dashed_line(&[pos2(plot.left(), base_y), pos2(plot.right(), base_y)], Stroke::new(1.0, FAINT), 3.0, 3.0));
+    match hovered {
+        Some(i) => resp.on_hover_text_at_pointer(hover(i)),
+        None => resp,
+    }
+}
+
+/// A `size`-point Summoner's Rift minimap (`map`, or a dark square while it loads) with deaths as
+/// red crosses and takedowns as small green dots, both at 0..1 image coordinates (origin
+/// top-left, see `timeline::sr_minimap`). Hovering near a death highlights it and shows
+/// `hover(index into deaths)`, which is only called on hover.
+pub fn death_map(ui: &mut Ui, map: Option<Tex>, size: f32, deaths: &[(f32, f32)], takedowns: &[(f32, f32)], hover: &dyn Fn(usize) -> String) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let p = ui.painter_at(rect);
+    match map {
+        // Dimmed so the marks stand out against the art.
+        Some(t) => paint_tex(&p, rect, t, 10, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_gray(150)),
+        None => {
+            p.rect_filled(rect, 10, Color32::from_rgb(0x0C, 0x10, 0x17));
+        }
+    }
+    p.rect_stroke(rect, 10, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    let at = |(u, v): (f32, f32)| rect.min + vec2(u, v) * size;
+    for &q in takedowns {
+        p.circle(at(q), 2.5, WIN, Stroke::new(1.0, alpha(BG, 0.8)));
+    }
+    let near = resp.hover_pos().and_then(|h| {
+        (0..deaths.len()).map(|i| (i, at(deaths[i]).distance(h))).filter(|&(_, dist)| dist <= 10.0).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
+    });
+    let cross = |c: Pos2, r: f32, stroke: Stroke| {
+        p.line_segment([c + vec2(-r, -r), c + vec2(r, r)], stroke);
+        p.line_segment([c + vec2(-r, r), c + vec2(r, -r)], stroke);
+    };
+    for (i, &q) in deaths.iter().enumerate() {
+        let on = near == Some(i);
+        let r = if on { 6.0 } else { 4.5 };
+        // A dark outline keeps the cross readable on bright terrain.
+        cross(at(q), r, Stroke::new(4.0, alpha(BG, 0.75)));
+        cross(at(q), r, Stroke::new(2.0, if on { TEXT } else { LOSS }));
+    }
+    match near {
+        Some(i) => resp.on_hover_text_at_pointer(hover(i)),
+        None => resp,
+    }
 }
 
 /// `k / d / a` with the deaths in red, on one line.

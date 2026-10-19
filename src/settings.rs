@@ -37,6 +37,8 @@ pub struct OverlaySections {
     pub clock: bool,
     /// Your KDA, CS and CS per minute against your average.
     pub kda: bool,
+    /// Your goals for the role (CS/min, deaths, vision) and how this game is going.
+    pub goals: bool,
     /// Team kills and your current gold.
     pub kills_gold: bool,
     /// Item value, team and lane.
@@ -45,6 +47,8 @@ pub struct OverlaySections {
     pub skill_hint: bool,
     /// The OP.GG build picked in champ select, items you own outlined.
     pub build: bool,
+    /// Items that answer what the enemies build (healing, shields, armor/MR stacking).
+    pub counters: bool,
     pub objectives: bool,
     /// Dead enemies with respawn timers.
     pub dead_enemies: bool,
@@ -56,6 +60,8 @@ pub struct OverlaySections {
     pub enemy_items: bool,
     /// Enemy ranks during loading and the first minute and a half.
     pub scouts: bool,
+    /// Your notes on the champion and the lane matchup, during the first minute and a half.
+    pub notes: bool,
     /// ARAM Mayhem: where the augment tiers come from (or why they are missing).
     pub augment_line: bool,
 }
@@ -65,16 +71,19 @@ impl Default for OverlaySections {
         OverlaySections {
             clock: true,
             kda: true,
+            goals: true,
             kills_gold: true,
             item_diff: true,
             skill_hint: true,
             build: true,
+            counters: true,
             objectives: true,
             dead_enemies: true,
             enemy_spells: false,
             events: false,
             enemy_items: false,
             scouts: true,
+            notes: true,
             augment_line: true,
         }
     }
@@ -82,20 +91,23 @@ impl Default for OverlaySections {
 
 impl OverlaySections {
     /// Short label and flag of every section, in drawing order.
-    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 13] {
+    pub fn toggles(&mut self) -> [(&'static str, &mut bool); 16] {
         [
             ("Clock", &mut self.clock),
             ("KDA / CS", &mut self.kda),
+            ("Goals", &mut self.goals),
             ("Kills / gold", &mut self.kills_gold),
             ("Item value", &mut self.item_diff),
             ("Skill hint", &mut self.skill_hint),
             ("Build", &mut self.build),
+            ("Counter items", &mut self.counters),
             ("Objectives", &mut self.objectives),
             ("Dead enemies", &mut self.dead_enemies),
             ("Enemy spells", &mut self.enemy_spells),
             ("Recent events", &mut self.events),
             ("Enemy items", &mut self.enemy_items),
             ("Enemy ranks", &mut self.scouts),
+            ("Notes", &mut self.notes),
             ("Augment source", &mut self.augment_line),
         ]
     }

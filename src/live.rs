@@ -104,6 +104,9 @@ pub struct LiveGame {
     pub feed: Vec<FeedEvent>,
     /// Finished items enemies bought while riftlite watched, newest first ([`ItemWatch`]).
     pub item_callouts: Vec<ItemCallout>,
+    /// Items that answer what the enemies hold now, most important threat first
+    /// ([`crate::counters::suggest`]; filled by the worker, empty from the API parse).
+    pub counters: Vec<crate::counters::CounterPick>,
 }
 
 /// An enemy finished an item.
@@ -256,6 +259,7 @@ fn parse(v: &Value) -> Option<LiveGame> {
         dragons,
         feed,
         item_callouts: Vec::new(),
+        counters: Vec::new(),
     })
 }
 
@@ -554,6 +558,7 @@ mod tests {
                 dragons: (0, 0),
                 feed: vec![],
                 item_callouts: vec![],
+                counters: vec![],
             }
         };
         let completed = std::collections::HashSet::from([3071, 6692]);

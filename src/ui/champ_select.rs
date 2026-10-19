@@ -1,17 +1,22 @@
 //! Champ select: teams, bans, ARAM cards and bench, OP.GG builds, Riot's
-//! recommended pages, automation log, your record on the pick and suggestions.
+//! recommended pages, automation log, your record on the pick and suggestions, your games vs
+//! the draft, pick ideas from your pool, and your pick's mastery, notes and challenges.
 
 use eframe::egui::{Align, Align2, Color32, Label, Layout, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, vec2};
 
 use super::home::void;
 use super::live_tab::mastery_tag;
 use super::matches::trunc;
-use super::stats::{Avg, Comp, averages, mmss, now_ms, position, position_label, queue_name, scout};
+use super::stats::{Avg, Comp, averages, mmss, now_ms, position, position_label, queue_name, scout, title};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
+use crate::ddragon::StaticData;
 use crate::lcu::{self, ChampSelect, Lobby, LolGame, RecPage};
+use crate::matchups::Record;
 use crate::meta::{self, Pick};
+use crate::notes;
+use crate::pool::{self, Reason};
 use crate::worker::{Action, Snapshot};
 use crate::itemset;
 
@@ -125,6 +130,31 @@ fn lobby_card(ui: &mut Ui, s: &Snapshot, g: &Gfx, l: &Lobby) {
         }
     });
     card(ui, |ui| {
+        let mut warned = false;
+        if let Some((left, kind)) = &s.queue_penalty {
+            warned = true;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                icon(ui, Icon::Clock, 14.0, SOON);
+                ui.label(RichText::new(format!("Queue lockout · {} left", mmss(left.ceil()))).font(semibold(12.5)).color(SOON));
+                let why = penalty_reason(kind);
+                if !why.is_empty() {
+                    ui.label(RichText::new(why).size(11.5).color(MUTED));
+                }
+            });
+        }
+        if s.ranked_restriction > 0 && matches!(l.queue_id, 420 | 440) {
+            warned = true;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                icon(ui, Icon::Lock, 14.0, SOON);
+                ui.label(RichText::new(format!("Ranked restricted: {} left", n_games(s.ranked_restriction as u64))).font(semibold(12.5)).color(SOON));
+                ui.label(RichText::new("Finished normal games count down the restriction.").size(11.5).color(MUTED));
+            });
+        }
+        if warned {
+            ui.add_space(4.0);
+        }
         for m in &l.members {
             ui.horizontal(|ui| {
                 let name = s.names.get(&m.puuid).map(String::as_str).filter(|n| !n.is_empty()).unwrap_or("…");
@@ -155,6 +185,25 @@ fn lobby_card(ui: &mut Ui, s: &Snapshot, g: &Gfx, l: &Lobby) {
             });
         }
     });
+}
+
+/// The client's queue lockout `errorType` in words; unknown types in plain case.
+fn penalty_reason(kind: &str) -> String {
+    match kind {
+        "QUEUE_DODGER" => "Dodge penalty (left a champ select)".into(),
+        "LEAVER_BUSTED" => "Leaver penalty (low-priority queue)".into(),
+        other => title(other),
+    }
+}
+
+/// `1 game`, `3 games`.
+fn n_games(n: u64) -> String {
+    if n == 1 { "1 game".into() } else { format!("{n} games") }
+}
+
+/// `3–2 in 5 games`.
+fn record_line(r: Record) -> String {
+    format!("{}–{} in {}", r.wins, r.losses(), n_games(r.games))
 }
 
 /// While you have a ban to make: the champions your intended pick wins least against in lane
@@ -193,6 +242,257 @@ fn ban_hints(ui: &mut Ui, s: &Snapshot, cs: &ChampSelect, g: &Gfx, meta_on: bool
         });
         small_note(ui, format!("{name}'s lane win rate against each (OP.GG, {} games or more), lowest first.", meta::MIN_GAMES));
     });
+}
+
+/// Your own record against the enemy picks (match details, any queue with lanes), and while you
+/// have a ban to make, the enemy champions you have lost to most. Champions only: enemy players
+/// stay anonymous.
+fn draft_record(ui: &mut Ui, s: &Snapshot, cs: &ChampSelect, g: &Gfx) {
+    let mine = cs.my_champion();
+    let opp = s.opponent.as_ref().map(|o| o.champion_id);
+    let rows: Vec<(i64, Record)> = cs
+        .their_team
+        .iter()
+        .filter(|p| p.picked && p.champion_id > 0)
+        .map(|p| (p.champion_id, s.matchups.record_vs(p.champion_id, None, false)))
+        .filter(|(_, r)| r.games > 0)
+        .collect();
+    let bans = if cs.my_ban_pending {
+        let mut exclude = cs.bans.clone();
+        exclude.extend(cs.my_team.iter().chain(&cs.their_team).map(|p| p.champion_id).filter(|&c| c > 0));
+        s.matchups.ban_hints(3, 3, &exclude)
+    } else {
+        Vec::new()
+    };
+    let filling = s.matchups.len() == 0;
+    if rows.is_empty() && bans.is_empty() && !filling {
+        return;
+    }
+    section(ui, "Your games vs this draft");
+    card(ui, |ui| {
+        if filling {
+            small_note(ui, "Your record against each enemy champion fills in from your match history in the background.");
+        }
+        for &(enemy, all) in &rows {
+            let lane = opp == Some(enemy);
+            ui.horizontal(|ui| {
+                g.champ(ui, enemy, 28.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(RichText::new(format!("vs {}", s.data.champion_name(enemy))).font(semibold(12.5)).color(TEXT));
+                        if lane {
+                            pill(ui, "probable lane opponent", CYAN);
+                        }
+                        if all.few_games() {
+                            pill(ui, "few games", MUTED);
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let color = if all.few_games() { MUTED } else { wr_color(all.win_rate()) };
+                        ui.label(RichText::new(record_line(all)).size(11.5).color(color));
+                        let mut part = |label: String, r: Record| {
+                            if r.games > 0 {
+                                ui.label(RichText::new("·").size(11.5).color(FAINT));
+                                ui.label(RichText::new(format!("{label} {}", record_line(r))).size(11.5).color(MUTED));
+                            }
+                        };
+                        if let Some(m) = mine {
+                            part(format!("on {}:", s.data.champion_name(m)), s.matchups.record_vs(enemy, Some(m), false));
+                        }
+                        if lane {
+                            part("in lane:".into(), s.matchups.record_vs(enemy, None, true));
+                        }
+                    });
+                });
+            });
+        }
+        if !bans.is_empty() {
+            if !rows.is_empty() {
+                ui.add_space(6.0);
+            }
+            overline(ui, "Ban ideas from your own games");
+            tiles(ui, |ui| {
+                for &(c, r) in &bans {
+                    inset_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            g.champ(ui, c, 30.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(RichText::new(s.data.champion_name(c)).font(semibold(12.5)).color(TEXT));
+                                ui.label(RichText::new(format!("you won {} of {} vs it", r.wins, r.games)).size(11.5).color(MUTED));
+                            });
+                        });
+                    });
+                }
+            });
+            small_note(ui, "Options: enemy champions you have lost to most in your recorded games (any role, 3 games or more), not OP.GG's numbers.");
+        }
+    });
+}
+
+/// Queues whose champion you do not choose freely (ARAM, ARURF) or whose results are
+/// placements rather than wins (Arena); left out of your pick pool.
+const NOT_IN_POOL: [i64; 6] = [450, 2400, 900, 1010, 1700, 1710];
+
+/// While your pick is open: champions from your own pool, each with the reasons it could fit
+/// this draft (`pool::ideas`). Options to weigh, never a single pick. Not in Arena.
+fn pick_ideas(ui: &mut Ui, s: &Snapshot, cs: &ChampSelect, g: &Gfx) {
+    if matches!(cs.queue_id, 1700 | 1710) || s.session.as_ref().is_some_and(|x| x.map_id == 30) {
+        return;
+    }
+    let history = s.lol_history.as_deref().unwrap_or(&[]);
+    let mut champs: Vec<pool::PoolChamp> = Vec::new();
+    for game in history.iter().filter(|x| !NOT_IN_POOL.contains(&x.queue_id)) {
+        match champs.iter_mut().find(|p| p.champion_id == game.champion_id) {
+            Some(p) => {
+                p.games += 1;
+                p.wins += game.win as u64;
+            }
+            None => champs.push(pool::PoolChamp { champion_id: game.champion_id, games: 1, wins: game.win as u64 }),
+        }
+    }
+    let team = Comp::of(&s.data, cs.my_team.iter().filter(|p| !p.is_me && p.picked).map(|p| p.champion_id));
+    let warnings = team.warnings();
+    let needs = pool::Needs {
+        magic: warnings.contains(&"All physical damage"),
+        physical: warnings.contains(&"All magic damage"),
+        tank: warnings.contains(&"No tank"),
+    };
+    let position = lcu::canonical_position(cs.me().map_or("", |me| me.position.as_str()));
+    // Without OP.GG's matchups the opponent still brings your own record against it.
+    let opponent = s.opponent.as_ref().map(|o| {
+        let counters: &[meta::Matchup] = match &o.build {
+            Some(Ok(b)) => &b.counters,
+            _ => &[],
+        };
+        (o.champion_id, counters)
+    });
+    let record_vs = |mine: i64, enemy: i64| {
+        let r = s.matchups.record_vs(enemy, Some(mine), true);
+        (r.games, r.wins)
+    };
+    let input = pool::Input {
+        pool: &champs,
+        pickable: &s.pickable,
+        position,
+        positions: &s.positions,
+        needs,
+        data: &s.data,
+        opponent,
+        record_vs: &record_vs,
+    };
+    let taken = |c: i64| cs.bans.contains(&c) || cs.my_team.iter().chain(&cs.their_team).any(|p| !p.is_me && p.picked && p.champion_id == c);
+    let ideas: Vec<pool::Idea> = pool::ideas(&input).into_iter().filter(|i| !taken(i.champion_id)).take(5).collect();
+    if ideas.is_empty() {
+        return;
+    }
+    section(ui, "Pick ideas");
+    card(ui, |ui| {
+        overline(ui, "Options from your own pool, with the reasons each could fit");
+        if let Some(o) = &s.opponent {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("Probable lane opponent").size(11.5).color(MUTED));
+                g.champ(ui, o.champion_id, 22.0);
+                ui.label(RichText::new(s.data.champion_name(o.champion_id)).font(semibold(12.5)).color(TEXT));
+            });
+        }
+        ui.add_space(4.0);
+        for idea in &ideas {
+            ui.horizontal(|ui| {
+                g.champ(ui, idea.champion_id, 34.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(s.data.champion_name(idea.champion_id)).font(semibold(13.0)).color(TEXT));
+                        ui.label(RichText::new(format!("{} · {} won", n_games(idea.games), idea.wins)).size(11.5).color(MUTED));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if idea.reasons.is_empty() {
+                            ui.label(RichText::new("from your record on it").size(11.5).color(FAINT));
+                        }
+                        for r in &idea.reasons {
+                            let (text, color) = reason_chip(r, position, &s.data);
+                            pill(ui, text, color);
+                        }
+                    });
+                });
+            });
+        }
+        ui.add_space(2.0);
+        small_note(
+            ui,
+            "From your recent games (ARAM, ARURF and Arena left out), Riot's position list, your team's damage mix and the probable lane opponent. Ideas to weigh, not instructions.",
+        );
+    });
+}
+
+/// A pick idea's reason as chip text and color.
+fn reason_chip(r: &Reason, position: &str, data: &StaticData) -> (String, Color32) {
+    match r {
+        Reason::Role => (format!("Riot lists it for {}", position_label(position)), CYAN),
+        Reason::Magic => ("adds magic damage".into(), ACCENT_TEXT),
+        Reason::Physical => ("adds physical damage".into(), ACCENT_TEXT),
+        Reason::Tank => ("adds a frontliner".into(), ACCENT_TEXT),
+        Reason::Counters { opponent, games, opponent_wins } => {
+            let pct = *opponent_wins as f64 * 100.0 / (*games).max(1) as f64;
+            (format!("OP.GG: {} wins {pct:.0}% of {games} games vs it", data.champion_name(*opponent)), BODY)
+        }
+        Reason::Record { opponent, games, wins } => (format!("you're {wins}–{} vs {} on it", games - wins, data.champion_name(*opponent)), BODY),
+    }
+}
+
+/// Your mastery on the pick: level, points and marks to the next level, grades the next
+/// milestone still needs, and the best grade so far.
+fn mastery_lines(ui: &mut Ui, m: &lcu::Mastery) {
+    overline(ui, "Mastery");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new(format!("Level {}", m.level)).font(semibold(13.0)).color(if m.level >= 10 { SOON } else { TEXT }));
+        if m.points_to_next > 0 {
+            ui.label(RichText::new(format!("{} pts to level {}", m.points_to_next, m.level + 1)).size(11.5).color(MUTED));
+        }
+        if m.marks_required > 0 {
+            ui.label(RichText::new(format!("marks {}/{}", m.marks, m.marks_required)).size(11.5).color(MUTED));
+        }
+        if !m.highest_grade.is_empty() {
+            pill(ui, format!("best grade {}", m.highest_grade), ACCENT_TEXT);
+        }
+    });
+    let needed = m.grades_needed();
+    if !needed.is_empty() {
+        let list: Vec<String> = needed.iter().map(|(grade, n)| format!("{grade} ×{n}")).collect();
+        small_note(ui, format!("Next milestone needs: {}", list.join(", ")));
+    }
+}
+
+/// Open challenges a game on the pick can advance: name, description, value toward the next
+/// threshold and the level it reaches.
+fn challenge_lines(ui: &mut Ui, list: &[&lcu::Challenge]) {
+    let num = |v: f64| if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.1}") };
+    overline(ui, "Challenges a game on it can advance");
+    for c in list {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&c.name).font(semibold(12.5)).color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{} → {}", title(&c.level), title(&c.next_level))).size(11.5).color(MUTED));
+            });
+        });
+        if !c.description.is_empty() {
+            small_note(ui, &c.description);
+        }
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 90.0).max(60.0);
+            progress(ui, c.progress() as f32, width, ACCENT);
+            ui.label(RichText::new(format!("{} / {}", num(c.value), num(c.next_threshold))).size(11.0).color(MUTED));
+        });
+        ui.add_space(2.0);
+    }
 }
 
 impl App {
@@ -322,6 +622,7 @@ impl App {
         if cs.my_ban_pending {
             ban_hints(ui, s, cs, &g, self.settings.meta_builds);
         }
+        draft_record(ui, s, cs, &g);
         let history = s.lol_history.as_deref().unwrap_or(&[]);
         let record = |c: i64| averages(history.iter().filter(|g| g.champion_id == c));
         if cs.picking_card() {
@@ -362,6 +663,9 @@ impl App {
             });
         }
 
+        if !cs.locked && !cs.picking_card() {
+            pick_ideas(ui, s, cs, &g);
+        }
         self.meta_build(ui, s, cs, &g);
 
         section(ui, "Recommended runes");
@@ -440,12 +744,75 @@ impl App {
                 });
             }
         });
+        self.my_pick_card(ui, s, cs, champ);
         suggestions(ui, s, &g, history);
     }
 
-    /// OP.GG's builds for the current pick (Settings → "Use OP.GG builds"): build types and
-    /// builds best first, then the picked build's items, skill orders, rune pages, spells and
-    /// lane matchups. Clicking an option picks it for the OP.GG rune page and the lock-in set.
+    /// Your pick at a glance: mastery toward the next level and milestone, your notes on it and on
+    /// the probable lane matchup (plus other saved notes for this draft, read-only), and the
+    /// challenges a game on it can advance.
+    fn my_pick_card(&mut self, ui: &mut Ui, s: &Snapshot, cs: &ChampSelect, champ: i64) {
+        let name = s.data.champion_name(champ);
+        let mastery = s.mastery.iter().find(|m| m.champion_id == champ);
+        let mode = match s.session.as_ref().map_or(0, |x| x.map_id) {
+            12 => "ARAM",
+            30 => "CHERRY",
+            _ => "CLASSIC",
+        };
+        let challenges: Vec<&lcu::Challenge> = match &s.challenge_list {
+            Some(Ok(list)) => lcu::champion_challenges(list, champ, mode).into_iter().take(3).collect(),
+            _ => Vec::new(),
+        };
+        let opp = s.opponent.as_ref().map(|o| o.champion_id);
+        let enemies: Vec<i64> = cs.their_team.iter().filter(|p| p.picked && p.champion_id > 0).map(|p| p.champion_id).collect();
+        let own_key = notes::champ_key(champ);
+        let vs_key = opp.map(|o| notes::vs_key(champ, o));
+        let others: Vec<(String, String, String)> = s
+            .notes
+            .for_game(champ, &enemies, opp, &s.data)
+            .into_iter()
+            .filter(|(k, _, _)| *k != own_key && Some(k) != vs_key.as_ref())
+            .collect();
+        section(ui, &format!("{name}: mastery, notes and challenges"));
+        card(ui, |ui| {
+            let notes_col = |this: &mut App, ui: &mut Ui| {
+                overline(ui, "Your notes");
+                let mut boxes = vec![(own_key.clone(), format!("{name} notes"))];
+                if let (Some(o), Some(k)) = (opp, &vs_key) {
+                    boxes.push((k.clone(), format!("{name} vs {}", s.data.champion_name(o))));
+                }
+                for (key, heading) in &boxes {
+                    if let Some((key, text)) = note_box(ui, &mut this.note_edit, key, heading, s.notes.get(key)) {
+                        this.request(Action::SaveNote { key, text });
+                    }
+                    ui.add_space(4.0);
+                }
+                for (_, heading, text) in &others {
+                    ui.label(RichText::new(heading).font(semibold(12.5)).color(TEXT));
+                    ui.add(Label::new(RichText::new(text).color(BODY)).wrap());
+                    ui.add_space(4.0);
+                }
+            };
+            if mastery.is_none() && challenges.is_empty() {
+                return notes_col(self, ui);
+            }
+            ui.columns(2, |cols| {
+                if let Some(m) = mastery {
+                    mastery_lines(&mut cols[0], m);
+                    cols[0].add_space(6.0);
+                }
+                if !challenges.is_empty() {
+                    challenge_lines(&mut cols[0], &challenges);
+                }
+                notes_col(self, &mut cols[1]);
+            });
+        });
+    }
+
+    /// OP.GG's builds for the current pick (Settings → "Use OP.GG builds"): the champion's OP.GG
+    /// summary, build types and builds best first (Arena: most played first), then the picked
+    /// build's items, skill orders, rune pages, spells and lane matchups. Clicking an option picks
+    /// it for the OP.GG rune page and the lock-in set.
     fn meta_build(&mut self, ui: &mut Ui, s: &Snapshot, cs: &ChampSelect, g: &Gfx) {
         if !self.settings.meta_builds {
             return;
@@ -501,7 +868,8 @@ impl App {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.label(RichText::new(format!("{name} · OP.GG {}", build.query.label())).font(semibold(14.0)).color(TEXT));
-                    ui.label(RichText::new(format!("{} builds", build.cores.len())).color(MUTED));
+                    let order = if build.query.mode == "arena" { ", most played first" } else { "" };
+                    ui.label(RichText::new(format!("{} builds{order}", build.cores.len())).color(MUTED));
                 });
             });
             if !build.patch_matches(&s.data.version) {
@@ -511,7 +879,11 @@ impl App {
                 small_note(ui, "ARAM Mayhem: these are OP.GG's ARAM builds; Mayhem's augments can change which items are strong.");
             }
             if build.query.mode == "arena" {
-                small_note(ui, "Arena: wins as OP.GG counts them, with average placement. Augments are not shown.");
+                small_note(ui, "Arena: options with pick rate and games, most played first; Riot does not allow Arena win rates. Augments are not shown.");
+            }
+            if let Some(sum) = &build.summary {
+                ui.add_space(6.0);
+                opgg_summary(ui, sum, &name, build.query);
             }
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
@@ -549,7 +921,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 let row = |ui: &mut Ui, label: &str, f: &mut dyn FnMut(&mut Ui)| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.add_sized([84.0, 22.0], eframe::egui::Label::new(RichText::new(label.to_uppercase()).font(semibold(10.5)).color(MUTED)));
                         f(ui);
                     });
@@ -690,10 +1062,60 @@ impl App {
                 _ => "all games",
             };
             let patch = if build.patch.is_empty() { String::new() } else { format!("patch {}, ", build.patch) };
+            let margin = if build.query.mode == "arena" { "Most played first" } else { "± is the win rate's 95% margin" };
             ui.add_space(6.0);
-            small_note(ui, format!("Data: OP.GG (op.gg), {patch}{sample}. ± is the win rate's 95% margin. Types from Data Dragon item stats."));
+            small_note(ui, format!("Data: OP.GG (op.gg), {patch}{sample}. {margin}. Types from Data Dragon item stats."));
         });
     }
+}
+
+/// OP.GG's numbers for the picked champion: one line, then its win rate by game length
+/// (bars around 50 %) and by recent patch. Arena has neither chart (no win rates).
+fn opgg_summary(ui: &mut Ui, sum: &meta::ChampSummary, name: &str, query: meta::Query) {
+    inset_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add(Label::new(RichText::new(sum.line(name, query)).size(12.0).color(BODY)).wrap());
+        let lengths = &sum.game_lengths;
+        let trend = &sum.trend;
+        if lengths.is_empty() && trend.len() < 2 {
+            return;
+        }
+        ui.add_space(4.0);
+        let w = ((ui.available_width() - 16.0) / 2.0).max(140.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            if !lengths.is_empty() {
+                // OP.GG's buckets: under the next start, between starts, and the last one onwards.
+                let labels: Vec<String> = lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(from, _))| match lengths.get(i + 1) {
+                        Some(&(next, _)) if from == 0 => format!("<{next}"),
+                        Some(&(next, _)) => format!("{from}–{next}"),
+                        None => format!("{from}+"),
+                    })
+                    .collect();
+                let bars: Vec<(&str, f64)> = labels.iter().zip(lengths).map(|(l, &(_, wr))| (l.as_str(), wr)).collect();
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    overline(ui, "Win rate by game length (min)");
+                    let axis = BarAxis { base: 0.5, span: 0.1, above: WIN, below: LOSS };
+                    bar_chart(ui, &bars, vec2(w, 64.0), axis, &|i: usize| format!("{} min: {:.1}% WR", labels[i], lengths[i].1 * 100.0));
+                });
+            }
+            if trend.len() >= 2 {
+                let points: Vec<LinePoint> = trend.iter().enumerate().map(|(i, &(_, wr))| LinePoint { x: i as f64, y: wr, gap_before: false }).collect();
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    overline(ui, "Win rate by patch");
+                    let label = |i: usize| format!("Patch {}: {:.1}% WR", trend[i].0, trend[i].1 * 100.0);
+                    line_chart(ui, &points, vec2(w, 48.0), CYAN, Some(Baseline { value: 0.5, below: None }), &label);
+                    let (first, last) = (&trend[0].0, &trend[trend.len() - 1].0);
+                    ui.label(RichText::new(format!("{first} → {last} · dashed line 50%")).size(11.0).color(MUTED));
+                });
+            }
+        });
+    });
 }
 
 /// Picks from your own record: champions you have won with recently, best first.

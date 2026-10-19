@@ -1,5 +1,6 @@
 //! League Client (LCU) API: credential discovery and the endpoints riftlite uses.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -94,17 +95,31 @@ impl std::fmt::Display for LcuError {
     }
 }
 
-/// Riot's position names as used by the perks recommender.
-pub fn perk_position(assigned: &str) -> &'static str {
-    match assigned.to_ascii_lowercase().as_str() {
-        "top" => "TOP",
-        "jungle" => "JUNGLE",
-        "middle" | "mid" => "MIDDLE",
-        "bottom" | "bot" => "BOTTOM",
-        "utility" | "support" => "UTILITY",
-        _ => "NONE",
+/// Canonical position (`TOP`, `JUNGLE`, `MIDDLE`, `BOTTOM`, `UTILITY`) for any spelling the
+/// client uses (`top`, `Mid`, `bot`, `ADC`, `support`…); `""` for `NONE`, `UNSELECTED`, `FILL`,
+/// empty and anything unknown.
+pub fn canonical_position(s: &str) -> &'static str {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "TOP" => "TOP",
+        "JUNGLE" => "JUNGLE",
+        "MIDDLE" | "MID" => "MIDDLE",
+        "BOTTOM" | "BOT" | "ADC" => "BOTTOM",
+        "UTILITY" | "SUPPORT" => "UTILITY",
+        _ => "",
     }
 }
+
+/// Riot's position names as used by the perks recommender (`NONE` when unknown).
+pub fn perk_position(assigned: &str) -> &'static str {
+    match canonical_position(assigned) {
+        "" => "NONE",
+        p => p,
+    }
+}
+
+/// The replay component the match-history replay button identifies itself as. UNVERIFIED:
+/// taken from the client's API schema, not checked against a running client.
+const REPLAY_COMPONENT: &str = "replay-button_match-history";
 
 const FLASH: i64 = 4;
 const PAGE_PREFIX: &str = "riftlite";
@@ -228,6 +243,13 @@ impl Lcu {
             .ok_or_else(|| LcuError::Transport("match has no participants".into()))
     }
 
+    /// Minute-by-minute frames and events of one finished game, as the client returns them
+    /// (parsed by `timeline::parse`). UNVERIFIED: shape from the client's API schema, not
+    /// checked against a running client.
+    pub fn game_timeline(&self, game_id: u64) -> Result<Value, LcuError> {
+        self.get_match_history(&format!("/lol-match-history/v1/game-timelines/{game_id}"))
+    }
+
     /// `Ok(None)` when not in champ select (the client answers 404).
     pub fn champ_select(&self) -> Result<Option<ChampSelect>, LcuError> {
         let mut cs = match self.get("/lol-champ-select/v1/session") {
@@ -261,16 +283,14 @@ impl Lcu {
         Ok(v.as_array().into_iter().flatten().filter_map(parse_rec_page).collect())
     }
 
-    /// Positions Riot recommends for a champion, best first.
+    /// Positions Riot recommends for a champion, canonical, best first.
     pub fn recommended_positions(&self, champion_id: i64) -> Vec<String> {
-        self.get("/lol-perks/v1/recommended-champion-positions")
-            .ok()
-            .and_then(|v| {
-                v[champion_id.to_string()]["recommendedPositions"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
-            })
-            .unwrap_or_default()
+        self.recommended_positions_all().ok().and_then(|mut all| all.remove(&champion_id)).unwrap_or_default()
+    }
+
+    /// Riot's recommended positions for every champion (canonical, best first).
+    pub fn recommended_positions_all(&self) -> Result<HashMap<i64, Vec<String>>, LcuError> {
+        Ok(parse_recommended_positions(&self.get("/lol-perks/v1/recommended-champion-positions")?))
     }
 
     /// Writes `rec` into riftlite's own rune page (created once, then reused)
@@ -358,22 +378,95 @@ impl Lcu {
         })
     }
 
-    /// Mastery per champion, highest points first.
+    /// Mastery per champion, highest points first. The milestone fields come from the client's
+    /// API schema and were not verified against a running client.
     pub fn mastery(&self, puuid: &str) -> Result<Vec<Mastery>, LcuError> {
         let v = self.get(&format!("/lol-champion-mastery/v1/{puuid}/champion-mastery"))?;
-        let mut m: Vec<Mastery> = v
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|c| Mastery {
-                champion_id: c["championId"].as_i64().unwrap_or(0),
-                level: c["championLevel"].as_i64().unwrap_or(0),
-                points: c["championPoints"].as_i64().unwrap_or(0),
-                last_play_ms: c["lastPlayTime"].as_i64().unwrap_or(0),
-            })
-            .collect();
+        let mut m: Vec<Mastery> = v.as_array().into_iter().flatten().map(parse_mastery).collect();
         m.sort_by(|a, b| b.points.cmp(&a.points));
         Ok(m)
+    }
+
+    /// Mastery gained in the game that just ended; `None` outside the end of game screen (404)
+    /// or without a champion. UNVERIFIED: shape from the client's API schema, not checked
+    /// against a running client.
+    pub fn mastery_update(&self) -> Result<Option<MasteryUpdate>, LcuError> {
+        match self.get("/lol-end-of-game/v1/champion-mastery-updates") {
+            Ok(v) => Ok(parse_mastery_update(&v)),
+            Err(LcuError::Status(404)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every challenge of the local player. UNVERIFIED semantics: field meanings come from the
+    /// client's API schema, not checked against a running client.
+    pub fn challenge_list(&self) -> Result<Vec<Challenge>, LcuError> {
+        Ok(parse_challenge_list(&self.get("/lol-challenges/v1/challenges/local-player")?))
+    }
+
+    /// Ranked games still to play in normal queues before ranked unlocks (leaver penalty); 0
+    /// when none (404). UNVERIFIED: shape from the client's API schema, not checked against a
+    /// running client.
+    pub fn ranked_restriction(&self) -> Result<i64, LcuError> {
+        match self.get("/lol-leaver-buster/v1/ranked-restriction") {
+            Ok(v) => Ok(v["punishedGamesRemaining"].as_i64().unwrap_or(0).max(0)),
+            Err(LcuError::Status(404)) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Queue lockout: seconds left and the client's `errorType`; `None` when there is none
+    /// (404). UNVERIFIED: shape from the client's API schema, not checked against a running client.
+    pub fn queue_penalty(&self) -> Result<Option<(f64, String)>, LcuError> {
+        match self.get("/lol-matchmaking/v1/search/errors") {
+            Ok(v) => Ok(v.as_array().into_iter().flatten().find_map(|e| {
+                let left = e["penaltyTimeRemaining"].as_f64().filter(|&s| s > 0.0)?;
+                Some((left, e["errorType"].as_str().unwrap_or("").to_string()))
+            })),
+            Err(LcuError::Status(404)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replay settings and whether the client can download/watch replays right now.
+    /// UNVERIFIED: shape from the client's API schema, not checked against a running client.
+    pub fn replay_config(&self) -> Result<ReplayConfig, LcuError> {
+        Ok(parse_replay_config(&self.get("/lol-replays/v1/configuration")?))
+    }
+
+    /// Replay availability of one game; empty state when the client knows nothing about it (404).
+    /// UNVERIFIED: shape from the client's API schema, not checked against a running client.
+    pub fn replay_state(&self, game_id: u64) -> Result<ReplayState, LcuError> {
+        match self.get(&format!("/lol-replays/v1/metadata/{game_id}")) {
+            Ok(v) => Ok(ReplayState {
+                state: v["state"].as_str().unwrap_or("").to_string(),
+                progress: v["downloadProgress"].as_i64().unwrap_or(0),
+            }),
+            Err(LcuError::Status(404)) => Ok(ReplayState { state: String::new(), progress: 0 }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Makes the client look up a game's replay (match history does this before showing the
+    /// button); `game_end_ms` is the game's end time. UNVERIFIED: shape from the client's API
+    /// schema, not checked against a running client.
+    pub fn replay_create(&self, game_id: u64, game_version: &str, game_type: &str, queue_id: i64, game_end_ms: i64) -> Result<(), LcuError> {
+        let body = serde_json::json!({"gameVersion": game_version, "gameType": game_type, "queueId": queue_id, "gameEnd": game_end_ms});
+        self.send("POST", &format!("/lol-replays/v2/metadata/{game_id}/create"), Some(&body)).map(drop)
+    }
+
+    /// Starts downloading a game's replay file. UNVERIFIED: shape from the client's API schema,
+    /// not checked against a running client.
+    pub fn replay_download(&self, game_id: u64) -> Result<(), LcuError> {
+        let body = serde_json::json!({"componentType": REPLAY_COMPONENT});
+        self.send("POST", &format!("/lol-replays/v1/rofls/{game_id}/download"), Some(&body)).map(drop)
+    }
+
+    /// Opens a downloaded replay in the game client. UNVERIFIED: shape from the client's API
+    /// schema, not checked against a running client.
+    pub fn replay_watch(&self, game_id: u64) -> Result<(), LcuError> {
+        let body = serde_json::json!({"componentType": REPLAY_COMPONENT});
+        self.send("POST", &format!("/lol-replays/v1/rofls/{game_id}/watch"), Some(&body)).map(drop)
     }
 
     pub fn challenges(&self) -> Result<Challenges, LcuError> {
@@ -674,7 +767,7 @@ pub struct Summoner {
     pub profile_icon: i64,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct RankedQueue {
     pub queue: String,
     pub tier: String,
@@ -682,6 +775,21 @@ pub struct RankedQueue {
     pub lp: i64,
     pub wins: i64,
     pub losses: i64,
+    /// Placement games left (`provisionalGamesRemaining` while `isProvisional`), else 0.
+    pub provisional_left: i64,
+    /// Season high (`highestTier`/`highestDivision`); empty when none.
+    pub highest_tier: String,
+    pub highest_division: String,
+    /// Last season's final rank (`previousSeasonEndTier`/`Division`); empty when none.
+    pub previous_tier: String,
+    pub previous_division: String,
+    /// Days until LP decay, only while the client shows the decay warning (UNVERIFIED: from
+    /// the client's API schema, not checked against a running client).
+    pub decay_days: Option<i64>,
+    /// The client warns of a demotion (UNVERIFIED, same source).
+    pub demotion_warning: bool,
+    /// `miniSeriesProgress` (e.g. `WLN`); empty when not in a series.
+    pub mini_series: String,
 }
 
 /// Display name of a ranked queue type (`RANKED_SOLO_5x5` → `Ranked Solo/Duo`).
@@ -732,6 +840,8 @@ fn title_case(s: &str) -> String {
 
 fn parse_ranked(v: &Value) -> Vec<RankedQueue> {
     let str_of = |q: &Value, k: &str| q[k].as_str().unwrap_or("").to_string();
+    // The client fills absent ranks with `NONE` (tiers) and `NA` (divisions, series).
+    let rank_of = |q: &Value, k: &str| q[k].as_str().filter(|s| !matches!(*s, "NONE" | "NA")).unwrap_or("").to_string();
     v["queues"]
         .as_array()
         .into_iter()
@@ -739,6 +849,7 @@ fn parse_ranked(v: &Value) -> Vec<RankedQueue> {
         .map(|q| {
             // Hyper Roll reports a rated tier instead of a division ladder.
             let rated = q["ratedTier"].as_str().filter(|t| !t.is_empty() && *t != "NONE");
+            let w = &q["warnings"];
             RankedQueue {
                 queue: str_of(q, "queueType"),
                 tier: rated.map(str::to_string).unwrap_or_else(|| str_of(q, "tier")),
@@ -746,6 +857,14 @@ fn parse_ranked(v: &Value) -> Vec<RankedQueue> {
                 lp: if rated.is_some() { q["ratedRating"].as_i64() } else { q["leaguePoints"].as_i64() }.unwrap_or(0),
                 wins: q["wins"].as_i64().unwrap_or(0),
                 losses: q["losses"].as_i64().unwrap_or(0),
+                provisional_left: if q["isProvisional"] == true { q["provisionalGamesRemaining"].as_i64().unwrap_or(0).max(0) } else { 0 },
+                highest_tier: rank_of(q, "highestTier"),
+                highest_division: rank_of(q, "highestDivision"),
+                previous_tier: rank_of(q, "previousSeasonEndTier"),
+                previous_division: rank_of(q, "previousSeasonEndDivision"),
+                decay_days: if w["displayDecayWarning"] == true { w["daysUntilDecay"].as_i64() } else { None },
+                demotion_warning: w["demotionWarning"].as_i64().map_or(w["demotionWarning"] == true, |d| d > 0),
+                mini_series: rank_of(q, "miniSeriesProgress"),
             }
         })
         .filter(|q| !q.queue.is_empty())
@@ -820,18 +939,30 @@ fn parse_lol_history(v: &Value, puuid: &str) -> Vec<LolGame> {
         .collect()
 }
 
+/// Summoner's Rift queues with lanes (draft, ranked solo, blind, ranked flex, Swiftplay,
+/// Quickplay, Clash): the only games whose match details carry a usable lane.
+pub const LANE_QUEUES: [i64; 7] = [400, 420, 430, 440, 480, 490, 700];
+
 /// The lane match history assigns from movement (`timeline.lane`/`role`), on Summoner's Rift
-/// queues only; Riot's guess, often wrong for roamers and swaps. Empty when unknown.
-fn history_position(queue_id: i64, timeline: &Value) -> &'static str {
-    if !matches!(queue_id, 400 | 420 | 430 | 440 | 480 | 490 | 700) {
+/// queues only; Riot's guess, often wrong for roamers and swaps. Canonical; empty when unknown.
+fn history_lane(queue_id: i64, timeline: &Value) -> &'static str {
+    if !LANE_QUEUES.contains(&queue_id) {
         return "";
     }
-    match (timeline["lane"].as_str().unwrap_or(""), timeline["role"].as_str().unwrap_or("")) {
-        ("TOP", _) => "Top",
-        ("JUNGLE", _) => "Jungle",
-        ("MIDDLE" | "MID", _) => "Mid",
-        ("BOTTOM" | "BOT", "SUPPORT" | "DUO_SUPPORT") => "Support",
-        ("BOTTOM" | "BOT", _) => "Bot",
+    match (canonical_position(timeline["lane"].as_str().unwrap_or("")), timeline["role"].as_str().unwrap_or("")) {
+        ("BOTTOM", "SUPPORT" | "DUO_SUPPORT") => "UTILITY",
+        (lane, _) => lane,
+    }
+}
+
+/// `history_lane` as shown in the match list (`Top`, `Jungle`, `Mid`, `Bot`, `Support`).
+fn history_position(queue_id: i64, timeline: &Value) -> &'static str {
+    match history_lane(queue_id, timeline) {
+        "TOP" => "Top",
+        "JUNGLE" => "Jungle",
+        "MIDDLE" => "Mid",
+        "BOTTOM" => "Bot",
+        "UTILITY" => "Support",
         _ => "",
     }
 }
@@ -1090,6 +1221,12 @@ pub struct MatchPlayer {
     pub items: [i64; 7],
     pub spells: [i64; 2],
     pub is_me: bool,
+    /// `participantId` in match details (pairs with timeline frames); 0 at end of game.
+    pub participant_id: i64,
+    /// Canonical position (`TOP`…`UTILITY`); empty when unknown.
+    pub position: &'static str,
+    /// Control wards bought; `None` when the client did not report the count.
+    pub control_wards: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -1099,6 +1236,12 @@ pub struct MatchDetail {
     pub duration_s: i64,
     pub queue_id: i64,
     pub mode: String,
+    /// `gameVersion` (e.g. `14.20.628.4410`); empty at end of game.
+    pub game_version: String,
+    /// `gameType` (e.g. `MATCHED_GAME`).
+    pub game_type: String,
+    /// 0 at end of game.
+    pub map_id: i64,
     pub players: Vec<MatchPlayer>,
 }
 
@@ -1122,6 +1265,7 @@ impl MatchDetail {
 
 fn parse_match_detail(g: &Value) -> Option<MatchDetail> {
     let idents = g["participantIdentities"].as_array()?;
+    let queue_id = g["queueId"].as_i64().unwrap_or(0);
     let players: Vec<MatchPlayer> = g["participants"]
         .as_array()?
         .iter()
@@ -1149,6 +1293,9 @@ fn parse_match_detail(g: &Value) -> Option<MatchDetail> {
                 items: std::array::from_fn(|i| n(&format!("item{i}"))),
                 spells: [p["spell1Id"].as_i64().unwrap_or(0), p["spell2Id"].as_i64().unwrap_or(0)],
                 is_me: false,
+                participant_id: pid.unwrap_or(0),
+                position: history_lane(queue_id, &p["timeline"]),
+                control_wards: s["visionWardsBoughtInGame"].as_i64(),
             }
         })
         .collect();
@@ -1159,8 +1306,11 @@ fn parse_match_detail(g: &Value) -> Option<MatchDetail> {
         game_id: g["gameId"].as_u64().unwrap_or(0),
         created_ms: g["gameCreation"].as_i64().unwrap_or(0),
         duration_s: g["gameDuration"].as_i64().unwrap_or(0),
-        queue_id: g["queueId"].as_i64().unwrap_or(0),
+        queue_id,
         mode: g["gameMode"].as_str().unwrap_or("").to_string(),
+        game_version: g["gameVersion"].as_str().unwrap_or("").to_string(),
+        game_type: g["gameType"].as_str().unwrap_or("").to_string(),
+        map_id: g["mapId"].as_i64().unwrap_or(0),
         players,
     })
 }
@@ -1169,7 +1319,9 @@ fn riot_id(name: &str, tag: &str) -> String {
     if tag.is_empty() { name.to_string() } else { format!("{name}#{tag}") }
 }
 
-/// `/lol-end-of-game/v1/eog-stats-block`: players carry an upper-case stats map.
+/// `/lol-end-of-game/v1/eog-stats-block`: players carry an upper-case stats map. Positions
+/// (`detectedTeamPosition`) and `VISION_WARDS_BOUGHT_IN_GAME` come from the client's API
+/// schema and were not verified against a running client.
 fn parse_eog(v: &Value) -> Option<MatchDetail> {
     let mut players = Vec::new();
     for t in v["teams"].as_array()? {
@@ -1197,6 +1349,13 @@ fn parse_eog(v: &Value) -> Option<MatchDetail> {
                 items: std::array::from_fn(|i| items.get(i).copied().unwrap_or(0)),
                 spells: [p["spell1Id"].as_i64().unwrap_or(0), p["spell2Id"].as_i64().unwrap_or(0)],
                 is_me: p["isLocalPlayer"].as_bool().unwrap_or(false),
+                participant_id: 0,
+                position: ["detectedTeamPosition", "selectedPosition"]
+                    .iter()
+                    .map(|k| canonical_position(p[*k].as_str().unwrap_or("")))
+                    .find(|pos| !pos.is_empty())
+                    .unwrap_or(""),
+                control_wards: s["VISION_WARDS_BOUGHT_IN_GAME"].as_i64(),
             });
         }
     }
@@ -1209,6 +1368,9 @@ fn parse_eog(v: &Value) -> Option<MatchDetail> {
         duration_s: v["gameLength"].as_i64().unwrap_or(0),
         queue_id: 0,
         mode: v["gameMode"].as_str().unwrap_or("").to_string(),
+        game_version: String::new(),
+        game_type: v["gameType"].as_str().unwrap_or("").to_string(),
+        map_id: 0,
         players,
     })
 }
@@ -1223,12 +1385,274 @@ pub struct LpChange {
     pub game_id: u64,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+/// Champion mastery. The milestone fields come from the client's API schema and were not
+/// verified against a running client.
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Mastery {
     pub champion_id: i64,
     pub level: i64,
     pub points: i64,
     pub last_play_ms: i64,
+    /// `championPointsUntilNextLevel`.
+    pub points_to_next: i64,
+    /// `markRequiredForNextLevel`.
+    pub marks_required: i64,
+    /// `tokensEarned`.
+    pub marks: i64,
+    /// `championSeasonMilestone`.
+    pub milestone: i64,
+    /// Grades earned toward the next milestone (`milestoneGrades`).
+    pub grades: Vec<String>,
+    /// Grades the next milestone requires (`nextSeasonMilestone.requireGradeCounts`), strictest first.
+    pub required_grades: Vec<(String, i64)>,
+    /// `nextSeasonMilestone.rewardMarks`.
+    pub milestone_reward_marks: i64,
+    /// `highestGrade`; empty when none.
+    pub highest_grade: String,
+}
+
+impl Mastery {
+    /// Grades still missing for the next milestone, strictest first.
+    pub fn grades_needed(&self) -> Vec<(String, i64)> {
+        missing_grades(&self.required_grades, &self.grades)
+    }
+}
+
+/// Mastery grades, worst first.
+const GRADES: [&str; 15] = ["D-", "D", "D+", "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+", "S-", "S", "S+"];
+
+/// Strictness of a mastery grade: `S+` = 14 … `D-` = 0; `None` for anything else.
+pub fn grade_rank(g: &str) -> Option<u8> {
+    GRADES.iter().position(|&x| x == g.trim()).map(|i| i as u8)
+}
+
+/// Required grades (grade, count) not covered by `earned`. An earned grade covers one slot of
+/// its own grade or lower. Requirements are filled strictest first, each with the lowest earned
+/// grade that still satisfies it, so better grades stay free for stricter slots. Unknown grades
+/// never satisfy anything. Strictest first; zero counts dropped.
+pub fn missing_grades(required: &[(String, i64)], earned: &[String]) -> Vec<(String, i64)> {
+    let mut pool: Vec<u8> = earned.iter().filter_map(|g| grade_rank(g)).collect();
+    pool.sort_unstable();
+    let mut req: Vec<&(String, i64)> = required.iter().collect();
+    req.sort_by_key(|(g, _)| std::cmp::Reverse(grade_rank(g)));
+    req.into_iter()
+        .filter_map(|(grade, count)| {
+            let need = grade_rank(grade);
+            let mut left = 0;
+            for _ in 0..(*count).max(0) {
+                match need.and_then(|r| pool.iter().position(|&e| e >= r)) {
+                    Some(i) => {
+                        pool.remove(i);
+                    }
+                    None => left += 1,
+                }
+            }
+            (left > 0).then(|| (grade.clone(), left))
+        })
+        .collect()
+}
+
+fn parse_mastery(c: &Value) -> Mastery {
+    let next = &c["nextSeasonMilestone"];
+    let mut required_grades: Vec<(String, i64)> = next["requireGradeCounts"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(g, n)| Some((g.clone(), n.as_i64().filter(|&n| n > 0)?)))
+        .collect();
+    required_grades.sort_by_key(|(g, _)| std::cmp::Reverse(grade_rank(g)));
+    Mastery {
+        champion_id: c["championId"].as_i64().unwrap_or(0),
+        level: c["championLevel"].as_i64().unwrap_or(0),
+        points: c["championPoints"].as_i64().unwrap_or(0),
+        last_play_ms: c["lastPlayTime"].as_i64().unwrap_or(0),
+        points_to_next: c["championPointsUntilNextLevel"].as_i64().unwrap_or(0),
+        marks_required: c["markRequiredForNextLevel"].as_i64().unwrap_or(0),
+        marks: c["tokensEarned"].as_i64().unwrap_or(0),
+        milestone: c["championSeasonMilestone"].as_i64().unwrap_or(0),
+        grades: c["milestoneGrades"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect(),
+        required_grades,
+        milestone_reward_marks: next["rewardMarks"].as_i64().unwrap_or(0),
+        highest_grade: c["highestGrade"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// The local player's mastery result of the game that just ended.
+#[derive(Clone, PartialEq, Debug)]
+pub struct MasteryUpdate {
+    pub champion_id: i64,
+    /// Grade of this game; empty when none.
+    pub grade: String,
+    pub points_gained: i64,
+    pub level: i64,
+    pub leveled_up: bool,
+    /// `pointsUntilNextLevelAfterGame`.
+    pub points_to_next: i64,
+    /// `tokenEarnedAfterGame`: the game earned a mark.
+    pub mark_earned: bool,
+}
+
+/// Never reads `memberGrades` (other players' grades).
+fn parse_mastery_update(v: &Value) -> Option<MasteryUpdate> {
+    Some(MasteryUpdate {
+        champion_id: v["championId"].as_i64().filter(|&c| c > 0)?,
+        grade: v["grade"].as_str().unwrap_or("").to_string(),
+        points_gained: v["pointsGained"].as_i64().unwrap_or(0),
+        level: v["level"].as_i64().unwrap_or(0),
+        leveled_up: v["hasLeveledUp"] == true,
+        points_to_next: v["pointsUntilNextLevelAfterGame"].as_i64().unwrap_or(0),
+        mark_earned: v["tokenEarnedAfterGame"] == true,
+    })
+}
+
+/// One challenge of the local player (`/lol-challenges/v1/challenges/local-player`).
+/// UNVERIFIED semantics: from the client's API schema, not checked against a running client.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Challenge {
+    pub id: i64,
+    pub name: String,
+    /// `descriptionShort`, else `description`, without the client's HTML.
+    pub description: String,
+    pub category: String,
+    /// `currentLevel` (e.g. `GOLD`).
+    pub level: String,
+    pub next_level: String,
+    /// `currentValue`.
+    pub value: f64,
+    pub next_threshold: f64,
+    /// `idListType`: `ITEM`, `CHAMPION_SKIN`, `CHAMPION` or `NONE`.
+    pub id_list: String,
+    pub available_ids: Vec<i64>,
+    pub completed_ids: Vec<i64>,
+    /// Game modes it counts in (`CLASSIC`, `ARAM`…); empty = any.
+    pub game_modes: Vec<String>,
+    /// `isCapstone`: the category's summary challenge.
+    pub capstone: bool,
+    /// `retireTimestamp` > 0.
+    pub retired: bool,
+}
+
+impl Challenge {
+    /// `value / next_threshold` in 0..=1; 0 without a next level (threshold 0).
+    pub fn progress(&self) -> f64 {
+        if self.next_threshold > 0.0 { (self.value / self.next_threshold).clamp(0.0, 1.0) } else { 0.0 }
+    }
+
+    /// A next level is still open and the challenge is a regular, current one.
+    fn open(&self) -> bool {
+        self.next_threshold > self.value && !self.capstone && !self.retired
+    }
+}
+
+fn by_progress(mut v: Vec<&Challenge>) -> Vec<&Challenge> {
+    v.sort_by(|a, b| b.progress().total_cmp(&a.progress()));
+    v
+}
+
+/// Open per-champion challenges a game on `champion_id` in `game_mode` can advance, best
+/// progress first.
+pub fn champion_challenges<'a>(list: &'a [Challenge], champion_id: i64, game_mode: &str) -> Vec<&'a Challenge> {
+    by_progress(
+        list.iter()
+            .filter(|c| c.id_list == "CHAMPION" && c.open())
+            .filter(|c| !c.completed_ids.contains(&champion_id))
+            .filter(|c| c.available_ids.is_empty() || c.available_ids.contains(&champion_id))
+            .filter(|c| c.game_modes.is_empty() || c.game_modes.iter().any(|m| m == game_mode))
+            .collect(),
+    )
+}
+
+/// The `n` open challenges closest to their next level.
+pub fn closest_challenges(list: &[Challenge], n: usize) -> Vec<&Challenge> {
+    let mut v = by_progress(list.iter().filter(|c| c.open() && c.next_threshold > 0.0).collect());
+    v.truncate(n);
+    v
+}
+
+/// Challenges keyed by id; sorted by id.
+fn parse_challenge_list(v: &Value) -> Vec<Challenge> {
+    let text = |c: &Value, k: &str| c[k].as_str().unwrap_or("").to_string();
+    let ids = |c: &Value, k: &str| c[k].as_array().into_iter().flatten().filter_map(Value::as_i64).collect::<Vec<_>>();
+    let mut list: Vec<Challenge> = v
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.values())
+        .filter_map(|c| {
+            Some(Challenge {
+                id: c["id"].as_i64()?,
+                name: text(c, "name"),
+                description: strip_tags(
+                    c["descriptionShort"].as_str().filter(|d| !d.trim().is_empty()).or(c["description"].as_str()).unwrap_or(""),
+                ),
+                category: text(c, "category"),
+                level: text(c, "currentLevel"),
+                next_level: text(c, "nextLevel"),
+                value: c["currentValue"].as_f64().unwrap_or(0.0),
+                next_threshold: c["nextThreshold"].as_f64().unwrap_or(0.0),
+                id_list: text(c, "idListType"),
+                available_ids: ids(c, "availableIds"),
+                completed_ids: ids(c, "completedIds"),
+                game_modes: c["gameModes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect(),
+                capstone: c["isCapstone"] == true,
+                retired: c["retireTimestamp"].as_i64().is_some_and(|t| t > 0),
+            })
+        })
+        .collect();
+    list.sort_by_key(|c| c.id);
+    list
+}
+
+/// `/lol-replays/v1/configuration`. UNVERIFIED: from the client's API schema.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ReplayConfig {
+    /// Replays and match-history replays are both enabled.
+    pub enabled: bool,
+    /// Game version replays are recorded for; only games of this version can be watched.
+    pub game_version: String,
+    /// Why replays cannot start now: `patching`, `in a game` or `watching a replay`.
+    pub busy: Option<&'static str>,
+}
+
+fn parse_replay_config(v: &Value) -> ReplayConfig {
+    let busy = [("isPatching", "patching"), ("isPlayingGame", "in a game"), ("isPlayingReplay", "watching a replay")]
+        .into_iter()
+        .find(|(k, _)| v[*k] == true)
+        .map(|(_, reason)| reason);
+    ReplayConfig {
+        enabled: v["isReplaysEnabled"] == true && v["isReplaysForMatchHistoryEnabled"] == true,
+        game_version: v["gameVersion"].as_str().unwrap_or("").to_string(),
+        busy,
+    }
+}
+
+/// Replay availability of one game, as reported: `checking`, `found`, `download`,
+/// `downloading`, `watch`, `incompatible`, `missingOrExpired`, `lost`, `retryDownload`,
+/// `unsupported`, `error`; `progress` is the download percentage.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ReplayState {
+    pub state: String,
+    pub progress: i64,
+}
+
+/// `/lol-perks/v1/recommended-champion-positions`: champion id (string key) → canonical
+/// positions in Riot's order.
+fn parse_recommended_positions(v: &Value) -> HashMap<i64, Vec<String>> {
+    v.as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, c)| {
+            let id = k.parse::<i64>().ok().filter(|&id| id > 0)?;
+            let positions = c["recommendedPositions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| canonical_position(p.as_str().unwrap_or("")))
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some((id, positions))
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -1394,17 +1818,138 @@ mod tests {
 
     #[test]
     fn end_of_game_block_maps_upper_case_stats() {
-        let v = serde_json::json!({"gameId": 7, "gameLength": 923, "gameMode": "KIWI", "teams": [
+        let v = serde_json::json!({"gameId": 7, "gameLength": 923, "gameMode": "KIWI", "gameType": "MATCHED_GAME", "teams": [
             {"teamId": 100, "isWinningTeam": true, "players": [{"isLocalPlayer": true, "championId": 115, "riotIdGameName": "A", "riotIdTagLine": "TR1",
-                "items": [6655, 0, 0, 0, 0, 0, 2052], "spell1Id": 4, "spell2Id": 7,
-                "stats": {"CHAMPIONS_KILLED": 5, "NUM_DEATHS": 6, "ASSISTS": 24, "MINIONS_KILLED": 11, "NEUTRAL_MINIONS_KILLED": 2, "GOLD_EARNED": 12620, "TOTAL_DAMAGE_DEALT_TO_CHAMPIONS": 24543}}]},
-            {"teamId": 200, "isWinningTeam": false, "players": [{"isLocalPlayer": false, "championId": 1, "stats": {}}]}
+                "items": [6655, 0, 0, 0, 0, 0, 2052], "spell1Id": 4, "spell2Id": 7, "detectedTeamPosition": "", "selectedPosition": "support",
+                "stats": {"CHAMPIONS_KILLED": 5, "NUM_DEATHS": 6, "ASSISTS": 24, "MINIONS_KILLED": 11, "NEUTRAL_MINIONS_KILLED": 2, "GOLD_EARNED": 12620,
+                    "TOTAL_DAMAGE_DEALT_TO_CHAMPIONS": 24543, "VISION_WARDS_BOUGHT_IN_GAME": 3}}]},
+            {"teamId": 200, "isWinningTeam": false, "players": [{"isLocalPlayer": false, "championId": 1, "detectedTeamPosition": "JUNGLE", "selectedPosition": "TOP", "stats": {}}]}
         ]});
         let d = parse_eog(&v).unwrap();
         let me = d.me().unwrap();
         assert_eq!((me.name.as_str(), me.kills, me.deaths, me.assists, me.cs, me.damage), ("A#TR1", 5, 6, 24, 13, 24543));
         assert_eq!(me.items[6], 2052);
         assert!(me.win && !d.players[1].win);
-        assert_eq!(d.duration_s, 923);
+        assert_eq!((d.duration_s, d.game_type.as_str()), (923, "MATCHED_GAME"));
+        // No detected position: the champ-select pick stands in, canonicalised.
+        assert_eq!((me.position, me.control_wards), ("UTILITY", Some(3)));
+        // The detected position wins over what was selected; a missing ward count stays unknown.
+        assert_eq!((d.players[1].position, d.players[1].control_wards), ("JUNGLE", None));
+    }
+
+    #[test]
+    fn match_detail_positions_come_from_lanes_on_rift_queues_only() {
+        let game = |queue: i64| {
+            serde_json::json!({"gameId": 9, "queueId": queue, "mapId": 11, "gameVersion": "14.20.1", "gameType": "MATCHED_GAME",
+                "participantIdentities": [
+                    {"participantId": 1, "player": {"puuid": "a", "gameName": "A", "tagLine": "1"}},
+                    {"participantId": 2, "player": {"puuid": "b", "gameName": "B", "tagLine": "2"}}],
+                "participants": [
+                    {"participantId": 1, "teamId": 100, "championId": 412, "timeline": {"lane": "BOTTOM", "role": "SUPPORT"},
+                        "stats": {"visionWardsBoughtInGame": 4}},
+                    {"participantId": 2, "teamId": 200, "championId": 222, "timeline": {"lane": "BOTTOM", "role": "CARRY"}, "stats": {}}]})
+        };
+        let d = parse_match_detail(&game(420)).unwrap();
+        assert_eq!((d.game_version.as_str(), d.map_id, d.game_type.as_str()), ("14.20.1", 11, "MATCHED_GAME"));
+        let [sup, adc] = [&d.players[0], &d.players[1]];
+        assert_eq!((sup.participant_id, sup.position, sup.control_wards), (1, "UTILITY", Some(4)));
+        assert_eq!((adc.participant_id, adc.position, adc.control_wards), (2, "BOTTOM", None));
+        // ARAM has no lanes: whatever the timeline says is noise.
+        assert!(parse_match_detail(&game(450)).unwrap().players.iter().all(|p| p.position.is_empty()));
+        // Match history shows the same lane in its display form.
+        assert_eq!(history_position(420, &serde_json::json!({"lane": "BOT", "role": "DUO_SUPPORT"})), "Support");
+    }
+
+    #[test]
+    fn positions_canonicalise_every_client_spelling() {
+        for (raw, want) in [
+            ("top", "TOP"), ("JUNGLE", "JUNGLE"), ("Mid", "MIDDLE"), ("MIDDLE", "MIDDLE"), ("bot", "BOTTOM"),
+            ("ADC", "BOTTOM"), ("support", "UTILITY"), ("UTILITY", "UTILITY"),
+            ("NONE", ""), ("UNSELECTED", ""), ("FILL", ""), ("", ""), ("roam", ""),
+        ] {
+            assert_eq!(canonical_position(raw), want, "{raw}");
+        }
+        // The perks recommender keeps its own word for "unknown".
+        assert_eq!((perk_position("fill"), perk_position("mid")), ("NONE", "MIDDLE"));
+        let rec = parse_recommended_positions(&serde_json::json!({
+            "103": {"recommendedPositions": ["MIDDLE", "UTILITY"]},
+            "0": {"recommendedPositions": ["TOP"]},
+            "64": {"recommendedPositions": ["JUNGLE", "NONE"]}
+        }));
+        assert_eq!(rec[&103], ["MIDDLE", "UTILITY"], "Riot's order is kept");
+        assert_eq!(rec[&64], ["JUNGLE"]);
+        assert!(!rec.contains_key(&0));
+    }
+
+    #[test]
+    fn ranked_reads_placements_warnings_and_season_highs() {
+        let v = serde_json::json!({"queues": [
+            {"queueType": "RANKED_SOLO_5x5", "tier": "PLATINUM", "division": "IV", "leaguePoints": 0, "isProvisional": false,
+                "provisionalGamesRemaining": 5, "highestTier": "GOLD", "highestDivision": "I", "previousSeasonEndTier": "NONE",
+                "previousSeasonEndDivision": "NA", "miniSeriesProgress": "NA",
+                "warnings": {"displayDecayWarning": false, "daysUntilDecay": 3, "demotionWarning": 2}},
+            {"queueType": "RANKED_FLEX_SR", "tier": "", "isProvisional": true, "provisionalGamesRemaining": 4,
+                "warnings": {"displayDecayWarning": true, "daysUntilDecay": 6, "demotionWarning": 0}},
+            {"queueType": "CHERRY", "tier": ""}
+        ]});
+        let q = parse_ranked(&v);
+        let solo = &q[0];
+        // Remaining placements only count while the queue is actually provisional.
+        assert_eq!(solo.provisional_left, 0);
+        assert_eq!((solo.highest_tier.as_str(), solo.highest_division.as_str()), ("GOLD", "I"));
+        assert_eq!((solo.previous_tier.as_str(), solo.previous_division.as_str(), solo.mini_series.as_str()), ("", "", ""), "NONE/NA mean none");
+        // Decay days are only meaningful while the client shows the warning.
+        assert_eq!((solo.decay_days, solo.demotion_warning), (None, true));
+        let flex = &q[1];
+        assert_eq!((flex.provisional_left, flex.decay_days, flex.demotion_warning), (4, Some(6), false));
+        assert_eq!((q[2].provisional_left, q[2].decay_days, q[2].demotion_warning), (0, None, false), "no warnings object");
+    }
+
+    #[test]
+    fn missing_grades_keep_better_grades_for_stricter_slots() {
+        let req = |r: &[(&str, i64)]| r.iter().map(|(g, n)| (g.to_string(), *n)).collect::<Vec<_>>();
+        let got = |e: &[&str]| e.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        // Listed loosest first on purpose: spending the S on the A- slot would leave S- open.
+        let need = req(&[("A-", 1), ("S-", 1)]);
+        assert!(missing_grades(&need, &got(&["S", "A-"])).is_empty());
+        assert_eq!(missing_grades(&need, &got(&["A", "A"])), req(&[("S-", 1)]));
+        // The lowest grade that fits is used, so S+ is still there for S-.
+        assert!(missing_grades(&req(&[("S-", 1), ("A-", 1)]), &got(&["S+", "A"])).is_empty());
+        // Counts, strictest-first output and zero counts dropped.
+        assert_eq!(missing_grades(&req(&[("B", 3), ("S", 1), ("C", 0)]), &got(&["B+"])), req(&[("S", 1), ("B", 2)]));
+        // Unknown grades satisfy nothing, and an unknown requirement cannot be met.
+        assert_eq!(missing_grades(&req(&[("A", 1)]), &got(&["S++", ""])), req(&[("A", 1)]));
+        assert_eq!(missing_grades(&req(&[("Z", 1)]), &got(&["S+"])), req(&[("Z", 1)]));
+        assert_eq!((grade_rank("S+"), grade_rank("D-"), grade_rank("E")), (Some(14), Some(0), None));
+        let m = parse_mastery(&serde_json::json!({"championId": 1, "milestoneGrades": ["S"],
+            "nextSeasonMilestone": {"requireGradeCounts": {"A-": 2, "S-": 1}, "rewardMarks": 1}}));
+        assert_eq!(m.required_grades, req(&[("S-", 1), ("A-", 2)]), "strictest first");
+        assert_eq!(m.grades_needed(), req(&[("A-", 2)]));
+    }
+
+    #[test]
+    fn challenge_filters_pick_open_champion_challenges() {
+        let list = parse_challenge_list(&serde_json::json!({
+            "1": {"id": 1, "name": "Same Penta", "descriptionShort": "", "description": "Get a <b>pentakill</b>", "idListType": "CHAMPION",
+                "currentValue": 3.0, "nextThreshold": 10.0, "gameModes": ["CLASSIC"]},
+            "2": {"id": 2, "name": "Jack of all", "idListType": "CHAMPION", "currentValue": 8.0, "nextThreshold": 10.0,
+                "availableIds": [99], "gameModes": []},
+            "3": {"id": 3, "name": "Done on Lux", "idListType": "CHAMPION", "currentValue": 9.0, "nextThreshold": 10.0, "completedIds": [99]},
+            "4": {"id": 4, "name": "Capstone", "idListType": "CHAMPION", "currentValue": 9.5, "nextThreshold": 10.0, "isCapstone": true},
+            "5": {"id": 5, "name": "Old", "idListType": "NONE", "currentValue": 9.9, "nextThreshold": 10.0, "retireTimestamp": 1700000000000_i64},
+            "6": {"id": 6, "name": "Maxed", "idListType": "NONE", "currentValue": 50.0, "nextThreshold": 0.0},
+            "7": {"id": 7, "name": "Wards", "idListType": "NONE", "currentValue": 1.0, "nextThreshold": 2.0},
+            "8": {"id": 8, "name": "ARAM only", "idListType": "CHAMPION", "currentValue": 1.0, "nextThreshold": 4.0, "gameModes": ["ARAM"]}
+        }));
+        assert_eq!(list[0].description, "Get a pentakill", "short description empty: full one, tags stripped");
+        let names = |v: Vec<&Challenge>| v.into_iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        // Lux (99) on the Rift: 3 is already done on Lux, 4 is a capstone, 8 is ARAM-only.
+        assert_eq!(names(champion_challenges(&list, 99, "CLASSIC")), ["Jack of all", "Same Penta"]);
+        // Another champion is outside 2's id list but still counts for 3.
+        assert_eq!(names(champion_challenges(&list, 1, "CLASSIC")), ["Done on Lux", "Same Penta"]);
+        assert_eq!(names(champion_challenges(&list, 99, "ARAM")), ["Jack of all", "ARAM only"]);
+        // Closest: retired, capstone and maxed (no next threshold) are out; any id list counts.
+        assert_eq!(names(closest_challenges(&list, 3)), ["Done on Lux", "Jack of all", "Wards"]);
+        assert_eq!(list[5].progress(), 0.0, "no next level");
     }
 }

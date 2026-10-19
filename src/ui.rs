@@ -10,7 +10,7 @@ mod overlay;
 mod players;
 mod post_game;
 mod settings_tab;
-mod stats;
+pub(crate) mod stats;
 mod theme;
 mod widgets;
 
@@ -144,6 +144,15 @@ pub struct App {
     hotkeys_rx: Receiver<crate::tray::Hotkeys>,
     /// Logo, banner and Data Dragon images (shared with the overlay viewport).
     icons: Arc<Icons>,
+    /// Note being edited: its `notes::champ_key`/`notes::vs_key` key and the draft text.
+    note_edit: Option<(String, String)>,
+    /// Goals editor (Settings): the canonical position shown and its unsaved goals.
+    goals_role: String,
+    goals_draft: Option<crate::goals::Goals>,
+    /// Match ids whose timeline view (deaths, gold lead, replay) is open in the League tab.
+    timeline_open: HashSet<u64>,
+    /// Seconds recorded before and after the moment a clip is made around.
+    clip_span: (f64, f64),
 }
 
 impl App {
@@ -176,6 +185,11 @@ impl App {
             hotkeys: None,
             hotkeys_rx,
             icons,
+            note_edit: None,
+            goals_role: "MIDDLE".into(),
+            goals_draft: None,
+            timeline_open: HashSet::new(),
+            clip_span: (15.0, 5.0),
         }
     }
 

@@ -15,18 +15,20 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use crate::ddragon::{self, StaticData};
+use crate::goals::{self, Goals};
 use crate::lcu::{
-    self, ChampSelect, ChampionAccess, Challenges, Creds, Friend, GameSession, Lcu, LcuError, Lobby, LolGame, LpChange, MatchDetail,
-    Mastery, Mission, QueueSearch, RankedQueue, RecPage, Summoner, TftGame, Wallet,
+    self, Challenge, ChampSelect, ChampionAccess, Challenges, Creds, Friend, GameSession, Lcu, LcuError, Lobby, LolGame, LpChange,
+    MasteryUpdate, MatchDetail, Mastery, Mission, QueueSearch, RankedQueue, RecPage, ReplayState, Summoner, TftGame, Wallet,
 };
 use crate::augments::Offer;
 use crate::live::{self, LiveGame};
 use crate::riot::{self, Installs, Running};
 use crate::settings::{PageSource, Settings};
 use crate::lp::{self, LpEntry};
-use crate::skills::{Recorder, SkillHint};
+use crate::skills::{self, Recorder, SkillHint};
 use crate::meta::{self, MetaBuild, Pick, Picks, Query};
-use crate::{itemset, net, win};
+use crate::timeline::{self, Timeline};
+use crate::{counters, itemset, matchups, net, notes, replay, win};
 
 /// How long lock-in work that uses OP.GG (the item set, OP.GG runes and spells) waits for
 /// its answer before falling back to your own build and Riot's page.
@@ -75,12 +77,54 @@ pub enum Action {
     LoadFriends,
     /// Back to the lobby of the queue just played.
     PlayAgain,
+    /// The game's timeline (deaths, gold lead, skill order); the UI also loads its match detail.
+    MatchTimeline(u64),
+    /// Stores a note under a `notes::champ_key`/`notes::vs_key` key; empty text deletes it.
+    SaveNote { key: String, text: String },
+    /// Goals for a canonical position; empty goals remove them.
+    SetGoals { role: String, goals: Goals },
+    /// Registers a game with the client's replay service (as its match history does) and
+    /// reads whether the replay can be downloaded or watched.
+    ReplayState(u64),
+    ReplayDownload(u64),
+    ReplayWatch(u64),
+    /// Moves the open replay to a game time in seconds.
+    ReplaySeek(f64),
+    /// Records the open replay between two game times (seconds) into `replay::clips_dir()`.
+    ReplayClip { start: f64, end: f64 },
+    /// Settings button: writes `EnableReplayApi=1` into the game's `game.cfg`.
+    EnableReplayApi,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct PostGame {
     pub detail: MatchDetail,
     pub lp: Option<LpChange>,
+    /// Mastery points and grade from this game (`/lol-end-of-game/v1/champion-mastery-updates`).
+    pub mastery: Option<MasteryUpdate>,
+    /// Canonical position the goals were checked for; empty when unknown.
+    pub role: String,
+    /// This game against your goals for `role`; empty without goals (or for remakes).
+    pub goals: Vec<goals::Check>,
+}
+
+/// The enemy champ select suggests you will face in lane, and its OP.GG lane matchups.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Opponent {
+    pub champion_id: i64,
+    /// Your canonical position, which the opponent was matched on.
+    pub position: String,
+    pub query: Query,
+    /// `None` while OP.GG is asked.
+    pub build: Option<Result<MetaBuild, String>>,
+}
+
+/// A clip the open replay is recording.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Clip {
+    Recording { start: f64, end: f64, current: f64 },
+    Saved(String),
+    Failed(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -154,6 +198,31 @@ pub struct Snapshot {
     pub window_mode: Option<i64>,
     /// LP after ranked games riftlite saw end (`lp.json`).
     pub lp_log: Vec<LpEntry>,
+    /// Ranked games still restricted by the leaver-buster system; 0 when none or unknown.
+    pub ranked_restriction: i64,
+    /// Queue lockout while in the lobby or queue: (seconds left, the client's error type).
+    pub queue_penalty: Option<(f64, String)>,
+    /// Every challenge with progress (Profile, champ select hints); loaded with the profile.
+    pub challenge_list: Option<Result<Vec<Challenge>, String>>,
+    /// Riot's recommended positions per champion (canonical names), once per client connection.
+    pub positions: HashMap<i64, Vec<String>>,
+    /// Champ select: the probable lane opponent and its OP.GG lane matchups (pick ideas).
+    pub opponent: Option<Opponent>,
+    /// Your record against enemy champions, from match details (`matchups.json`).
+    pub matchups: matchups::Store,
+    /// Goals per position and past results (`goals.json`).
+    pub goals: goals::Store,
+    /// Champion and matchup notes (`notes.json`).
+    pub notes: notes::Notes,
+    /// Match timelines per game id, loaded on request.
+    pub timelines: HashMap<u64, Result<Timeline, String>>,
+    /// The client's replay state per game id, loaded on request and refreshed while downloading.
+    pub replays: HashMap<u64, Result<ReplayState, String>>,
+    /// `[General] EnableReplayApi` in `game.cfg`; `None` when unreadable.
+    pub replay_api: Option<bool>,
+    /// Playback of a replay open in the game, polled while the Replay API answers.
+    pub replay_playback: Option<replay::Playback>,
+    pub clip: Option<Clip>,
     pub live: Option<LiveGame>,
     /// ARAM Mayhem augment cards on screen, with their tiers.
     pub augments: Option<Offer>,
@@ -205,6 +274,19 @@ impl Default for Snapshot {
             post_game: None,
             window_mode: None,
             lp_log: Vec::new(),
+            ranked_restriction: 0,
+            queue_penalty: None,
+            challenge_list: None,
+            positions: HashMap::new(),
+            opponent: None,
+            matchups: matchups::Store::default(),
+            goals: goals::Store::default(),
+            notes: notes::Notes::default(),
+            timelines: HashMap::new(),
+            replays: HashMap::new(),
+            replay_api: None,
+            replay_playback: None,
+            clip: None,
             live: None,
             augments: None,
             augment_error: None,
@@ -303,6 +385,8 @@ struct Conn {
     lcu: Lcu,
     /// `/lol-game-data` names (items, perks, styles, spells), fetched once per connection.
     assets: Option<[Value; 4]>,
+    /// Riot's recommended positions were loaded into the snapshot (once per connection).
+    positions_loaded: bool,
 }
 
 /// Champ-select automation state for one session.
@@ -344,6 +428,10 @@ struct LockIn {
     items: bool,
 }
 
+/// A skill order learned from match history: champion name and the order saved (`None`
+/// when one was recorded meanwhile or the game's order was too short).
+type Backfill = (String, Result<Option<String>, String>);
+
 struct State {
     conn: Option<Conn>,
     last_phase: String,
@@ -360,6 +448,21 @@ struct State {
     ready_handled: bool,
     last_friends: Option<Instant>,
     item_watch: live::ItemWatch,
+    /// Agent for the game's loopback APIs (Live Client, Replay API).
+    local: ureq::Agent,
+    /// Your canonical position in the live game, for goals at the end of it; cleared in champ select.
+    live_role: String,
+    /// Match details fetched on a background thread for the matchup store.
+    matchup_job: Option<mpsc::Receiver<(u64, Result<MatchDetail, LcuError>)>>,
+    /// Games handed to that thread this run; failed fetches are tried again next run.
+    matchup_tried: HashSet<u64>,
+    /// Champions whose skill order was looked up in match history this run.
+    backfill_tried: HashSet<i64>,
+    backfill_chan: (mpsc::Sender<Backfill>, mpsc::Receiver<Backfill>),
+    /// Last poll of the Replay API (playback of an open replay, clip progress).
+    replay_polled: Option<Instant>,
+    /// When the last clip was started (the game may not report it as recording at once).
+    clip_started: Option<Instant>,
 }
 
 fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
@@ -379,9 +482,23 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         ready_handled: false,
         last_friends: None,
         item_watch: live::ItemWatch::default(),
+        local: local.clone(),
+        live_role: String::new(),
+        matchup_job: None,
+        matchup_tried: HashSet::new(),
+        backfill_tried: HashSet::new(),
+        backfill_chan: mpsc::channel(),
+        replay_polled: None,
+        clip_started: None,
     };
     let mut last_install_scan: Option<Instant> = None;
-    shared.snap.lock().lp_log = lp::load();
+    {
+        let mut s = shared.snap.lock();
+        s.lp_log = lp::load();
+        s.matchups = matchups::Store::load();
+        s.goals = goals::Store::load();
+        s.notes = notes::Notes::load();
+    }
     loop {
         let mut changed = false;
         let forced = shared.refresh.swap(false, Ordering::Relaxed);
@@ -389,8 +506,13 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         if forced || last_install_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
             let installs = riot::scan_installs(shared.settings.lock().league_override().as_deref());
             changed |= set(&mut shared.snap.lock().installs, installs);
-            let mode = shared.snap.lock().league_root().and_then(|root| window_mode(&root));
-            changed |= set(&mut shared.snap.lock().window_mode, mode);
+            let root = shared.snap.lock().league_root();
+            let mode = root.as_deref().and_then(window_mode);
+            let replay_api = root.as_deref().and_then(replay::api_enabled);
+            let mut s = shared.snap.lock();
+            changed |= set(&mut s.window_mode, mode);
+            changed |= set(&mut s.replay_api, replay_api);
+            drop(s);
             last_install_scan = Some(Instant::now());
         }
 
@@ -414,7 +536,7 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
                 let league = shared.snap.lock().installs.get(riot::Product::League).map(|i| i.path.clone());
                 match lcu::discover(pid, league.as_deref()) {
                     Ok(creds) => {
-                        st.conn = Some(Conn { lcu: Lcu::new(local.clone(), &creds), creds, assets: None });
+                        st.conn = Some(Conn { lcu: Lcu::new(local.clone(), &creds), creds, assets: None, positions_loaded: false });
                         st.last_profile = None;
                     }
                     Err(e) => changed |= set(&mut shared.snap.lock().lcu, LcuStatus::Error(e)),
@@ -442,6 +564,10 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
         let mut s = shared.snap.lock();
         if let Some(g) = &mut live_game {
             st.item_watch.observe(g, &s.data.completed_items);
+            g.counters = counters::suggest(g, &s.data);
+            if let Some(role) = g.me().map(|me| lcu::canonical_position(&me.position)).filter(|r| !r.is_empty()) {
+                st.live_role = role.to_string();
+            }
         }
         let live_changed = set(&mut s.live, live_game) | set(&mut s.skill_hint, hint);
         drop(s);
@@ -449,6 +575,7 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
             changed = true;
             ctx.request_repaint_of(crate::ui::overlay_id());
         }
+        changed |= poll_replay(shared, &mut st, running.any_game());
 
         // --- UI actions ---
         let actions = std::mem::take(&mut *shared.actions.lock());
@@ -509,6 +636,13 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
             changed = true;
         }
     }
+    // Riot's recommended positions for every champion: pick ideas and the likely lane opponent.
+    if !c.positions_loaded {
+        if let Ok(p) = c.lcu.recommended_positions_all() {
+            c.positions_loaded = true;
+            changed |= set(&mut shared.snap.lock().positions, p);
+        }
+    }
 
     let phase_changed = phase != st.last_phase;
     let in_game_phase = matches!(phase.as_str(), "GameStart" | "InProgress" | "Reconnect");
@@ -524,12 +658,25 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
             if matches!(phase.as_str(), "EndOfGame" | "PreEndOfGame" | "None" | "Lobby") {
                 st.last_profile = None;
             }
+            // A new game is being set up: the last game's live position no longer applies.
+            if phase == "ChampSelect" {
+                st.live_role.clear();
+            }
             st.last_phase = phase.clone();
         }
     }
     if forced || st.last_profile.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
         changed |= refresh_profile(shared, &c.lcu, st.history_len);
         st.last_profile = Some(Instant::now());
+    }
+    changed |= sync_matchups(shared, &mut st.matchup_job, &mut st.matchup_tried, &c.creds);
+    for (name, r) in st.backfill_chan.1.try_iter() {
+        match r {
+            Ok(Some(order)) => log(shared, format!("Skill order for {name} taken from your last game on it: {order}"), true),
+            Ok(None) => {}
+            Err(e) => log(shared, format!("Skill order for {name} from match history: {e}"), false),
+        }
+        changed = true;
     }
     if !in_game_phase && (forced || st.last_friends.is_none_or(|t| t.elapsed() > Duration::from_secs(30))) {
         changed |= refresh_friends(shared, &c.lcu);
@@ -540,6 +687,9 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
     let cs = if phase == "ChampSelect" { c.lcu.champ_select().ok().flatten() } else { None };
     if let Some(cs) = &cs {
         changed |= champ_select_automation(shared, &c.lcu, &mut st.auto, cs);
+        if let Some(champ) = cs.my_champion() {
+            backfill_skills(shared, &mut st.backfill_tried, &st.backfill_chan.0, &c.creds, champ);
+        }
         let puuids: Vec<String> = cs.my_team.iter().chain(&cs.their_team).map(|p| p.puuid.clone()).collect();
         changed |= fetch_ranks(shared, &c.lcu, &puuids);
         // Enemy puuids are hidden in champ select; only allies' mastery can be read.
@@ -559,6 +709,8 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
     changed |= set(&mut shared.snap.lock().lobby, lobby);
     let queue = if matches!(phase.as_str(), "Matchmaking" | "ReadyCheck") { c.lcu.queue_search().ok().flatten() } else { None };
     changed |= set(&mut shared.snap.lock().queue, queue);
+    let penalty = if matches!(phase.as_str(), "Lobby" | "Matchmaking") { c.lcu.queue_penalty().ok().flatten() } else { None };
+    changed |= set(&mut shared.snap.lock().queue_penalty, penalty);
 
     // --- Loading screen / in game scouting ---
     if in_game_phase {
@@ -580,7 +732,7 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
                 if let Some(l) = &lp {
                     let entry = LpEntry {
                         game_id: detail.game_id,
-                        at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64),
+                        at_ms: now_ms(),
                         queue: l.queue.clone(),
                         tier: l.tier.clone(),
                         division: l.division.clone(),
@@ -593,11 +745,19 @@ fn poll_lcu(shared: &Shared, st: &mut State, forced: bool) -> bool {
                         shared.snap.lock().lp_log = all;
                     }
                 }
-                shared.snap.lock().post_game = Some(PostGame { detail, lp });
+                let mastery = c.lcu.mastery_update().ok().flatten().filter(|m| detail.me().is_none_or(|me| me.champion_id == m.champion_id));
+                // The live game's position is the Live Client's (verified); the end-of-game block's own guess is the fallback.
+                let role = match st.live_role.as_str() {
+                    "" => detail.me().map_or("", |m| m.position).to_string(),
+                    r => r.to_string(),
+                };
+                let checks = goal_checks(shared, &role, &detail);
+                shared.snap.lock().post_game = Some(PostGame { detail, lp, mastery, role, goals: checks });
                 changed = true;
             }
         }
     }
+    changed |= refresh_replays(shared, &c.lcu);
 
     // --- Ready check (only queried while the gameflow phase says one is open) ---
     if phase != "ReadyCheck" {
@@ -660,6 +820,7 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
         s.champ_log.clear();
         s.rec_pages.clear();
         s.meta = None;
+        s.opponent = None;
         auto.map_id = s.session.as_ref().map(|g| g.map_id).filter(|&m| m > 0).unwrap_or(0);
         drop(s);
         let pickable = lcu.pickable_champions();
@@ -711,6 +872,7 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
         changed = true;
     }
     changed |= sync_meta(shared, auto);
+    changed |= sync_opponent(shared, auto, cs);
     if cs.locked && champ.is_some() && auto.applied != champ {
         auto.applied = champ;
         let champion = champ.expect("checked");
@@ -786,6 +948,10 @@ fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
                 auto.meta_cache.insert(key, b.clone());
             }
             let mut s = shared.snap.lock();
+            if let Some(o) = s.opponent.as_mut().filter(|o| o.champion_id == key.0 && o.query == key.1) {
+                o.build = Some(r.clone());
+                changed = true;
+            }
             if let Some(m) = s.meta.as_mut().filter(|m| m.champion_id == key.0 && m.query.as_ref().ok() == Some(&key.1)) {
                 m.build = Some(r);
                 adopt_build(m);
@@ -1004,6 +1170,11 @@ fn with_champ_select(shared: &Shared, f: impl FnOnce(&ChampSelect) -> Result<Str
 }
 
 fn run_action(shared: &Shared, st: &mut State, a: Action) {
+    // Notes, goals, game.cfg and the open replay need no League client.
+    let a = match run_local_action(shared, st, a) {
+        Ok(r) => return finish_action(shared, st, r),
+        Err(a) => a,
+    };
     let Some(c) = &st.conn else {
         return finish_action(shared, st, Err("League client not connected".into()));
     };
@@ -1027,6 +1198,37 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             shared.snap.lock().match_details.insert(id, r);
             msg.map_or(Ok(String::new()), Err)
         }
+        Action::MatchTimeline(id) => {
+            let r = lcu
+                .game_timeline(id)
+                .map_err(|e| e.to_string())
+                .and_then(|v| timeline::parse(&v).ok_or_else(|| "the client has no timeline for this game".to_string()));
+            let msg = r.as_ref().err().map(|e| format!("Timeline of match {id}: {e}"));
+            shared.snap.lock().timelines.insert(id, r);
+            msg.map_or(Ok(String::new()), Err)
+        }
+        Action::ReplayState(id) => {
+            let r = replay_state(shared, lcu, id);
+            let msg = r.as_ref().err().cloned();
+            shared.snap.lock().replays.insert(id, r);
+            msg.map_or(Ok(String::new()), Err)
+        }
+        Action::ReplayDownload(id) => {
+            let r = lcu.replay_download(id).map(|_| "Replay download started".to_string()).map_err(|e| format!("Replay download: {e}"));
+            let state = lcu.replay_state(id).map_err(|e| format!("Replay: {e}"));
+            shared.snap.lock().replays.insert(id, state);
+            r
+        }
+        Action::ReplayWatch(id) => lcu
+            .replay_watch(id)
+            .map(|_| "The League client is starting the replay".to_string())
+            .map_err(|e| format!("Watch replay: {e}")),
+        // Handled by `run_local_action`.
+        Action::SaveNote { .. }
+        | Action::SetGoals { .. }
+        | Action::ReplaySeek(_)
+        | Action::ReplayClip { .. }
+        | Action::EnableReplayApi => Ok(String::new()),
         Action::LoadFriends => {
             refresh_friends(shared, lcu);
             st.last_friends = Some(Instant::now());
@@ -1116,8 +1318,7 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             Ok(String::new())
         }
         Action::LoadMissions => {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-            let r = lcu.missions(now).map_err(|e| e.to_string());
+            let r = lcu.missions(now_ms()).map_err(|e| e.to_string());
             let msg = r.as_ref().err().map(|e| format!("Missions: {e}"));
             shared.snap.lock().missions = Some(r);
             msg.map_or(Ok(String::new()), Err)
@@ -1129,6 +1330,63 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
         }
     };
     finish_action(shared, st, r);
+}
+
+/// Actions on riftlite's own files, the game's settings file and the open replay; other actions
+/// are handed back.
+fn run_local_action(shared: &Shared, st: &mut State, a: Action) -> Result<Result<String, String>, Action> {
+    Ok(match a {
+        Action::SaveNote { key, text } => {
+            let mut notes = shared.snap.lock().notes.clone();
+            notes.set(&key, &text);
+            notes.save().map_err(|e| format!("Could not save the note: {e}")).map(|_| {
+                shared.snap.lock().notes = notes;
+                if text.trim().is_empty() { "Note removed" } else { "Note saved" }.to_string()
+            })
+        }
+        Action::SetGoals { role, goals } => {
+            let mut store = shared.snap.lock().goals.clone();
+            if goals.is_empty() {
+                store.roles.remove(&role);
+            } else {
+                store.roles.insert(role.clone(), goals);
+            }
+            store.save().map_err(|e| format!("Could not save goals: {e}")).map(|_| {
+                shared.snap.lock().goals = store;
+                format!("Goals saved for {}", crate::ui::stats::position_label(&role))
+            })
+        }
+        Action::ReplaySeek(t) => replay::seek(&st.local, t).map(|_| format!("Replay moved to {}", clock(t))),
+        Action::ReplayClip { start, end } => {
+            let dir = replay::clips_dir();
+            match replay::record(&st.local, start, end, &dir) {
+                Ok(()) => {
+                    st.clip_started = Some(Instant::now());
+                    shared.snap.lock().clip = Some(Clip::Recording { start, end, current: start });
+                    Ok(format!("Recording {}–{} into {}; keep the replay playing", clock(start), clock(end), dir.display()))
+                }
+                Err(e) => {
+                    shared.snap.lock().clip = Some(Clip::Failed(e.clone()));
+                    Err(format!("Clip: {e}"))
+                }
+            }
+        }
+        Action::EnableReplayApi => {
+            let root = shared.snap.lock().league_root();
+            match root {
+                None => Err("League install not found (set it in Settings)".to_string()),
+                Some(root) => replay::enable_api(&root).map(|changed| {
+                    shared.snap.lock().replay_api = replay::api_enabled(&root);
+                    if changed {
+                        "Replay API enabled; it takes effect the next time a game or replay starts".to_string()
+                    } else {
+                        "The Replay API is already enabled".to_string()
+                    }
+                }),
+            }
+        }
+        other => return Err(other),
+    })
 }
 
 fn finish_action(shared: &Shared, st: &mut State, r: Result<String, String>) {
@@ -1235,6 +1493,8 @@ fn refresh_profile(shared: &Shared, lcu: &Lcu, history_len: usize) -> bool {
     let wallet = lcu.wallet().ok();
     let honor = lcu.honor_level().ok();
     let access = lcu.champion_access().unwrap_or_default();
+    let challenge_list = lcu.challenge_list().map_err(|e| format!("Challenges: {e}"));
+    let restriction = lcu.ranked_restriction().unwrap_or(0);
     let mut s = shared.snap.lock();
     let mut changed = set(&mut s.profile_error, None);
     if let Ok(g) = &lol {
@@ -1249,12 +1509,290 @@ fn refresh_profile(shared: &Shared, lcu: &Lcu, history_len: usize) -> bool {
     changed |= set(&mut s.wallet, wallet);
     changed |= set(&mut s.honor_level, honor);
     changed |= set(&mut s.champion_access, access);
+    changed |= set(&mut s.challenge_list, Some(challenge_list));
+    changed |= set(&mut s.ranked_restriction, restriction);
     changed
 }
 
 fn refresh_friends(shared: &Shared, lcu: &Lcu) -> bool {
     let f = lcu.friends().map_err(|e| format!("Friends: {e}"));
     set(&mut shared.snap.lock().friends, Some(f))
+}
+
+type DetailJob = mpsc::Receiver<(u64, Result<MatchDetail, LcuError>)>;
+
+/// Fills the matchup store from the loaded match history: games it has not seen are fetched
+/// on a background thread (spaced out, one batch at a time) and added as they arrive.
+fn sync_matchups(shared: &Shared, job: &mut Option<DetailJob>, tried: &mut HashSet<u64>, creds: &Creds) -> bool {
+    let mut store_changed = false;
+    if let Some(rx) = job {
+        let puuid = shared.snap.lock().summoner.as_ref().map(|s| s.puuid.clone()).unwrap_or_default();
+        loop {
+            match rx.try_recv() {
+                Ok((id, Ok(detail))) => {
+                    let detail = detail.with_me(&puuid);
+                    let mut s = shared.snap.lock();
+                    store_changed |= s.matchups.add_game(&detail);
+                    s.match_details.entry(id).or_insert(Ok(detail));
+                }
+                // The client no longer has the game: do not ask for it again.
+                Ok((id, Err(LcuError::Status(404)))) => {
+                    shared.snap.lock().matchups.mark_seen(id);
+                    store_changed = true;
+                }
+                // Asked again next run.
+                Ok((_, Err(_))) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *job = None;
+                    break;
+                }
+            }
+        }
+    }
+    if job.is_none() {
+        let mut s = shared.snap.lock();
+        let fresh: Vec<(u64, i64)> = match &s.lol_history {
+            Ok(games) => games
+                .iter()
+                .filter(|g| g.game_id != 0 && !tried.contains(&g.game_id) && !s.matchups.has_game(g.game_id))
+                .map(|g| (g.game_id, g.queue_id))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut fetch = Vec::new();
+        for (id, queue) in fresh {
+            if lcu::LANE_QUEUES.contains(&queue) {
+                tried.insert(id);
+                fetch.push(id);
+            } else {
+                s.matchups.mark_seen(id);
+                store_changed = true;
+            }
+        }
+        drop(s);
+        if !fetch.is_empty() {
+            *job = spawn_detail_fetch(creds, fetch);
+        }
+    }
+    if store_changed {
+        let store = shared.snap.lock().matchups.clone();
+        // A failed write only means these games are fetched again next run.
+        let _ = store.save();
+    }
+    store_changed
+}
+
+/// Match details for `ids`, one every 300 ms so the client is not flooded.
+fn spawn_detail_fetch(creds: &Creds, ids: Vec<u64>) -> Option<DetailJob> {
+    let (tx, rx) = mpsc::channel();
+    let lcu = Lcu::new(net::riot_local_agent(), creds);
+    std::thread::Builder::new()
+        .name("riftlite-matchups".into())
+        .spawn(move || {
+            for id in ids {
+                if tx.send((id, lcu.match_detail(id))).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        })
+        .ok()?;
+    Some(rx)
+}
+
+/// When the picked champion has no recorded skill order, learns it from your newest game on it
+/// in the loaded history (match detail, then its timeline) on a background thread, once per run.
+fn backfill_skills(shared: &Shared, tried: &mut HashSet<i64>, tx: &mpsc::Sender<Backfill>, creds: &Creds, champion: i64) {
+    if tried.contains(&champion) {
+        return;
+    }
+    let (key, name, game, puuid) = {
+        let s = shared.snap.lock();
+        let games = match &s.lol_history {
+            Ok(g) if !g.is_empty() => g,
+            // History not loaded yet: try again on a later poll.
+            _ => return,
+        };
+        // Data Dragon not loaded yet: try again on a later poll.
+        let Some(c) = s.data.champions.get(&champion) else { return };
+        let game = games.iter().filter(|g| g.champion_id == champion).max_by_key(|g| g.created_ms).map(|g| g.game_id);
+        (c.id.clone(), c.name.clone(), game, s.summoner.as_ref().map(|s| s.puuid.clone()).unwrap_or_default())
+    };
+    tried.insert(champion);
+    let Some(game) = game.filter(|_| !skills::has(&key)) else { return };
+    let lcu = Lcu::new(net::riot_local_agent(), creds);
+    let tx = tx.clone();
+    let _ = std::thread::Builder::new().name("riftlite-skills".into()).spawn(move || {
+        let order = || -> Result<Option<String>, String> {
+            let detail = lcu.match_detail(game).map_err(|e| format!("match {game}: {e}"))?.with_me(&puuid);
+            let me = detail.me().map(|m| m.participant_id).filter(|&id| id > 0).ok_or("you are not on that game's scoreboard")?;
+            let v = lcu.game_timeline(game).map_err(|e| format!("timeline of match {game}: {e}"))?;
+            let order = timeline::parse(&v).ok_or("the client returned no timeline")?.skill_order(me);
+            Ok(skills::backfill(&key, &order)?.then_some(order))
+        };
+        let _ = tx.send((name, order()));
+    });
+}
+
+/// The finished game against your goals for `role`, kept in `goals.json` for streaks. Nothing
+/// for remakes, unknown roles or roles without goals.
+fn goal_checks(shared: &Shared, role: &str, detail: &MatchDetail) -> Vec<goals::Check> {
+    let Some(me) = detail.me() else { return Vec::new() };
+    // Remakes end before 5 minutes.
+    if role.is_empty() || detail.duration_s < 300 {
+        return Vec::new();
+    }
+    let mut s = shared.snap.lock();
+    let Some(g) = s.goals.goals(role).copied() else { return Vec::new() };
+    let stats = goals::Stats {
+        cs: me.cs,
+        deaths: me.deaths,
+        vision: me.vision as f64,
+        control_wards: me.control_wards,
+        minutes: detail.duration_s as f64 / 60.0,
+    };
+    let checks = g.evaluate(&stats);
+    let result = goals::GameResult { game_id: detail.game_id, at_ms: now_ms(), role: role.to_string(), checks: checks.clone() };
+    if s.goals.record(result) {
+        let store = s.goals.clone();
+        drop(s);
+        // A failed write only drops this game from the streaks.
+        let _ = store.save();
+    }
+    checks
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Registers a game with the client's replay service (as its match history does before it shows
+/// a replay button) and reads the replay's state.
+fn replay_state(shared: &Shared, lcu: &Lcu, id: u64) -> Result<ReplayState, String> {
+    let cfg = lcu.replay_config().map_err(|e| format!("Replays: {e}"))?;
+    if !cfg.enabled {
+        return Err("Replays are turned off in the League client".into());
+    }
+    if let Some(busy) = cfg.busy {
+        return Err(format!("Replays are unavailable while {busy}"));
+    }
+    let detail = shared.snap.lock().match_details.get(&id).and_then(|d| d.as_ref().ok().cloned());
+    if let Some(d) = detail {
+        let version = if d.game_version.is_empty() { cfg.game_version } else { d.game_version.clone() };
+        // An already registered game keeps its state; any problem shows in the state below.
+        let _ = lcu.replay_create(id, &version, &d.game_type, d.queue_id, d.created_ms + d.duration_s * 1000);
+    }
+    lcu.replay_state(id).map_err(|e| format!("Replay: {e}"))
+}
+
+/// Replays the client is checking or downloading: their state, until it settles.
+fn refresh_replays(shared: &Shared, lcu: &Lcu) -> bool {
+    let pending: Vec<u64> = shared
+        .snap
+        .lock()
+        .replays
+        .iter()
+        .filter(|(_, r)| r.as_ref().is_ok_and(|r| matches!(r.state.as_str(), "checking" | "found" | "downloading")))
+        .map(|(id, _)| *id)
+        .collect();
+    let mut changed = false;
+    for id in pending {
+        let r = lcu.replay_state(id).map_err(|e| format!("Replay: {e}"));
+        let mut s = shared.snap.lock();
+        if s.replays.get(&id) != Some(&r) {
+            s.replays.insert(id, r);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// While a game process runs with the Replay API on: the open replay's playback (for jumps and
+/// clips) and the progress of a clip being recorded.
+fn poll_replay(shared: &Shared, st: &mut State, game_running: bool) -> bool {
+    if !game_running || shared.snap.lock().replay_api != Some(true) {
+        return set(&mut shared.snap.lock().replay_playback, None);
+    }
+    if st.replay_polled.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+        return false;
+    }
+    st.replay_polled = Some(Instant::now());
+    let playback = replay::playback(&st.local).ok();
+    let recording_clip = matches!(shared.snap.lock().clip, Some(Clip::Recording { .. }));
+    let recording = recording_clip.then(|| replay::recording(&st.local));
+    let mut s = shared.snap.lock();
+    let mut changed = set(&mut s.replay_playback, playback);
+    let clip = match recording {
+        None => None,
+        Some(Ok(r)) if r.recording => Some(Clip::Recording { start: r.start, end: r.end, current: r.current }),
+        // The game may not report the recording in its first moments.
+        Some(Ok(_)) if st.clip_started.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) => None,
+        Some(Ok(r)) => Some(Clip::Saved(if r.path.is_empty() { replay::clips_dir().display().to_string() } else { r.path })),
+        Some(Err(e)) => Some(Clip::Failed(e)),
+    };
+    if let Some(clip) = clip {
+        changed |= set(&mut s.clip, Some(clip));
+    }
+    changed
+}
+
+/// Pick ideas: the enemy champ select suggests you will face in lane, and its OP.GG lane
+/// matchups. Ranked and flex only (other queues have no OP.GG lane data); off with OP.GG builds.
+fn sync_opponent(shared: &Shared, auto: &mut Auto, cs: &ChampSelect) -> bool {
+    let meta_on = shared.settings.lock().meta_builds;
+    let mut s = shared.snap.lock();
+    // The assigned position, else the one the pick's recommendations used.
+    let position = match lcu::canonical_position(cs.me().map_or("", |m| m.position.as_str())) {
+        "" => lcu::canonical_position(&auto.position),
+        p => p,
+    };
+    let want = probable_opponent(cs, &s.positions, position)
+        .zip(meta::query_for(cs.queue_id, auto.map_id, position).ok().filter(|q| matches!(q.mode, "ranked" | "flex")))
+        .filter(|_| meta_on && !s.data.item_stats.is_empty());
+    let Some((champion_id, query)) = want else { return set(&mut s.opponent, None) };
+    if s.opponent.as_ref().is_some_and(|o| o.champion_id == champion_id && o.query == query) {
+        return false;
+    }
+    let key = (champion_id, query);
+    let build = auto.meta_cache.get(&key).cloned().map(Ok);
+    let ask = build.is_none() && !auto.meta_inflight.contains(&key);
+    s.opponent = Some(Opponent { champion_id, position: position.to_string(), query, build });
+    let data = s.data.clone();
+    drop(s);
+    if ask {
+        auto.meta_inflight.insert(key);
+        if let Err(e) = request_meta(auto, data, key) {
+            auto.meta_inflight.remove(&key);
+            if let Some(o) = shared.snap.lock().opponent.as_mut() {
+                o.build = Some(Err(e));
+            }
+        }
+    }
+    true
+}
+
+/// The enemy you probably face in lane: the one the client shows in your position, else the only
+/// picked enemy whose first Riot-recommended position is yours. `None` when that is unclear.
+fn probable_opponent(cs: &ChampSelect, positions: &HashMap<i64, Vec<String>>, position: &str) -> Option<i64> {
+    if position.is_empty() {
+        return None;
+    }
+    let picked = || cs.their_team.iter().filter(|p| p.champion_id > 0);
+    if let Some(p) = picked().find(|p| lcu::canonical_position(&p.position) == position) {
+        return Some(p.champion_id);
+    }
+    let mut likely = picked().filter(|p| positions.get(&p.champion_id).and_then(|v| v.first()).is_some_and(|f| f == position));
+    match (likely.next(), likely.next()) {
+        (Some(p), None) => Some(p.champion_id),
+        _ => None,
+    }
+}
+
+/// `m:ss` for a game time in seconds.
+fn clock(t: f64) -> String {
+    let t = t.max(0.0) as i64;
+    format!("{}:{:02}", t / 60, t % 60)
 }
 
 /// `[General] WindowMode` of the game's settings file.
@@ -1302,5 +1840,30 @@ mod tests {
         assert!(matches!(lockin_meta(Some(&state(Some(Err("OP.GG HTTP 500".into())))), 145, early), Some(Some(Err(_)))));
         assert!(matches!(lockin_meta(None, 145, early), Some(None)));
         assert!(matches!(lockin_meta(Some(&state(None)), 62, early), Some(None)));
+    }
+
+    #[test]
+    fn lane_opponent_is_the_assigned_enemy_else_the_only_one_riot_lists_there() {
+        let enemy = |champion_id, position: &str| lcu::CsPlayer { champion_id, position: position.into(), ..Default::default() };
+        let positions: HashMap<i64, Vec<String>> = [
+            (103, vec!["MIDDLE".to_string()]),
+            (238, vec!["MIDDLE".to_string(), "TOP".to_string()]),
+            (64, vec!["JUNGLE".to_string()]),
+            (12, vec!["UTILITY".to_string(), "MIDDLE".to_string()]),
+        ]
+        .into();
+        let mut cs = ChampSelect { their_team: vec![enemy(64, ""), enemy(103, ""), enemy(12, ""), enemy(0, "")], ..Default::default() };
+        // Only Ahri lists Mid first; Alistar's second position does not count; unpicked slots are skipped.
+        assert_eq!(probable_opponent(&cs, &positions, "MIDDLE"), Some(103));
+        assert_eq!(probable_opponent(&cs, &positions, "JUNGLE"), Some(64));
+        assert_eq!(probable_opponent(&cs, &positions, "BOTTOM"), None);
+        // Two enemies that usually play Mid: unclear, so no guess.
+        cs.their_team.push(enemy(238, ""));
+        assert_eq!(probable_opponent(&cs, &positions, "MIDDLE"), None);
+        // A position the client shows wins over Riot's lists, in any spelling.
+        cs.their_team.push(enemy(7, "middle"));
+        assert_eq!(probable_opponent(&cs, &positions, "MIDDLE"), Some(7));
+        // No position of your own: no opponent.
+        assert_eq!(probable_opponent(&cs, &positions, ""), None);
     }
 }

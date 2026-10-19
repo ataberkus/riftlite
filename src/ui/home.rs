@@ -1,14 +1,16 @@
 //! Home and Profile tabs, plus the ranked / performance / mastery blocks the
 //! Players tab reuses.
 
-use eframe::egui::{Align, Color32, Layout, RichText, Ui, vec2};
+use eframe::egui::{Align, Color32, Label, Layout, Margin, RichText, Sense, Stroke, Ui, vec2};
 
-use super::stats::{Avg, averages, cs_per_min, date, next_division, no_data_hint, now_ms, streak, title};
+use super::stats::{Avg, averages, cs_per_min, date, datetime, next_division, no_data_hint, now_ms, signed, streak, title};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
-use crate::lcu::{self, LolGame, Mastery, RankedQueue, TftGame};
+use crate::goals::GoalKind;
+use crate::lcu::{self, Challenge, LolGame, Mastery, RankedQueue, TftGame};
 use crate::lp;
+use crate::meta::thousands;
 use crate::riot::{self, Product};
 use crate::worker::{Action, LcuStatus, Snapshot};
 
@@ -195,6 +197,7 @@ impl App {
                 });
             }
         });
+        ranked_details(ui, s);
         ranked_progress(ui, s);
         let lol = s.lol_history.as_deref().unwrap_or(&[]);
         if !lol.is_empty() {
@@ -207,7 +210,8 @@ impl App {
         ui.columns(2, |cols| {
             card(&mut cols[0], |ui| {
                 card_head(ui, "Champion mastery", |_| {});
-                mastery_list(ui, &g, &s.mastery);
+                mastery_list(ui, &g, &s.mastery, true);
+                closest_milestones_block(ui, &g, &s.mastery);
             });
             card(&mut cols[1], |ui| {
                 card_head(ui, "Challenges", |_| {});
@@ -239,7 +243,12 @@ impl App {
                         }
                     }
                 }
+                closest_challenges_block(ui, s);
             });
+        });
+        ui.columns(2, |cols| {
+            card(&mut cols[0], |ui| goal_streaks(ui, s));
+            card(&mut cols[1], |ui| toughest_matchups(ui, &g, s));
         });
 
         section_with(ui, "Missions", |ui| {
@@ -326,6 +335,141 @@ fn ranked_progress(ui: &mut Ui, s: &Snapshot) {
     });
 }
 
+/// Queues whose LP riftlite logs after each game (League's end-of-game LP notification).
+fn logs_lp(q: &RankedQueue) -> bool {
+    matches!(q.queue.as_str(), "RANKED_SOLO_5x5" | "RANKED_FLEX_SR")
+}
+
+/// Anything the client reports beyond the rank itself: placements, series, decay, demotion,
+/// season high or last season.
+fn has_status(q: &RankedQueue) -> bool {
+    q.provisional_left > 0
+        || !q.mini_series.is_empty()
+        || q.decay_days.is_some()
+        || q.demotion_warning
+        || !q.highest_tier.is_empty()
+        || !q.previous_tier.is_empty()
+}
+
+/// A banner while ranked is restricted, then per queue: placements, series, decay, demotion and
+/// season ranks from the client, and the LP chart from the LP log.
+fn ranked_details(ui: &mut Ui, s: &Snapshot) {
+    if s.ranked_restriction > 0 {
+        restriction_banner(ui, s.ranked_restriction);
+    }
+    let rows: Vec<(&RankedQueue, Vec<lp::ChartPoint>)> = s
+        .ranked
+        .iter()
+        .filter(|q| q.worth_showing())
+        .map(|q| (q, lp::chart(&s.lp_log, &q.queue)))
+        .filter(|(q, points)| has_status(q) || points.len() >= 2 || (logs_lp(q) && (q.is_ranked() || q.provisional_left > 0)))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    card(ui, |ui| {
+        card_head(ui, "Ranked details", |_| {});
+        for (i, (q, points)) in rows.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(4.0);
+            }
+            queue_status(ui, q);
+            if points.len() >= 2 {
+                lp_chart(ui, &s.lp_log, q, points);
+            } else if logs_lp(q) {
+                small_note(ui, "The LP chart fills in after ranked games riftlite sees end.");
+            }
+        }
+        ui.add_space(2.0);
+        small_note(ui, "Placements, series, decay and season ranks from the client. LP from the games riftlite saw end; dashed segments mark games or LP changes it missed.");
+    });
+}
+
+fn restriction_banner(ui: &mut Ui, games: i64) {
+    let frame = card_frame().fill(mix(SURFACE, SOON, 0.06)).stroke(Stroke::new(1.0, mix(BORDER, SOON, 0.35))).inner_margin(Margin::symmetric(14, 10));
+    framed(ui, frame, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            icon(ui, Icon::Lock, 16.0, SOON);
+            ui.label(RichText::new(format!("Ranked restricted: {games} game{} left", plural(games))).font(semibold(13.5)).color(TEXT));
+            small_note(ui, "Ranked queues open again once they are played in other queues.");
+        });
+    });
+}
+
+/// One queue's name with its placement, series, decay, demotion and season-rank chips.
+fn queue_status(ui: &mut Ui, q: &RankedQueue) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_sized([120.0, 20.0], Label::new(RichText::new(q.label()).font(semibold(12.5)).color(TEXT)));
+        if q.provisional_left > 0 {
+            pill(ui, format!("{} placement{} left", q.provisional_left, plural(q.provisional_left)), ACCENT_TEXT);
+        }
+        if !q.mini_series.is_empty() {
+            ui.label(RichText::new("Series").size(11.5).color(MUTED));
+            series_dots(ui, &q.mini_series);
+        }
+        if let Some(days) = q.decay_days {
+            let text = match days {
+                ..=0 => "Decay due".to_string(),
+                n => format!("Decay in {n} day{}", plural(n)),
+            };
+            pill(ui, text, SOON).on_hover_text("From the client's decay warning");
+        }
+        if q.demotion_warning {
+            pill(ui, "Demotion risk", LOSS).on_hover_text("From the client's demotion warning");
+        }
+        for (caption, tier, division) in [("Season high", &q.highest_tier, &q.highest_division), ("Last season", &q.previous_tier, &q.previous_division)] {
+            if let Some(rank) = rank_name(tier, division) {
+                ui.label(RichText::new(caption).size(11.5).color(MUTED));
+                ui.label(RichText::new(rank).font(semibold(12.0)).color(tier_color(tier)));
+            }
+        }
+    });
+}
+
+/// Promotion series results as dots: wins, losses, games still to play.
+fn series_dots(ui: &mut Ui, series: &str) {
+    let wins = series.chars().filter(|&c| c == 'W').count();
+    let losses = series.chars().filter(|&c| c == 'L').count();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for c in series.chars() {
+            let (r, _) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
+            let color = match c {
+                'W' => WIN,
+                'L' => LOSS,
+                _ => FAINT,
+            };
+            ui.painter().circle_filled(r.center(), 4.0, color);
+        }
+    })
+    .response
+    .on_hover_text(format!("Series: {wins}W {losses}L of {}", series.chars().count()));
+}
+
+/// `Gold II`, `Master`; `None` without a tier.
+fn rank_name(tier: &str, division: &str) -> Option<String> {
+    if matches!(tier, "" | "NONE" | "UNRANKED") {
+        return None;
+    }
+    Some(if division.is_empty() || matches!(tier, "MASTER" | "GRANDMASTER" | "CHALLENGER") { title(tier) } else { format!("{} {division}", title(tier)) })
+}
+
+/// LP over one queue's logged games, oldest first, one step per game; hover shows the game.
+fn lp_chart(ui: &mut Ui, log: &[lp::LpEntry], q: &RankedQueue, points: &[lp::ChartPoint]) {
+    // The entries `lp::chart` kept, in its order: this queue, a known rank.
+    let entries: Vec<&lp::LpEntry> = log.iter().filter(|e| e.queue == q.queue && lp::ladder(&e.tier, &e.division, e.lp).is_some()).collect();
+    let line: Vec<LinePoint> = points.iter().enumerate().map(|(i, p)| LinePoint { x: i as f64, y: p.value as f64, gap_before: p.gap_before }).collect();
+    let label = |i: usize| {
+        let p = &points[i];
+        let rank = entries.get(i).and_then(|e| rank_name(&e.tier, &e.division).map(|r| format!("{r} · {} LP\n", e.lp))).unwrap_or_default();
+        format!("{rank}{} LP · {} · {}", signed(p.delta), if p.win { "Win" } else { "Loss" }, datetime(p.at_ms))
+    };
+    let tier = tier_color(&q.tier);
+    ui.add_space(2.0);
+    overline(ui, &format!("LP · {} logged games", points.len()));
+    line_chart(ui, &line, vec2(ui.available_width(), 84.0), if tier == FAINT { ACCENT } else { tier }, None, &label);
+}
+
 /// This play session's ranked results per queue, from the LP log.
 pub(super) fn session_line(ui: &mut Ui, session: &[lp::LpEntry]) {
     let mut queues: Vec<&str> = session.iter().map(|e| e.queue.as_str()).collect();
@@ -406,8 +550,9 @@ pub(super) fn ranked_list(ui: &mut Ui, ranked: &[RankedQueue], tft: bool) {
     }
 }
 
-/// Mastery rows: portrait, name, level, points, last played.
-pub(super) fn mastery_list(ui: &mut Ui, g: &Gfx, mastery: &[Mastery]) {
+/// Mastery rows: portrait, name, level, points, last played. `milestones` adds a line on the next
+/// level and season milestone; only for your own champions, never other players' grades.
+pub(super) fn mastery_list(ui: &mut Ui, g: &Gfx, mastery: &[Mastery], milestones: bool) {
     if mastery.is_empty() {
         return void(note(ui, "No mastery data"));
     }
@@ -424,7 +569,177 @@ pub(super) fn mastery_list(ui: &mut Ui, g: &Gfx, mastery: &[Mastery]) {
                 pill(ui, format!("M{}", m.level), if m.level >= 10 { SOON } else { ACCENT_TEXT }).on_hover_text(format!("Mastery level {}", m.level));
             });
         });
+        if let Some(line) = milestones.then(|| milestone_text(m)).flatten() {
+            ui.horizontal(|ui| {
+                // Lines up with the name, past the portrait.
+                ui.add_space(38.0);
+                ui.add(Label::new(RichText::new(line).size(11.0).color(BODY)).wrap());
+            });
+            ui.add_space(2.0);
+        }
     }
+}
+
+/// Progress on one of your champions: marks toward the next level, points to it, and the grades
+/// the next season milestone still needs. `None` when the client sent none of it.
+pub(super) fn milestone_text(m: &Mastery) -> Option<String> {
+    let mut parts = Vec::new();
+    if m.marks_required > 0 {
+        parts.push(format!("{}/{} marks", m.marks.clamp(0, m.marks_required), m.marks_required));
+    }
+    if m.points_to_next > 0 {
+        parts.push(format!("{} pts to M{}", thousands(m.points_to_next as u64), m.level + 1));
+    }
+    let needed = m.grades_needed();
+    if !needed.is_empty() {
+        parts.push(format!("next milestone needs {}", grades_text(&needed)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// `S- ×1, A ×2`
+fn grades_text(needed: &[(String, i64)]) -> String {
+    needed.iter().map(|(g, n)| format!("{g} ×{n}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Your champions closest to their next season milestone: fewest grades still missing, then most
+/// points. Champions without requirements, or with none missing, are left out.
+fn closest_milestones(mastery: &[Mastery], n: usize) -> Vec<(&Mastery, Vec<(String, i64)>)> {
+    let mut v: Vec<_> = mastery
+        .iter()
+        .filter(|m| !m.required_grades.is_empty())
+        .map(|m| (m, m.grades_needed()))
+        .filter(|(_, need)| !need.is_empty())
+        .collect();
+    v.sort_by_key(|(m, need)| (need.iter().map(|(_, c)| c).sum::<i64>(), std::cmp::Reverse(m.points), m.champion_id));
+    v.truncate(n);
+    v
+}
+
+/// The "Closest milestones" list under the Profile's mastery rows; nothing without any.
+fn closest_milestones_block(ui: &mut Ui, g: &Gfx, mastery: &[Mastery]) {
+    let closest = closest_milestones(mastery, 3);
+    if closest.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.separator();
+    overline(ui, "Closest milestones");
+    for (m, need) in closest {
+        ui.horizontal_wrapped(|ui| {
+            g.champ(ui, m.champion_id, 22.0);
+            ui.label(RichText::new(g.data.champion_name(m.champion_id)).font(semibold(12.5)).color(TEXT));
+            ui.label(RichText::new(format!("needs {}", grades_text(&need))).size(11.5).color(BODY));
+            if m.milestone_reward_marks > 0 {
+                ui.label(RichText::new(format!("· reward {} mark{}", m.milestone_reward_marks, plural(m.milestone_reward_marks))).size(11.5).color(MUTED));
+            }
+        });
+    }
+    small_note(ui, "Grades from your own games this season.");
+}
+
+/// Your open challenges closest to their next level; nothing when the list is missing or empty.
+fn closest_challenges_block(ui: &mut Ui, s: &Snapshot) {
+    let Some(Ok(list)) = &s.challenge_list else { return };
+    let closest = lcu::closest_challenges(list, 5);
+    if closest.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.separator();
+    overline(ui, "Closest to the next level");
+    for c in closest {
+        challenge_row(ui, c);
+    }
+}
+
+/// Name, level → next level, description and progress of one challenge.
+pub(super) fn challenge_row(ui: &mut Ui, c: &Challenge) {
+    let next = tier_color(&c.next_level);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(&c.name).font(semibold(12.5)).color(TEXT));
+        ui.label(RichText::new(format!("{} → {}", title(&c.level), title(&c.next_level))).font(semibold(11.5)).color(if next == FAINT { MUTED } else { next }));
+    });
+    if !c.description.is_empty() {
+        small_note(ui, &c.description);
+    }
+    ui.horizontal(|ui| {
+        let w = (ui.available_width() - 120.0).max(60.0);
+        progress(ui, c.progress() as f32, w, if next == FAINT { ACCENT } else { next });
+        ui.label(RichText::new(format!("{} / {}", challenge_value(c.value), challenge_value(c.next_threshold))).size(11.5).color(MUTED));
+    });
+    ui.add_space(3.0);
+}
+
+/// Challenge values: whole numbers with thousands separators, else one decimal.
+fn challenge_value(v: f64) -> String {
+    if v >= 0.0 && v.fract() == 0.0 { thousands(v as u64) } else { format!("{v:.1}") }
+}
+
+/// Games in a row with every goal met, and per goal kind set in any role.
+fn goal_streaks(ui: &mut Ui, s: &Snapshot) {
+    card_head(ui, "Goal streaks", |_| {});
+    let set: Vec<_> = s.goals.roles.values().filter(|g| !g.is_empty()).collect();
+    if set.is_empty() {
+        return void(note(ui, "No goals set yet. Add per-role goals in Settings → Goals; riftlite checks them after each game it sees end."));
+    }
+    let kinds = [
+        (GoalKind::CsPerMin, set.iter().any(|g| g.cs_per_min.is_some())),
+        (GoalKind::MaxDeaths, set.iter().any(|g| g.max_deaths.is_some())),
+        (GoalKind::VisionPerMin, set.iter().any(|g| g.vision_per_min.is_some())),
+        (GoalKind::ControlWards, set.iter().any(|g| g.control_wards.is_some())),
+    ];
+    let row = |ui: &mut Ui, label: &str, n: usize| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).font(semibold(12.5)).color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{n} in a row")).font(semibold(12.5)).color(if n > 0 { WIN } else { MUTED }));
+            });
+        });
+    };
+    row(ui, "All goals met", s.goals.streak(None));
+    for (kind, _) in kinds.into_iter().filter(|(_, on)| *on) {
+        row(ui, kind.label(), s.goals.kind_streak(kind));
+    }
+    small_note(
+        ui,
+        if s.goals.results.is_empty() {
+            "No game checked yet; streaks start with your next game."
+        } else {
+            "Your newest games in a row that met the goal; games without that goal are skipped."
+        },
+    );
+}
+
+/// The enemy champions you have lost to more often than beaten (3+ games), as your own record.
+fn toughest_matchups(ui: &mut Ui, g: &Gfx, s: &Snapshot) {
+    card_head(ui, "Toughest matchups", |_| {});
+    if s.matchups.len() == 0 {
+        return void(note(ui, "Fills in as riftlite reads your match details."));
+    }
+    let worst = s.matchups.ban_hints(3, 5, &[]);
+    if worst.is_empty() {
+        return void(note(ui, "No enemy champion you have lost to more often than beaten in 3+ games."));
+    }
+    for (id, r) in worst {
+        let few = r.few_games();
+        ui.horizontal(|ui| {
+            g.champ(ui, id, 26.0);
+            ui.label(RichText::new(g.data.champion_name(id)).font(semibold(12.5)).color(if few { BODY } else { TEXT }));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{} games", r.games)).size(11.5).color(MUTED));
+                ui.label(RichText::new(format!("{}–{}", r.wins, r.losses())).font(semibold(12.5)).color(if few { MUTED } else { LOSS }));
+                if few {
+                    pill(ui, "few games", MUTED);
+                }
+            });
+        });
+    }
+    small_note(ui, "Your wins–losses against them, any lane and any of your champions, from the matches riftlite read.");
+}
+
+fn plural(n: i64) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Recent League form: win rate, KDA and CS tiles, KDA and CS/min trend lines, results and most played.
@@ -545,4 +860,36 @@ pub(super) fn tft_summary(ui: &mut Ui, games: &[TftGame]) {
             ui.painter().text(r.center(), eframe::egui::Align2::CENTER_CENTER, game.placement.to_string(), display(14.0), c);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn champ(id: i64, points: i64, required: &[(&str, i64)], earned: &[&str]) -> Mastery {
+        Mastery {
+            champion_id: id,
+            points,
+            required_grades: required.iter().map(|(g, n)| (g.to_string(), *n)).collect(),
+            grades: earned.iter().map(|g| g.to_string()).collect(),
+            ..Mastery::default()
+        }
+    }
+
+    #[test]
+    fn closest_milestones_put_fewest_missing_grades_first() {
+        let list = [
+            champ(1, 900, &[("A", 3)], &[]),
+            champ(2, 100, &[("A", 3)], &["A", "S"]),
+            // B is below A, so two are still missing.
+            champ(3, 500, &[("A", 3)], &["A+", "B"]),
+            // Requirements met: nothing to show.
+            champ(4, 800, &[("A", 2)], &["A", "S"]),
+            champ(5, 999, &[], &[]),
+            // One missing like champion 2, with more points.
+            champ(6, 700, &[("S-", 1)], &[]),
+        ];
+        let ids: Vec<i64> = closest_milestones(&list, 3).iter().map(|(m, _)| m.champion_id).collect();
+        assert_eq!(ids, [6, 2, 3]);
+    }
 }

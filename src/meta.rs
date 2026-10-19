@@ -4,7 +4,8 @@
 //! (`arena/{id}` for Arena), the JSON endpoint behind op.gg's champion pages. It
 //! lists up to 15 core builds per champion with games, wins and pick rate, plus
 //! the most played starting items, boots, rune pages, summoner spells, skill
-//! orders and lane matchups. OP.GG's public MCP server (`mcp-api.op.gg`) returns
+//! orders and lane matchups, and the champion's own win, pick and ban rates, KDA,
+//! win rate per recent patch and per game length. OP.GG's public MCP server (`mcp-api.op.gg`) returns
 //! only the single most played core build, so it cannot offer several builds to
 //! pick from. OP.GG permits use of its data with the source cited and without
 //! excessive requests: riftlite sends one request per picked champion, containing
@@ -13,11 +14,15 @@
 //! Builds are classified from Data Dragon item data (`ddragon::ItemStats`), never
 //! from item names: AP or AD by which damage stat the core items mostly give, and
 //! Crit / On-hit / Tank by the item tags.
+//!
+//! Arena (Riot policy): no win rates or placements for items, builds, skill orders or the
+//! champion; options are shown with pick rate and games, and ranked by games.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::ddragon::StaticData;
 
@@ -97,7 +102,7 @@ fn rate(wins: u64, games: u64) -> f64 {
 }
 
 /// 95 % margin of a win rate, in percentage points.
-fn margin(wins: u64, games: u64) -> f64 {
+pub(crate) fn margin(wins: u64, games: u64) -> f64 {
     if games == 0 {
         return 100.0;
     }
@@ -106,7 +111,7 @@ fn margin(wins: u64, games: u64) -> f64 {
 }
 
 /// Lower end of the 95 % Wilson interval: a win rate that small samples cannot inflate.
-fn wilson_lower(wins: u64, games: u64) -> f64 {
+pub(crate) fn wilson_lower(wins: u64, games: u64) -> f64 {
     if games == 0 {
         return 0.0;
     }
@@ -115,17 +120,37 @@ fn wilson_lower(wins: u64, games: u64) -> f64 {
     (p + z2 / (2.0 * n) - Z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt()) / (1.0 + z2 / n)
 }
 
-/// "53.2% ±0.3 WR · 39.0% pick · 92,134 games" (avg place appended for Arena).
-fn stats_line(wins: u64, games: u64, pick_rate: Option<f64>, total_place: u64) -> String {
-    let mut s = format!("{:.1}% ±{:.1} WR", rate(wins, games) * 100.0, margin(wins, games));
+/// Upper end of the 95 % Wilson interval: a win rate that small samples cannot deflate, so a
+/// low value means the record is bad even allowing for few games.
+pub(crate) fn wilson_upper(wins: u64, games: u64) -> f64 {
+    if games == 0 {
+        return 1.0;
+    }
+    let (n, p) = (games as f64, rate(wins, games));
+    let z2 = Z * Z;
+    (p + z2 / (2.0 * n) + Z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt()) / (1.0 + z2 / n)
+}
+
+/// "53.2% ±0.3 WR · 39.0% pick · 92,134 games"; for Arena "39.0% pick · 92,134 games" (Riot
+/// policy: no win rates or placements for Arena items, builds or skill orders).
+fn stats_line(wins: u64, games: u64, pick_rate: Option<f64>, arena: bool) -> String {
+    let mut parts = Vec::new();
+    if !arena {
+        parts.push(format!("{:.1}% ±{:.1} WR", rate(wins, games) * 100.0, margin(wins, games)));
+    }
     if let Some(p) = pick_rate {
-        s += &format!(" · {:.1}% pick", p * 100.0);
+        parts.push(format!("{:.1}% pick", p * 100.0));
     }
-    s += &format!(" · {} games", thousands(games));
-    if total_place > 0 && games > 0 {
-        s += &format!(" · avg place {:.1}", total_place as f64 / games as f64);
-    }
-    s
+    parts.push(format!("{} games", thousands(games)));
+    parts.join(" · ")
+}
+
+/// The win rate's 95 % margin is at least `FEW_GAMES_MARGIN` points. Arena: the margin a 50 %
+/// win rate would have with this many games (the worst case, under 1,537 games), so the flag
+/// depends on the sample size only and never on an Arena win rate.
+fn few_games(wins: u64, games: u64, arena: bool) -> bool {
+    let wins = if arena { games / 2 } else { wins };
+    margin(wins, games) >= FEW_GAMES_MARGIN
 }
 
 /// One OP.GG option: items (or spells) with how often it was played and won.
@@ -139,24 +164,24 @@ pub struct Choice {
     pub wins: u64,
     /// Share of the champion's games in this mode and lane that used it (0–1).
     pub pick_rate: f64,
-    /// Arena only: sum of final placements (1–8).
-    pub total_place: u64,
+    /// Arena build: win rates are neither shown nor used for ranking.
+    #[serde(skip)]
+    pub arena: bool,
 }
 
 impl Choice {
-    /// The win rate's 95 % margin is at least `FEW_GAMES_MARGIN` points.
     pub fn few_games(&self) -> bool {
-        margin(self.wins, self.games) >= FEW_GAMES_MARGIN
+        few_games(self.wins, self.games, self.arena)
     }
 
     /// Ranking key: the low end of the win rate's 95 % Wilson interval, so a few lucky games
-    /// cannot outrank a much-played build.
+    /// cannot outrank a much-played build. Arena: games played.
     fn score(&self) -> f64 {
-        wilson_lower(self.wins, self.games)
+        if self.arena { self.games as f64 } else { wilson_lower(self.wins, self.games) }
     }
 
     pub fn stats(&self) -> String {
-        stats_line(self.wins, self.games, Some(self.pick_rate), self.total_place)
+        stats_line(self.wins, self.games, Some(self.pick_rate), self.arena)
     }
 }
 
@@ -170,15 +195,18 @@ pub struct Skills {
     #[serde(rename = "win")]
     pub wins: u64,
     pub pick_rate: f64,
+    /// Arena skill order: no win rate shown.
+    #[serde(skip)]
+    pub arena: bool,
 }
 
 impl Skills {
     pub fn few_games(&self) -> bool {
-        margin(self.wins, self.games) >= FEW_GAMES_MARGIN
+        few_games(self.wins, self.games, self.arena)
     }
 
     pub fn stats(&self) -> String {
-        stats_line(self.wins, self.games, Some(self.pick_rate), 0)
+        stats_line(self.wins, self.games, Some(self.pick_rate), self.arena)
     }
 }
 
@@ -203,6 +231,9 @@ pub struct Runes {
     #[serde(rename = "win")]
     pub wins: u64,
     pub pick_rate: f64,
+    /// Arena page: no win rate shown.
+    #[serde(skip)]
+    pub arena: bool,
 }
 
 impl Runes {
@@ -213,11 +244,11 @@ impl Runes {
     }
 
     pub fn few_games(&self) -> bool {
-        margin(self.wins, self.games) >= FEW_GAMES_MARGIN
+        few_games(self.wins, self.games, self.arena)
     }
 
     pub fn stats(&self) -> String {
-        stats_line(self.wins, self.games, Some(self.pick_rate), 0)
+        stats_line(self.wins, self.games, Some(self.pick_rate), self.arena)
     }
 }
 
@@ -234,7 +265,7 @@ pub struct Matchup {
 
 impl Matchup {
     pub fn stats(&self) -> String {
-        stats_line(self.wins, self.games, None, 0)
+        stats_line(self.wins, self.games, None, false)
     }
 }
 
@@ -343,7 +374,7 @@ impl CoreBuild {
 
     /// Whether a later item fits this build's damage. An AP build skips AD items and crit
     /// items without ability power (crit scales attacks); an AD build skips AP items.
-    fn fits(&self, s: &crate::ddragon::ItemStats) -> bool {
+    pub(crate) fn fits(&self, s: &crate::ddragon::ItemStats) -> bool {
         match self.damage {
             Damage::Ap => s.ap > s.ad || (s.ap == s.ad && (s.ap > 0.0 || !s.crit)),
             Damage::Ad => s.ap <= s.ad,
@@ -370,10 +401,14 @@ pub enum Pick {
     Skills(usize),
 }
 
+/// `summary.average_stats` and `summary.positions` stay raw `Value`s, like `trends` and
+/// `game_lengths`: they are read field by field, so a reshaped part empties only the summary.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Summary {
     id: i64,
+    average_stats: Value,
+    positions: Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -389,6 +424,8 @@ struct RawData {
     runes: Vec<Runes>,
     summoner_spells: Vec<Choice>,
     counters: Vec<Matchup>,
+    trends: Value,
+    game_lengths: Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -402,6 +439,109 @@ struct Envelope {
     data: RawData,
     #[serde(default)]
     meta: Info,
+}
+
+/// OP.GG's numbers for the champion itself in the query's mode (and lane, when it has one).
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ChampSummary {
+    /// Games in the lane (or mode) OP.GG counted.
+    pub games: u64,
+    /// 0–1; `None` for Arena (Riot policy) or when OP.GG gave none.
+    pub win_rate: Option<f64>,
+    /// 0–1.
+    pub pick_rate: Option<f64>,
+    /// 0–1; ARAM has no bans.
+    pub ban_rate: Option<f64>,
+    pub kda: Option<f64>,
+    /// Share of the champion's games played in the query's lane (0–1); `None` without a lane.
+    pub lane_share: Option<f64>,
+    /// (patch, win rate 0–1) for recent patches, oldest first; empty for Arena.
+    pub trend: Vec<(String, f64)>,
+    /// (game length in minutes from, win rate 0–1), shortest first: OP.GG's buckets start at
+    /// 0, 25, 30, 35 and 40 minutes. Empty for Arena.
+    pub game_lengths: Vec<(u32, f64)>,
+}
+
+impl ChampSummary {
+    /// "Ahri mid · 51.2% WR · 9.4% pick · 3.0% ban · KDA 2.55 · 95% of Ahri's games are mid";
+    /// fields OP.GG did not give are left out.
+    pub fn line(&self, champion: &str, query: Query) -> String {
+        let lane = (query.position != "NONE").then(|| query.position.to_lowercase());
+        let mut parts = vec![match &lane {
+            Some(l) => format!("{champion} {l}"),
+            None => champion.to_string(),
+        }];
+        let pct = |v: Option<f64>, what: &str| v.map(|v| format!("{:.1}% {what}", v * 100.0));
+        parts.extend(pct(self.win_rate, "WR"));
+        parts.extend(pct(self.pick_rate, "pick"));
+        parts.extend(pct(self.ban_rate, "ban"));
+        parts.extend(self.kda.map(|k| format!("KDA {k:.2}")));
+        parts.push(format!("{} games", thousands(self.games)));
+        if let (Some(share), Some(l)) = (self.lane_share, &lane) {
+            parts.push(format!("{:.0}% of {champion}'s games are {l}", share * 100.0));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// A finite number field.
+fn num(v: &Value, key: &str) -> Option<f64> {
+    v.get(key)?.as_f64().filter(|x| x.is_finite())
+}
+
+/// A rate field in 0–1.
+fn share(v: &Value, key: &str) -> Option<f64> {
+    num(v, key).filter(|x| (0.0..=1.0).contains(x))
+}
+
+/// The champion summary from OP.GG's `summary`, `trends` and `game_lengths`. Lane numbers
+/// (`summary.positions[name == query.position].stats`) win over champion-wide ones
+/// (`summary.average_stats`). Arena keeps games, pick rate, ban rate and KDA (from its kill,
+/// death and assist totals) only. `None` when OP.GG counted no games.
+fn parse_summary(summary: &Summary, trends: &Value, game_lengths: &Value, query: Query) -> Option<ChampSummary> {
+    let arena = query.mode == "arena";
+    let lane = (query.position != "NONE")
+        .then(|| summary.positions.as_array()?.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(query.position)))
+        .flatten();
+    let stats = lane.and_then(|p| p.get("stats")).filter(|s| s.is_object()).unwrap_or(&summary.average_stats);
+    let games = stats.get("play").and_then(Value::as_u64).filter(|&n| n > 0)?;
+    let kda = if arena {
+        let total = |k: &str| num(stats, k).filter(|x| *x >= 0.0);
+        match (total("kills"), total("deaths"), total("assists")) {
+            (Some(k), Some(d), Some(a)) if d > 0.0 => Some((k + a) / d),
+            _ => None,
+        }
+    } else {
+        num(stats, "kda").filter(|k| *k >= 0.0)
+    };
+    let mut trend: Vec<(String, f64)> = Vec::new();
+    let mut lengths: Vec<(u32, f64)> = Vec::new();
+    if !arena {
+        // Newest patch first in OP.GG's answer.
+        for t in trends.get("win").and_then(Value::as_array).into_iter().flatten().rev() {
+            if let (Some(v), Some(r)) = (t.get("version").and_then(Value::as_str).filter(|v| !v.is_empty()), share(t, "rate")) {
+                trend.push((v.to_string(), r));
+            }
+        }
+        for g in game_lengths.as_array().into_iter().flatten() {
+            let from = g.get("game_length").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok());
+            if let (Some(m), Some(r)) = (from, share(g, "rate")) {
+                lengths.push((m, r));
+            }
+        }
+        lengths.sort_by_key(|&(m, _)| m);
+        lengths.dedup_by_key(|&mut (m, _)| m);
+    }
+    Some(ChampSummary {
+        games,
+        win_rate: if arena { None } else { share(stats, "win_rate") },
+        pick_rate: share(stats, "pick_rate"),
+        ban_rate: share(stats, "ban_rate"),
+        kda,
+        lane_share: lane.and_then(|p| share(p.get("stats")?, "role_rate")),
+        trend,
+        game_lengths: lengths,
+    })
 }
 
 /// A champion's OP.GG builds for one mode and lane.
@@ -423,8 +563,10 @@ pub struct MetaBuild {
     pub spells: Vec<Choice>,
     /// Single items players finished with, most played first.
     pub last_items: Vec<Choice>,
-    /// Lane matchups with at least `MIN_GAMES` games (none outside ranked and flex).
+    /// Lane matchups with at least `MIN_GAMES` games (none outside ranked and flex; never for Arena).
     pub counters: Vec<Matchup>,
+    /// The champion's own OP.GG numbers; `None` when OP.GG gave none.
+    pub summary: Option<ChampSummary>,
     masteries: Vec<Mastery>,
 }
 
@@ -432,7 +574,7 @@ pub struct MetaBuild {
 pub const GROUP_LIMIT: usize = 3;
 
 impl MetaBuild {
-    /// Ranks `cores` by `Choice::score`, then games.
+    /// Ranks `cores` by `Choice::score` (Arena: games), then games.
     fn sort(&mut self) {
         self.cores.sort_by(|a, b| b.items.score().total_cmp(&a.items.score()).then(b.items.games.cmp(&a.items.games)));
     }
@@ -566,12 +708,15 @@ pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData
     if raw.summary.id != champion_id {
         return Err(format!("OP.GG answered for champion {} instead of {champion_id}", raw.summary.id));
     }
+    let arena = query.mode == "arena";
+    let summary = parse_summary(&raw.summary, &raw.trends, &raw.game_lengths, query);
     let most = raw.core_items.iter().map(|c| c.games).max().unwrap_or(0);
+    let flag = |c: Choice| Choice { arena, ..c };
     let cores: Vec<CoreBuild> = raw
         .core_items
         .into_iter()
         .filter(|c| !c.ids.is_empty() && c.games >= MIN_GAMES)
-        .map(|c| CoreBuild::classify(c, data))
+        .map(|c| CoreBuild::classify(flag(c), data))
         .collect();
     if cores.is_empty() {
         return Err(match most {
@@ -580,7 +725,9 @@ pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData
             n => format!("OP.GG has only {n} games of this build ({}); too few to trust", query.label()),
         });
     }
-    let items = |v: Vec<Choice>| trusted(v.into_iter().filter(|c| !c.ids.is_empty()).collect(), |c| c.games);
+    let items = |v: Vec<Choice>| trusted(v.into_iter().filter(|c| !c.ids.is_empty()).map(flag).collect(), |c| c.games);
+    let skills = raw.skills.into_iter().filter(|s| !s.order.is_empty()).map(|s| Skills { arena, ..s });
+    let runes = raw.runes.into_iter().filter(|r| r.perks().is_some()).map(|r| Runes { arena, ..r });
     let mut build = MetaBuild {
         champion_id,
         query,
@@ -588,11 +735,13 @@ pub fn parse_build(champion_id: i64, query: Query, json: &str, data: &StaticData
         cores,
         starters: items(raw.starter_items),
         boots: items(raw.boots),
-        skills: trusted(raw.skills.into_iter().filter(|s| !s.order.is_empty()).collect(), |s| s.games),
-        runes: trusted(raw.runes.into_iter().filter(|r| r.perks().is_some()).collect(), |r| r.games),
-        spells: trusted(raw.summoner_spells.into_iter().filter(|c| c.ids.len() == 2).collect(), |c| c.games),
-        last_items: raw.last_items,
-        counters: raw.counters.into_iter().filter(|m| m.games >= MIN_GAMES).collect(),
+        skills: trusted(skills.collect(), |s| s.games),
+        runes: trusted(runes.collect(), |r| r.games),
+        spells: trusted(raw.summoner_spells.into_iter().filter(|c| c.ids.len() == 2).map(flag).collect(), |c| c.games),
+        last_items: raw.last_items.into_iter().map(flag).collect(),
+        // Matchups are win rates; Arena has no lanes, and Riot policy rules out its win rates.
+        counters: if arena { Vec::new() } else { raw.counters.into_iter().filter(|m| m.games >= MIN_GAMES).collect() },
+        summary,
         masteries: raw.skill_masteries,
     };
     build.sort();
@@ -674,7 +823,7 @@ mod tests {
     use crate::ddragon::ItemStats;
 
     fn item(ap: f64, ad: f64, crit: bool, on_hit: bool, defensive: bool, boots: bool) -> ItemStats {
-        ItemStats { ap, ad, crit, on_hit, defensive, boots }
+        ItemStats { ap, ad, crit, on_hit, defensive, boots, ..ItemStats::default() }
     }
 
     /// Data Dragon 16.20 stats/tags of the items in the Kai'Sa answer below.
@@ -841,5 +990,93 @@ mod tests {
         assert_eq!(Query { mode: "aram", position: "NONE" }.url(115), format!("{BASE}/aram/115/NONE"));
         assert_eq!(Query { mode: "arena", position: "NONE" }.url(145), format!("{BASE}/arena/145"));
         assert_eq!(Query { mode: "ranked", position: "ADC" }.url(145), format!("{BASE}/ranked/145/ADC?tier=emerald_plus"));
+    }
+
+    /// Trimmed from a real answer for Ahri, ranked MID, emerald+ (2026-10-19), with a few
+    /// entries broken on purpose.
+    const AHRI_MID: &str = r#"{"data":{"summary":{"id":103,
+        "average_stats":{"play":222269,"win_rate":0.512015,"pick_rate":0.0988588,"ban_rate":0.0296825,"kda":2.529199,"tier":2,"rank":8},
+        "positions":[{"name":"TOP","stats":{"play":5000,"win_rate":0.45,"pick_rate":0.002,"role_rate":0.02,"ban_rate":0.0296,"kda":2.0}},
+                     {"name":"MID","stats":{"play":211449,"win_rate":0.512228,"pick_rate":0.0935197,"role_rate":0.95132,"ban_rate":0.0296678,"kda":2.547884}}]},
+        "core_items":[{"ids":[3115,3089,3087],"play":500,"win":260}],
+        "trends":{"total_rank":250,"win":[{"version":"16.20","rate":0.5122},{"version":"16.19","rate":0.5077},{"version":"16.18","rate":null},{"version":"16.17","rate":0.5091}]},
+        "game_lengths":[{"game_length":25,"rate":0.522977,"average":0.5},{"game_length":0,"rate":0.499609,"average":0.5},{"game_length":30,"rate":"n/a"},
+                        {"game_length":35,"rate":0.506122},{"game_length":40,"rate":0.500292}]}}"#;
+
+    const MID: Query = Query { mode: "ranked", position: "MID" };
+
+    #[test]
+    fn summary_prefers_lane_numbers_and_orders_trend_and_game_lengths() {
+        let s = parse_build(103, MID, AHRI_MID, &data()).expect("parses").summary.expect("has a summary");
+        // The MID entry wins over the champion-wide numbers (222,269 games, 51.2015%).
+        assert_eq!((s.games, s.win_rate, s.lane_share), (211449, Some(0.512228), Some(0.95132)));
+        // OP.GG lists patches newest first; the chart wants oldest first. The null rate is skipped.
+        let patches: Vec<_> = s.trend.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(patches, ["16.17", "16.19", "16.20"]);
+        // Buckets sorted by their first minute; the bucket with a text rate is dropped.
+        assert_eq!(s.game_lengths, [(0, 0.499609), (25, 0.522977), (35, 0.506122), (40, 0.500292)]);
+        assert_eq!(
+            s.line("Ahri", MID),
+            "Ahri mid · 51.2% WR · 9.4% pick · 3.0% ban · KDA 2.55 · 211,449 games · 95% of Ahri's games are mid"
+        );
+        // A lane OP.GG does not list falls back to the champion-wide numbers, without a lane share.
+        let jungle = Query { mode: "ranked", position: "JUNGLE" };
+        let s = parse_build(103, jungle, AHRI_MID, &data()).expect("parses").summary.expect("has a summary");
+        assert_eq!((s.games, s.win_rate, s.lane_share), (222269, Some(0.512015), None));
+    }
+
+    #[test]
+    fn summary_is_absent_safe() {
+        let aram = Query { mode: "aram", position: "NONE" };
+        // ARAM: no positions, no bans, no game lengths.
+        let json = r#"{"data":{"summary":{"id":103,"average_stats":{"play":50000,"win_rate":0.53,"pick_rate":0.2,"ban_rate":null,"kda":3.1},"positions":null},
+            "core_items":[{"ids":[3115,3089,3087],"play":500,"win":260}],"trends":{"win":[{"version":"16.20","rate":0.53}]},"game_lengths":null}}"#;
+        let s = parse_build(103, aram, json, &data()).expect("parses").summary.expect("has a summary");
+        assert_eq!((s.ban_rate, s.lane_share, s.game_lengths.len(), s.trend.len()), (None, None, 0, 1));
+        assert_eq!(s.line("Ahri", aram), "Ahri · 53.0% WR · 20.0% pick · KDA 3.10 · 50,000 games");
+        // A reshaped summary leaves only the summary out; the builds still load.
+        let odd = r#"{"data":{"summary":{"id":103,"average_stats":"gone","positions":{"MID":1}},
+            "core_items":[{"ids":[3115,3089,3087],"play":500,"win":260}],"trends":[1,2],"game_lengths":{"0":0.5}}}"#;
+        let b = parse_build(103, MID, odd, &data()).expect("builds still parse");
+        assert_eq!((b.summary, b.cores.len()), (None, 1));
+        // No games counted: no summary.
+        let none = r#"{"data":{"summary":{"id":103},"core_items":[{"ids":[3115,3089,3087],"play":500,"win":260}]}}"#;
+        assert!(parse_build(103, MID, none, &data()).expect("parses").summary.is_none());
+    }
+
+    /// Shaped like OP.GG's Arena answer for Ahri (2026-10-19): wins, placements, no win rates.
+    /// Trends, game lengths and counters are added to show they are ignored for Arena.
+    const ARENA_JSON: &str = r#"{"data":{"summary":{"id":103,
+        "average_stats":{"win":46099,"play":89223,"total_place":306630,"first_place":15544,"pick_rate":0.131839,"ban_rate":0.0517615,"kills":660466,"assists":945544,"deaths":625150,"tier":2,"rank":48}},
+        "core_items":[{"ids":[3115,3089,3087],"play":500,"win":400,"total_place":1200,"pick_rate":0.01},
+                      {"ids":[6672,3124,3302],"play":5000,"win":2000,"total_place":24000,"pick_rate":0.1},
+                      {"ids":[3032,3031,3085],"play":1000,"win":950,"total_place":1500,"pick_rate":0.02}],
+        "boots":[{"ids":[3006],"win":15201,"play":35772,"total_place":134794,"first_place":4435,"pick_rate":0.8053}],
+        "skills":[{"order":["Q","W","E","Q"],"play":25729,"win":16955,"total_place":73152,"pick_rate":0.4186}],
+        "trends":{"win":[{"version":"16.20","rate":0.51}]},"game_lengths":[{"game_length":0,"rate":0.5}],
+        "counters":[{"champion_id":202,"play":26943,"win":13935}]}}"#;
+
+    #[test]
+    fn arena_shows_no_win_rates_and_ranks_by_games() {
+        let arena = Query { mode: "arena", position: "NONE" };
+        let b = parse_build(103, arena, ARENA_JSON, &data()).expect("parses");
+        // Most played first, although the 95%-win 1,000-game build would top a Wilson ranking.
+        let games: Vec<u64> = b.cores.iter().map(|c| c.items.games).collect();
+        assert_eq!(games, [5000, 1000, 500]);
+        assert_eq!(b.groups(), [Group::Ad, Group::OnHit, Group::Crit, Group::Ap]);
+        assert_eq!(b.boots[0].stats(), "80.5% pick · 35,772 games");
+        assert_eq!(b.skills[0].stats(), "41.9% pick · 25,729 games");
+        let lines: Vec<String> = b.cores.iter().map(|c| c.items.stats()).chain([b.boots[0].stats(), b.skills[0].stats()]).collect();
+        assert!(lines.iter().all(|l| !l.contains("WR") && !l.contains("avg place")), "{lines:?}");
+        // "Few games" follows the sample size only: 1,000 games is few for Arena at any win rate,
+        // while the same record elsewhere has a narrow margin.
+        assert!(b.cores[1].items.few_games() && !b.cores[0].items.few_games());
+        assert!(!Choice { games: 1000, wins: 950, ..Choice::default() }.few_games());
+        assert!(b.counters.is_empty());
+        let s = b.summary.expect("has a summary");
+        assert_eq!((s.games, s.win_rate, s.pick_rate, s.ban_rate), (89223, None, Some(0.131839), Some(0.0517615)));
+        assert!(s.trend.is_empty() && s.game_lengths.is_empty());
+        // KDA from the kill, death and assist totals: (660,466 + 945,544) / 625,150.
+        assert_eq!(s.line("Ahri", arena), "Ahri · 13.2% pick · 5.2% ban · KDA 2.57 · 89,223 games");
     }
 }

@@ -28,6 +28,30 @@ fn save(all: &HashMap<String, String>) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// An order is recorded for the champion.
+pub fn has(champion_key: &str) -> bool {
+    load().contains_key(champion_key)
+}
+
+/// Saves an order learned from match history when the champion has none yet (a live
+/// recording is never overwritten) and it is at least `MIN_SAVED` points long. Returns whether
+/// it was saved.
+pub fn backfill(champion_key: &str, order: &str) -> Result<bool, String> {
+    let mut all = load();
+    if !learn(&mut all, champion_key, order) {
+        return Ok(false);
+    }
+    save(&all).map(|_| true).map_err(|e| format!("skills: {e}"))
+}
+
+fn learn(all: &mut HashMap<String, String>, champion_key: &str, order: &str) -> bool {
+    if champion_key.is_empty() || order.chars().count() < MIN_SAVED || all.contains_key(champion_key) {
+        return false;
+    }
+    all.insert(champion_key.to_string(), order.to_string());
+    true
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct SkillHint {
     /// Next key from the recorded order, when a point is unspent.
@@ -92,5 +116,19 @@ mod tests {
         let h = r.observe("Ziggs", [1, 1, 1, 0], 1).unwrap();
         assert_eq!(h.current, "QWE");
         assert_eq!(h.next, Some('Q'));
+    }
+
+    #[test]
+    fn backfill_fills_gaps_only_and_needs_a_full_enough_order() {
+        let mut all = HashMap::from([("Ziggs".to_string(), "QWEQQRQ".to_string())]);
+        // A recording exists (live or earlier backfill): match history never replaces it.
+        assert!(!learn(&mut all, "Ziggs", "EQWEERE"));
+        assert_eq!(all["Ziggs"], "QWEQQRQ");
+        // A remake's five points are not worth replaying.
+        assert!(!learn(&mut all, "Ahri", "QWEQQ"));
+        assert!(!all.contains_key("Ahri"));
+        assert!(learn(&mut all, "Ahri", "QWEQQR"));
+        assert_eq!(all["Ahri"], "QWEQQR");
+        assert!(!learn(&mut all, "", "QWEQQRQ"));
     }
 }

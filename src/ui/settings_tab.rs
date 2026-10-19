@@ -1,17 +1,23 @@
-//! Settings: automation toggles, rune source, overlay, behaviour, League folder, item sets.
+//! Settings: automation toggles, rune source, overlay, behaviour, goals, replays, League
+//! folder, item sets.
 
 use std::sync::atomic::Ordering;
 
-use eframe::egui::{DragValue, RichText, TextEdit, Ui, vec2};
+use eframe::egui::{Align, DragValue, Grid, Layout, RichText, TextEdit, Ui, vec2};
 
 use super::theme::*;
 use super::widgets::*;
 use super::live_tab::FULLSCREEN_WARNING;
+use super::stats::position_label;
 use super::{App, set_overlay_edit};
+use crate::goals::Goals;
 use crate::itemset;
 use crate::riot::Product;
 use crate::settings::{self, OVERLAY_MIN_SIZE, OVERLAY_SIZE, PageSource};
-use crate::worker::Snapshot;
+use crate::worker::{Action, Snapshot};
+
+/// Canonical positions, in the client's order.
+const ROLES: [&str; 5] = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"];
 
 impl App {
     pub(super) fn settings_tab(&mut self, ui: &mut Ui, s: &Snapshot) {
@@ -199,6 +205,9 @@ impl App {
             self.save_settings();
         }
 
+        self.goals_card(ui, s);
+        self.replays_card(ui, s);
+
         section(ui, "League folder");
         card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -239,8 +248,85 @@ impl App {
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 icon(ui, Icon::Folder, 16.0, MUTED);
-                ui.label(RichText::new("Settings, recorded skill orders and cache:").color(BODY));
+                ui.label(RichText::new("Settings, goals, notes, matchup record, LP history, recorded skill orders and cache:").color(BODY));
                 ui.label(RichText::new(settings::local_dir().display().to_string()).font(semibold(12.5)).color(TEXT));
+            });
+        });
+    }
+
+    /// Per-role goals: edited in a draft, written only by Save or Clear.
+    fn goals_card(&mut self, ui: &mut Ui, s: &Snapshot) {
+        section(ui, "Goals");
+        card(ui, |ui| {
+            let mut role = ROLES.into_iter().find(|r| *r == self.goals_role).unwrap_or("MIDDLE");
+            if segmented(ui, &mut role, &ROLES.map(|r| (r, position_label(r)))) {
+                self.goals_role = role.to_string();
+                self.goals_draft = None;
+            }
+            let stored = s.goals.goals(role).copied();
+            let draft = self.goals_draft.get_or_insert_with(|| stored.unwrap_or_default());
+            ui.add_space(4.0);
+            Grid::new("goals-editor").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.spacing_mut().interact_size = vec2(72.0, 24.0);
+                rate_goal(ui, "CS per minute", &mut draft.cs_per_min, 7.0, 12.0);
+                count_goal(ui, "Most deaths", &mut draft.max_deaths, 4, 20);
+                rate_goal(ui, "Vision score per minute", &mut draft.vision_per_min, 1.0, 5.0);
+                count_goal(ui, "Control wards bought", &mut draft.control_wards, 2, 10);
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let dirty = *draft != stored.unwrap_or_default();
+                if ui.add_enabled(dirty, Btn::primary("Save").small()).clicked() {
+                    self.shared.request(Action::SetGoals { role: role.to_string(), goals: *draft });
+                }
+                if ui.add_enabled(stored.is_some(), Btn::ghost("Clear").small()).clicked() {
+                    *draft = Goals::default();
+                    self.shared.request(Action::SetGoals { role: role.to_string(), goals: Goals::default() });
+                }
+                if dirty {
+                    ui.label(RichText::new("Unsaved changes").size(11.5).color(SOON));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let streak = s.goals.streak(Some(role));
+                    let color = if streak > 0 { WIN } else { MUTED };
+                    ui.label(RichText::new(format!("Streak: {streak} game(s) with every goal met")).size(11.5).color(color));
+                });
+            });
+            small_note(
+                ui,
+                "The Live tab and the overlay show how the game is going against these; Post-game checks them, \
+                 control wards included (the live game does not report purchases). Kept on this PC (goals.json).",
+            );
+        });
+    }
+
+    /// The game's Replay API switch, written to game.cfg only by the button.
+    fn replays_card(&mut self, ui: &mut Ui, s: &Snapshot) {
+        section(ui, "Replays");
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                match s.replay_api {
+                    Some(true) => status_msg(ui, true, "Replay API on"),
+                    Some(false) => status_msg(ui, false, "Replay API off"),
+                    None => status_msg(ui, false, "game.cfg not found"),
+                };
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled(s.replay_api != Some(true), Btn::primary("Enable Replay API").small()).clicked() {
+                        self.shared.request(Action::EnableReplayApi);
+                    }
+                });
+            });
+            small_note(
+                ui,
+                "Enabling writes EnableReplayApi=1 under [General] in <League>/Config/game.cfg, only when you click the button; \
+                 it takes effect the next time the game starts. It lets riftlite jump in an open replay and record clips \
+                 through the game's local Replay API (127.0.0.1:2999); nothing is sent anywhere.",
+            );
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                icon(ui, Icon::Folder, 16.0, MUTED);
+                ui.label(RichText::new("Clips:").color(BODY));
+                ui.label(RichText::new(crate::replay::clips_dir().display().to_string()).font(semibold(12.5)).color(TEXT));
             });
         });
     }
@@ -251,4 +337,31 @@ fn void_msg(ui: &mut Ui, ok: bool, text: &str) {
         ui.add_space(10.0);
         status_msg(ui, ok, text);
     });
+}
+
+/// A per-minute goal row: the checkbox turns it on (at `default`) or off; values move in tenths.
+fn rate_goal(ui: &mut Ui, label: &str, goal: &mut Option<f64>, default: f64, max: f64) {
+    goal_check(ui, label, goal, default);
+    let mut v = goal.unwrap_or(default);
+    if ui.add_enabled(goal.is_some(), DragValue::new(&mut v).range(0.0..=max).speed(0.05).fixed_decimals(1)).changed() {
+        *goal = Some((v * 10.0).round() / 10.0);
+    }
+    ui.end_row();
+}
+
+/// A count goal row: the checkbox turns it on (at `default`) or off.
+fn count_goal(ui: &mut Ui, label: &str, goal: &mut Option<i64>, default: i64, max: i64) {
+    goal_check(ui, label, goal, default);
+    let mut v = goal.unwrap_or(default);
+    if ui.add_enabled(goal.is_some(), DragValue::new(&mut v).range(0..=max).speed(0.1)).changed() {
+        *goal = Some(v);
+    }
+    ui.end_row();
+}
+
+fn goal_check<T: Copy>(ui: &mut Ui, label: &str, goal: &mut Option<T>, default: T) {
+    let mut on = goal.is_some();
+    if ui.checkbox(&mut on, RichText::new(label).color(BODY)).changed() {
+        *goal = on.then_some(default);
+    }
 }

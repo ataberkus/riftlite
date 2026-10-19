@@ -29,9 +29,10 @@ pub fn write_from_game(league_root: &Path, data: &StaticData, game: &LolGame) ->
 
 /// The picked OP.GG build (`picks.build`, an index into `build.cores`) as Starting / Core /
 /// Boots / Full build / Situational blocks, OP.GG's other trusted starts and boots, the best
-/// build of every other group (AP, AD, On-hit, Crit, Tank, Utility) as "Alternative" blocks,
-/// then the player's own best game on the champion in this mode. One file per champion and
-/// OP.GG mode, shown by the client only on that mode's map.
+/// build of every other group (AP, AD, On-hit, Crit, Tank or Utility; for Arena the most played,
+/// see `MetaBuild::groups`) as "Alternative" blocks, then the player's own best game on the
+/// champion in this mode. One file per champion and OP.GG mode, shown by the client only on that
+/// mode's map. Block titles carry `stats()`, so Arena titles show pick rate and games only.
 pub fn write_meta(
     league_root: &Path,
     data: &StaticData,

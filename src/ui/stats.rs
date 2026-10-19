@@ -2,6 +2,7 @@
 
 use crate::ddragon::StaticData;
 use crate::lcu::{LolGame, MatchDetail, MatchPlayer};
+use crate::lp::{DIVISIONS, TIERS};
 use crate::live::LivePlayer;
 use crate::win;
 use crate::worker::{LcuStatus, Snapshot};
@@ -122,9 +123,6 @@ pub fn streak<'a>(games: impl IntoIterator<Item = &'a LolGame>) -> Option<(bool,
     let won = it.next()?.win;
     Some((won, 1 + it.take_while(|g| g.win == won).count()))
 }
-
-const TIERS: [&str; 7] = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND"];
-const DIVISIONS: [&str; 4] = ["IV", "III", "II", "I"];
 
 /// The division after `tier division` (`Gold I` → `Platinum IV`, `Diamond I` → `Master`); `None`
 /// for apex tiers, which have no divisions.

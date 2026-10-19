@@ -1,16 +1,18 @@
 //! Post-game: result, LP change, this game against your usual games, and the scoreboard.
 
-use eframe::egui::{Align, Grid, Layout, RichText, Ui, vec2};
+use eframe::egui::{Align, Color32, Grid, Layout, RichText, Ui, vec2};
 
 use super::home::{session_line, void};
 use super::matches::match_table;
-use super::stats::{as_lol_game, averages, datetime, mmss, now_ms, queue_name};
+use super::stats::{as_lol_game, averages, datetime, mmss, now_ms, position_label, queue_name};
 use super::theme::*;
 use super::widgets::*;
 use super::App;
+use crate::goals::GoalKind;
 use crate::lcu::{MatchPlayer, RankedQueue};
 use crate::lp;
-use crate::worker::{Action, Snapshot};
+use crate::notes::{champ_key, vs_key};
+use crate::worker::{Action, PostGame, Snapshot};
 
 impl App {
     pub(super) fn post_game(&mut self, ui: &mut Ui, s: &Snapshot) {
@@ -50,6 +52,7 @@ impl App {
                         lp: lp.lp,
                         wins: 0,
                         losses: 0,
+                        ..RankedQueue::default()
                     };
                     ui.vertical(|ui| {
                         ui.with_layout(Layout::top_down(Align::Max), |ui| {
@@ -170,9 +173,142 @@ impl App {
                 });
             }
         });
+        self.after_game_card(ui, s, &g, pg, me);
         section(ui, "Scoreboard");
         if let Some(id) = card(ui, |ui| match_table(ui, &g, d, "postgame")) {
             self.lookup(id);
         }
+    }
+
+    /// Mastery from this game, its goal checks, and your record and notes against the lane
+    /// opponent, in one card; parts without data are left out.
+    fn after_game_card(&mut self, ui: &mut Ui, s: &Snapshot, g: &Gfx, pg: &PostGame, me: &MatchPlayer) {
+        let my = me.champion_id;
+        let opponent = pg
+            .detail
+            .players
+            .iter()
+            .find(|p| !me.position.is_empty() && p.team != me.team && p.position == me.position)
+            .map(|p| p.champion_id)
+            .filter(|&c| c > 0);
+        let record = opponent.map(|o| (o, s.matchups.record_vs(o, Some(my), true))).filter(|(_, r)| r.games > 0);
+        // Empty checks with goals set mean a remake, not missing goals.
+        let goals_hint = pg.goals.is_empty() && !pg.role.is_empty() && s.goals.goals(&pg.role).is_none();
+        let role = position_label(&pg.role);
+        let mut saved = None;
+        ui.add_space(6.0);
+        card(ui, |ui| {
+            tiles(ui, |ui| {
+                if let Some(m) = &pg.mastery {
+                    ui.vertical(|ui| {
+                        ui.set_width(250.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        overline(ui, "Champion mastery");
+                        ui.horizontal(|ui| {
+                            if !m.grade.is_empty() {
+                                pill(ui, m.grade.clone(), grade_color(&m.grade));
+                            }
+                            ui.label(RichText::new(format!("+{} points", m.points_gained)).font(semibold(13.0)).color(TEXT));
+                            ui.label(RichText::new(format!("Level {}", m.level)).color(BODY));
+                            if m.leveled_up {
+                                pill(ui, "Level up", SOON);
+                            }
+                        });
+                        let mut facts = Vec::new();
+                        if m.points_to_next > 0 {
+                            facts.push(format!("{} points to the next level", m.points_to_next));
+                        }
+                        if m.mark_earned {
+                            facts.push("Mark earned".to_string());
+                        }
+                        if !facts.is_empty() {
+                            small_note(ui, facts.join(" · "));
+                        }
+                        let needed = s.mastery.iter().find(|x| x.champion_id == m.champion_id).map(|x| x.grades_needed()).unwrap_or_default();
+                        if !needed.is_empty() {
+                            let list: Vec<String> = needed.iter().map(|(grade, n)| format!("{n}× {grade}")).collect();
+                            small_note(ui, format!("Next milestone still needs {}", list.join(", ")));
+                        }
+                    });
+                    ui.add_space(20.0);
+                }
+                if !pg.goals.is_empty() || goals_hint {
+                    ui.vertical(|ui| {
+                        ui.set_width(250.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        overline(ui, &if role.is_empty() { "Goals".to_string() } else { format!("Goals · {role}") });
+                        if goals_hint {
+                            small_note(ui, format!("Set goals for {role} in Settings to check games like this one."));
+                        }
+                        for c in &pg.goals {
+                            ui.horizontal(|ui| {
+                                icon(ui, if c.met { Icon::Check } else { Icon::Cross }, 13.0, result_color(c.met));
+                                ui.label(RichText::new(c.kind.label()).color(BODY));
+                                ui.label(RichText::new(goal_number(c.kind, c.actual)).font(semibold(12.5)).color(TEXT));
+                                let target = goal_number(c.kind, c.target);
+                                small_note(ui, if c.kind == GoalKind::MaxDeaths { format!("goal at most {target}") } else { format!("goal {target}") });
+                            });
+                        }
+                        let streak = s.goals.streak(Some(&pg.role));
+                        if !pg.goals.is_empty() && streak >= 2 {
+                            small_note(ui, format!("{streak} {role} games in a row with every goal met"));
+                        }
+                    });
+                    ui.add_space(20.0);
+                }
+                if let Some((o, r)) = record {
+                    ui.vertical(|ui| {
+                        ui.set_width(250.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        overline(ui, "Your lane record in this matchup");
+                        ui.horizontal(|ui| {
+                            g.champ(ui, my, 22.0);
+                            small_note(ui, "vs");
+                            g.champ(ui, o, 22.0);
+                            ui.label(RichText::new(format!("{}W {}L", r.wins, r.losses())).font(semibold(13.0)).color(TEXT));
+                        });
+                        wr_bar(ui, r.wins as i64, r.losses() as i64, 200.0);
+                        if r.few_games() {
+                            small_note(ui, "Only a few games, so this says little yet.");
+                        }
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            let my_name = s.data.champion_name(my);
+            let mut boxes = vec![(champ_key(my), format!("{my_name} note"))];
+            if let Some(o) = opponent {
+                boxes.push((vs_key(my, o), format!("{my_name} vs {}", s.data.champion_name(o))));
+            }
+            ui.columns(boxes.len(), |cols| {
+                for (ui, (key, title)) in cols.iter_mut().zip(&boxes) {
+                    if let Some(x) = note_box(ui, &mut self.note_edit, key, title, s.notes.get(key)) {
+                        saved = Some(x);
+                    }
+                }
+            });
+        });
+        if let Some((key, text)) = saved {
+            self.request(Action::SaveNote { key, text });
+        }
+    }
+}
+
+/// Mastery grade color: S gold, A green, B cyan, lower muted.
+fn grade_color(grade: &str) -> Color32 {
+    match grade.chars().next() {
+        Some('S') => SOON,
+        Some('A') => WIN,
+        Some('B') => CYAN,
+        _ => MUTED,
+    }
+}
+
+/// Per-minute goals with one decimal, counts as whole numbers.
+fn goal_number(kind: GoalKind, v: f64) -> String {
+    match kind {
+        // Two decimals: the check is exact, so 6.97 must not read as 7.0.
+        GoalKind::CsPerMin | GoalKind::VisionPerMin => format!("{v:.2}"),
+        GoalKind::MaxDeaths | GoalKind::ControlWards => format!("{v:.0}"),
     }
 }
