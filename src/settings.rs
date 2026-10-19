@@ -137,9 +137,11 @@ pub struct Settings {
     pub switch_tabs_automatically: bool,
     /// Accept the matchmaking ready check automatically (unless you already answered it).
     pub auto_accept: bool,
-    /// On lock-in, write the `page_source` rune page into riftlite's own page.
+    /// On lock-in, write the `page_source` rune page into riftlite's own page; an OP.GG rune
+    /// page picked in champ select is written at once.
     pub auto_runes: bool,
-    /// On lock-in, set the `page_source` summoner spells (Flash stays on its key).
+    /// On lock-in, set the `page_source` summoner spells (Flash stays on its key); OP.GG
+    /// spells picked in champ select are set at once.
     pub auto_spells: bool,
     /// Runes and spells for `auto_runes` / `auto_spells`.
     pub page_source: PageSource,

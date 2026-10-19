@@ -984,8 +984,10 @@ impl App {
             }
             if !build.runes.is_empty() {
                 ui.add_space(6.0);
-                overline(ui, "Rune page (offered below as the OP.GG page)");
-                for (i, r) in build.runes.iter().enumerate() {
+                overline(ui, "Rune page, best fit for the picked build first (offered below as the OP.GG page)");
+                let order = build.rune_order(sel);
+                for (rank, &i) in order.iter().enumerate() {
+                    let r = &build.runes[i];
                     let few = r.few_games();
                     // Pages often share keystone and styles, so every rune is shown to tell them apart.
                     let runes = |ids: &[i64]| ids.iter().map(|&id| s.data.perk_name(id)).collect::<Vec<_>>().join(", ");
@@ -1006,6 +1008,10 @@ impl App {
                         g.perk(ui, r.secondary_page_id, 18.0);
                         for &id in &r.secondary_rune_ids {
                             g.perk(ui, id, 22.0);
+                        }
+                        if rank == 0 && order.len() > 1 {
+                            ui.add_space(6.0);
+                            pill(ui, "suggested", ACCENT_TEXT).on_hover_text(format!("For the {} build: {}", chosen.label(), chosen.rune_fit_note()));
                         }
                         option_stats(ui, &r.stats(), few);
                     });

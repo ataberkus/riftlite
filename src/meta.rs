@@ -35,6 +35,13 @@ pub const MIN_GAMES: u64 = 100;
 pub const FEW_GAMES_MARGIN: f64 = 2.5;
 /// z for a 95 % interval.
 const Z: f64 = 1.96;
+/// Rune trees (`Runes::primary_page_id` / `secondary_page_id`): Riot's perk style ids.
+const PRECISION: i64 = 8000;
+const DOMINATION: i64 = 8100;
+const SORCERY: i64 = 8200;
+const RESOLVE: i64 = 8400;
+/// The attack-speed stat shard.
+const ATTACK_SPEED_SHARD: i64 = 5005;
 
 /// What to ask OP.GG for: its game mode and lane names.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -381,6 +388,54 @@ impl CoreBuild {
             Damage::None => s.ap == 0.0 && s.ad == 0.0,
         }
     }
+
+    /// Rune trees that suit this build, best first. OP.GG ties no rune page to a build, so the
+    /// fit comes from the build's kind: Resolve for tank builds; Precision for attack builds
+    /// (crit or on-hit, AP on-hit too); Precision, then Domination for other AD builds;
+    /// Sorcery, then Domination for AP; Sorcery, then Resolve for utility builds.
+    fn rune_trees(&self) -> &'static [i64] {
+        if self.tank {
+            &[RESOLVE]
+        } else if self.crit || self.on_hit {
+            &[PRECISION]
+        } else {
+            match self.damage {
+                Damage::Ad => &[PRECISION, DOMINATION],
+                Damage::Ap => &[SORCERY, DOMINATION],
+                Damage::None => &[SORCERY, RESOLVE],
+            }
+        }
+    }
+
+    /// How well rune page `r` suits this build, higher is better: its primary tree is the
+    /// build's first tree (4) or another of them (2), plus 1 for a secondary tree among them
+    /// and 1 for the attack-speed shard on a crit or on-hit build.
+    pub fn rune_fit(&self, r: &Runes) -> u8 {
+        let trees = self.rune_trees();
+        let primary = match trees.iter().position(|&t| t == r.primary_page_id) {
+            Some(0) => 4,
+            Some(_) => 2,
+            None => 0,
+        };
+        let secondary = u8::from(trees.contains(&r.secondary_page_id));
+        let attack_speed = u8::from(!self.tank && (self.crit || self.on_hit) && r.stat_mod_ids.contains(&ATTACK_SPEED_SHARD));
+        primary + secondary + attack_speed
+    }
+
+    /// Why the suggested rune page fits, for the panel.
+    pub fn rune_fit_note(&self) -> &'static str {
+        if self.tank {
+            "Resolve suits tank builds"
+        } else if self.crit || self.on_hit {
+            "Precision and the attack-speed shard suit crit and on-hit builds"
+        } else {
+            match self.damage {
+                Damage::Ad => "Precision, then Domination, suit AD builds",
+                Damage::Ap => "Sorcery, then Domination, suit AP builds",
+                Damage::None => "Sorcery, then Resolve, suit utility builds",
+            }
+        }
+    }
 }
 
 /// What the player picked among a build's options; indices into the `MetaBuild` lists.
@@ -388,6 +443,9 @@ impl CoreBuild {
 pub struct Picks {
     pub build: usize,
     pub runes: usize,
+    /// `runes` was picked by hand (or remembered from a hand pick) and stays when the build
+    /// changes; otherwise it follows `MetaBuild::suggested_runes` for the picked build.
+    pub runes_picked: bool,
     pub spells: usize,
     pub skills: usize,
 }
@@ -557,7 +615,8 @@ pub struct MetaBuild {
     pub starters: Vec<Choice>,
     pub boots: Vec<Choice>,
     pub skills: Vec<Skills>,
-    /// Complete pages only.
+    /// Complete pages only. OP.GG lists them for the champion, not per build; `rune_order`
+    /// ranks them for a build.
     pub runes: Vec<Runes>,
     /// Two-spell pairs only.
     pub spells: Vec<Choice>,
@@ -600,26 +659,58 @@ impl MetaBuild {
         self.cores.iter().position(|c| c.items.ids == ids)
     }
 
+    /// Indices into `runes` for core build `core`, best `CoreBuild::rune_fit` first; equal fits
+    /// stay most played first. `runes` itself keeps OP.GG's order, so `Picks::runes` indices
+    /// stay valid whichever build is picked.
+    pub fn rune_order(&self, core: usize) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.runes.len()).collect();
+        if let Some(c) = self.cores.get(core) {
+            order.sort_by_key(|&i| std::cmp::Reverse(c.rune_fit(&self.runes[i])));
+        }
+        order
+    }
+
+    /// The rune page suggested for core build `core`: the first of `rune_order`.
+    pub fn suggested_runes(&self, core: usize) -> usize {
+        self.rune_order(core).first().copied().unwrap_or(0)
+    }
+
     /// Indices of remembered picks in this build's lists; one no longer offered falls back to
-    /// the default (first) option.
+    /// the default: the first option, or the suggested rune page for the build.
     pub fn picks_of(&self, saved: &SavedPicks) -> Picks {
         let find = |found: Option<usize>| found.unwrap_or(0);
+        let build = find(self.index_of(&saved.build));
+        let runes = self.runes.iter().position(|r| r.perks().as_deref() == Some(saved.runes.as_slice()));
         Picks {
-            build: find(self.index_of(&saved.build)),
-            runes: find(self.runes.iter().position(|r| r.perks().as_deref() == Some(saved.runes.as_slice()))),
+            build,
+            runes: runes.unwrap_or_else(|| self.suggested_runes(build)),
+            runes_picked: runes.is_some(),
             spells: find(self.spells.iter().position(|s| s.ids == saved.spells)),
             skills: find(self.skills.iter().position(|s| s.order == saved.skills)),
         }
     }
 
-    /// The content of `picks`, to remember.
+    /// The content of `picks`, to remember. A rune page that only follows the suggestion is
+    /// not remembered, so it keeps following the build.
     pub fn saved(&self, picks: Picks) -> SavedPicks {
+        let runes = self.runes.get(picks.runes).filter(|_| picks.runes_picked);
         SavedPicks {
             build: self.cores.get(picks.build).map(|c| c.items.ids.clone()).unwrap_or_default(),
-            runes: self.runes.get(picks.runes).and_then(Runes::perks).unwrap_or_default(),
+            runes: runes.and_then(Runes::perks).unwrap_or_default(),
             spells: self.spells.get(picks.spells).map(|s| s.ids.clone()).unwrap_or_default(),
             skills: self.skills.get(picks.skills).map(|s| s.order.clone()).unwrap_or_default(),
         }
+    }
+
+    /// Selects core build `core`; a rune page not picked by hand moves to the build's
+    /// suggestion. Returns whether the rune page changed.
+    pub fn pick_build(&self, picks: &mut Picks, core: usize) -> bool {
+        picks.build = core;
+        let before = picks.runes;
+        if !picks.runes_picked {
+            picks.runes = self.suggested_runes(core);
+        }
+        picks.runes != before
     }
 
     /// Most played boots.
@@ -892,6 +983,47 @@ mod tests {
         assert_eq!(b.full_build(1, &data()), [3087, 3124, 3115, 3006, 3089]);
         // Nashor's Tooth (AP) stays out of the AD build; Phantom Dancer fits it.
         assert_eq!(b.full_build(2, &data()), [6672, 3124, 3302, 3006, 3031, 3046]);
+    }
+
+    #[test]
+    fn rune_pages_rank_by_fit_with_the_build_and_hand_picks_stay() {
+        // Most played first: Domination (Hail of Blades), Precision with adaptive shards,
+        // Precision with the attack-speed shard, Sorcery.
+        let pages = r#""runes":[
+            {"primary_page_id":8100,"primary_rune_ids":[9923,8139,8138,8135],"secondary_page_id":8000,"secondary_rune_ids":[9111,8017],"stat_mod_ids":[5008,5008,5011],"play":9000,"win":4500},
+            {"primary_page_id":8000,"primary_rune_ids":[8008,9111,9104,8017],"secondary_page_id":8300,"secondary_rune_ids":[8304,8345],"stat_mod_ids":[5008,5008,5011],"play":5000,"win":2500},
+            {"primary_page_id":8000,"primary_rune_ids":[8008,9111,9104,8017],"secondary_page_id":8100,"secondary_rune_ids":[8139,8135],"stat_mod_ids":[5005,5008,5011],"play":3000,"win":1500},
+            {"primary_page_id":8200,"primary_rune_ids":[8229,8226,8210,8237],"secondary_page_id":8100,"secondary_rune_ids":[8139,8135],"stat_mod_ids":[5008,5008,5011],"play":2000,"win":1000}],"#;
+        let start = KAISA.find(r#""runes":["#).expect("fixture has runes");
+        let end = KAISA.find(r#""summoner_spells""#).expect("fixture has spells");
+        let json = format!("{}{pages}{}", &KAISA[..start], &KAISA[end..]);
+        let mut b = parse_build(145, ADC, &json, &data()).expect("parses");
+        let other = |id, damage, tank| CoreBuild { items: Choice { ids: vec![id], ..Choice::default() }, damage, crit: false, on_hit: false, tank };
+        b.cores.push(other(3089, Damage::Ap, false));
+        b.cores.push(other(3068, Damage::None, true));
+        let (crit, ap_on_hit, ap, tank) = (0, 1, 3, 4);
+        // Attack builds (AD crit, AP on-hit alike): Precision, the attack-speed shard first;
+        // the Domination page ranks by its Precision secondary.
+        assert_eq!(b.rune_order(crit), [2, 1, 0, 3]);
+        assert_eq!(b.rune_order(ap_on_hit), [2, 1, 0, 3]);
+        // AP casters: Sorcery, then Domination primary, then a Domination secondary.
+        assert_eq!(b.rune_order(ap), [3, 0, 2, 1]);
+        // No page suits the tank build: OP.GG's most played order stays.
+        assert_eq!(b.rune_order(tank), [0, 1, 2, 3]);
+
+        // Nothing remembered: the suggested page for the best build, following build changes.
+        let mut p = b.picks_of(&SavedPicks::default());
+        assert_eq!((p.build, p.runes, p.runes_picked), (crit, 2, false));
+        assert!(b.pick_build(&mut p, ap));
+        assert_eq!(p.runes, 3);
+        assert!(b.saved(p).runes.is_empty(), "a followed suggestion is not remembered");
+        // A page picked by hand stays through build changes and is remembered.
+        p.runes = 1;
+        p.runes_picked = true;
+        assert!(!b.pick_build(&mut p, crit));
+        assert_eq!(p.runes, 1);
+        let restored = b.picks_of(&b.saved(p));
+        assert_eq!((restored.build, restored.runes, restored.runes_picked), (crit, 1, true));
     }
 
     #[test]

@@ -408,6 +408,10 @@ struct Auto {
     meta_chan: Option<(mpsc::Sender<MetaAnswer>, mpsc::Receiver<MetaAnswer>)>,
     /// Lock-in work waiting for OP.GG.
     lockin: Option<LockIn>,
+    /// Champion whose rune page / spells were set by button or an OP.GG panel pick in this
+    /// champ select: lock-in leaves them, and later panel picks replace them.
+    runes_set: Option<i64>,
+    spells_set: Option<i64>,
 }
 
 type MetaAnswer = ((i64, Query), Result<MetaBuild, String>);
@@ -878,20 +882,22 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
         let champion = champ.expect("checked");
         let prefs = shared.settings.lock().clone();
         let opgg_pages = prefs.page_source == PageSource::OpGg && prefs.meta_builds;
+        let runes = prefs.auto_runes && auto.runes_set != champ;
+        let spells = prefs.auto_spells && auto.spells_set != champ;
         if !opgg_pages {
             // Riot's page is already here. Outcomes are recorded in `champ_log` for the Champ select tab.
-            if prefs.auto_runes {
+            if runes {
                 let _ = apply_runes(shared, lcu, 0, cs);
             }
-            if prefs.auto_spells {
+            if spells {
                 let _ = apply_spells(shared, lcu, 0, cs);
             }
         }
         let job = LockIn {
             champion,
             since: Instant::now(),
-            runes: opgg_pages && prefs.auto_runes,
-            spells: opgg_pages && prefs.auto_spells,
+            runes: opgg_pages && runes,
+            spells: opgg_pages && spells,
             items: prefs.auto_item_set,
         };
         auto.lockin = (job.runes || job.spells || job.items).then_some(job);
@@ -964,7 +970,7 @@ fn sync_meta(shared: &Shared, auto: &mut Auto) -> bool {
 }
 
 /// A build just arrived for `m`: start on the options last picked for this champion and mode
-/// (else the best build and OP.GG's most played options).
+/// (else the best build, OP.GG's most played options and the rune page suggested for the build).
 fn adopt_build(m: &mut MetaState) {
     let Some(Ok(b)) = &m.build else { return };
     m.picks = saved_picks(m.champion_id, b);
@@ -972,7 +978,7 @@ fn adopt_build(m: &mut MetaState) {
 
 /// The remembered picks for this champion in `b`'s mode, as indices into `b`.
 fn saved_picks(champion_id: i64, b: &MetaBuild) -> Picks {
-    meta::saved_picks(champion_id, b.query.mode).map(|p| b.picks_of(&p)).unwrap_or_default()
+    b.picks_of(&meta::saved_picks(champion_id, b.query.mode).unwrap_or_default())
 }
 
 fn request_meta(auto: &mut Auto, data: Arc<StaticData>, key: (i64, Query)) -> Result<(), String> {
@@ -1001,7 +1007,9 @@ fn sync_meta_page(s: &mut Snapshot) {
 fn meta_page(b: &MetaBuild, picks: Picks) -> Option<RecPage> {
     let r = b.runes.get(picks.runes)?;
     let spells = b.spells.get(picks.spells)?;
-    let which = if picks.runes == 0 { "most played runes".to_string() } else { format!("runes option {}", picks.runes + 1) };
+    // Numbered as the panel lists them for the picked build.
+    let rank = b.rune_order(picks.build).iter().position(|&i| i == picks.runes).unwrap_or(picks.runes);
+    let which = if rank == 0 { "suggested runes".to_string() } else { format!("runes option {}", rank + 1) };
     Some(RecPage {
         position: b.query.position.to_uppercase(),
         primary_style: r.primary_page_id,
@@ -1078,50 +1086,107 @@ fn lock_in_item_set(shared: &Shared, champ: i64, meta: MetaUse, mode: Option<&st
 
 /// Applies a selection in the OP.GG panel. A picked build is remembered per champion and
 /// mode. A new build or skill order rewrites the lock-in item set if it was already written;
-/// rune pages and spells update the OP.GG page among the recommended pages.
-fn select_meta(shared: &Shared, auto: &Auto, pick: Pick) -> Result<String, String> {
-    let (champ, msg, save, rewrite) = {
+/// a new build also moves a rune page not picked by hand to the build's suggestion (applied
+/// again if lock-in applied the OP.GG page). A rune page or spells update the OP.GG page among
+/// the recommended pages and go to the client (see `push_pick`).
+fn select_meta(shared: &Shared, lcu: &Lcu, auto: &mut Auto, pick: Pick) -> Result<String, String> {
+    let (champ, msg, save, runes_moved) = {
         let mut s = shared.snap.lock();
         let m = s.meta.as_mut().ok_or("no OP.GG build loaded")?;
         let Some(Ok(b)) = &m.build else { return Err("no OP.GG build loaded".into()) };
         let missing = || "no such OP.GG option".to_string();
-        let (msg, rewrite) = match pick {
+        let mut runes_moved = false;
+        let msg = match pick {
             Pick::Build(i) => {
                 let c = b.cores.get(i).ok_or_else(missing)?;
-                m.picks.build = i;
-                (format!("OP.GG {} build selected", c.label()), true)
+                runes_moved = b.pick_build(&mut m.picks, i);
+                format!("OP.GG {} build selected", c.label())
             }
             Pick::Runes(i) => {
                 b.runes.get(i).ok_or_else(missing)?;
                 m.picks.runes = i;
-                ("OP.GG rune page selected".to_string(), false)
+                m.picks.runes_picked = true;
+                "OP.GG rune page selected".to_string()
             }
             Pick::Spells(i) => {
                 b.spells.get(i).ok_or_else(missing)?;
                 m.picks.spells = i;
-                ("OP.GG summoner spells selected".to_string(), false)
+                "OP.GG summoner spells selected".to_string()
             }
             Pick::Skills(i) => {
                 b.skills.get(i).ok_or_else(missing)?;
                 m.picks.skills = i;
-                ("OP.GG skill order selected".to_string(), true)
+                "OP.GG skill order selected".to_string()
             }
         };
         let save = (b.query.mode, b.saved(m.picks));
         let champ = m.champion_id;
         sync_meta_page(&mut s);
-        (champ, msg, save, rewrite)
+        (champ, msg, save, runes_moved)
     };
     // Losing remembered picks is harmless: the best options are the default.
     let _ = meta::save_picks(champ, save.0, save.1);
-    let written = rewrite && auto.applied == Some(champ) && auto.lockin.is_none() && shared.settings.lock().auto_item_set;
-    if !written {
+    let prefs = shared.settings.lock().clone();
+    match pick {
+        Pick::Runes(_) => push_pick(shared, lcu, champ, prefs.auto_runes, &mut auto.runes_set, apply_runes, msg),
+        Pick::Spells(_) => push_pick(shared, lcu, champ, prefs.auto_spells, &mut auto.spells_set, apply_spells, msg),
+        Pick::Build(_) | Pick::Skills(_) => {
+            let mut msg = msg;
+            let locked_in = auto.applied == Some(champ) && auto.lockin.is_none();
+            if locked_in && prefs.auto_item_set {
+                let meta = lockin_meta(shared.snap.lock().meta.as_ref(), champ, META_WAIT).flatten();
+                let mode = meta.as_ref().and_then(|r| r.as_ref().ok()).map(|(b, _)| b.query.mode);
+                lock_in_item_set(shared, champ, meta, mode);
+                msg += "; item set rewritten";
+            }
+            // The client holds the OP.GG page lock-in applied, unless you set runes yourself since.
+            let opgg_runes = prefs.auto_runes && prefs.page_source == PageSource::OpGg && prefs.meta_builds;
+            if runes_moved && locked_in && opgg_runes && auto.runes_set != Some(champ) {
+                match apply_opgg(shared, lcu, champ, apply_runes) {
+                    Some(Ok(_)) => msg += "; suggested rune page applied",
+                    Some(Err(e)) => return Err(format!("{msg}, but {e}")),
+                    None => {}
+                }
+            }
+            Ok(msg)
+        }
+    }
+}
+
+type ApplyPage = fn(&Shared, &Lcu, usize, &ChampSelect) -> Result<String, String>;
+
+/// Sets a rune page or spells just picked in the OP.GG panel in the client, before or after
+/// lock-in, when riftlite sets them on lock-in (`auto_on`) or already set them for `champ`
+/// (`set_for`). Nothing happens outside champ select or once you are on another champion.
+fn push_pick(
+    shared: &Shared,
+    lcu: &Lcu,
+    champ: i64,
+    auto_on: bool,
+    set_for: &mut Option<i64>,
+    apply: ApplyPage,
+    msg: String,
+) -> Result<String, String> {
+    if !auto_on && *set_for != Some(champ) {
         return Ok(msg);
     }
-    let meta = lockin_meta(shared.snap.lock().meta.as_ref(), champ, META_WAIT).flatten();
-    let mode = meta.as_ref().and_then(|r| r.as_ref().ok()).map(|(b, _)| b.query.mode);
-    lock_in_item_set(shared, champ, meta, mode);
-    Ok(format!("{msg}; item set rewritten"))
+    match apply_opgg(shared, lcu, champ, apply) {
+        None => Ok(msg),
+        Some(r) => {
+            let applied = r.map_err(|e| format!("{msg}, but {e}"))?;
+            *set_for = Some(champ);
+            Ok(format!("{msg}; {applied}"))
+        }
+    }
+}
+
+/// Applies the OP.GG page among the recommended pages with `apply`; `None` outside champ select
+/// or once you are on another champion than `champ`.
+fn apply_opgg(shared: &Shared, lcu: &Lcu, champ: i64, apply: ApplyPage) -> Option<Result<String, String>> {
+    let cs = shared.snap.lock().champ_select.clone();
+    let cs = cs.filter(|cs| cs.my_champion() == Some(champ))?;
+    let page = shared.snap.lock().rec_pages.iter().position(|p| p.label.starts_with(OPGG_LABEL));
+    Some(page.ok_or_else(|| "OP.GG has no page for this pick".to_string()).and_then(|i| apply(shared, lcu, i, &cs)))
 }
 
 fn apply_runes(shared: &Shared, lcu: &Lcu, i: usize, cs: &ChampSelect) -> Result<String, String> {
@@ -1180,8 +1245,20 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
     };
     let lcu = &c.lcu;
     let r: Result<String, String> = match a {
-        Action::ApplyRunes(i) => with_champ_select(shared, |cs| apply_runes(shared, lcu, i, cs)),
-        Action::ApplySpells(i) => with_champ_select(shared, |cs| apply_spells(shared, lcu, i, cs)),
+        Action::ApplyRunes(i) => with_champ_select(shared, |cs| {
+            let r = apply_runes(shared, lcu, i, cs);
+            if r.is_ok() {
+                st.auto.runes_set = cs.my_champion();
+            }
+            r
+        }),
+        Action::ApplySpells(i) => with_champ_select(shared, |cs| {
+            let r = apply_spells(shared, lcu, i, cs);
+            if r.is_ok() {
+                st.auto.spells_set = cs.my_champion();
+            }
+            r
+        }),
         Action::BenchSwap(champ) => {
             let name = shared.snap.lock().data.champion_name(champ);
             lcu.bench_swap(champ).map(|_| format!("Swapped to {name}")).map_err(|e| format!("Bench swap: {e}"))
@@ -1283,7 +1360,7 @@ fn run_action(shared: &Shared, st: &mut State, a: Action) {
             .spectate(&puuid)
             .map(|_| "Spectator requested; the League client starts it".to_string())
             .map_err(|e| format!("Spectate: {e} (the player must be in a game that can be spectated)")),
-        Action::SelectMeta(pick) => select_meta(shared, &st.auto, pick),
+        Action::SelectMeta(pick) => select_meta(shared, lcu, &mut st.auto, pick),
         Action::RetryMeta => {
             let mut s = shared.snap.lock();
             match s.meta.as_mut() {
@@ -1815,7 +1892,7 @@ mod tests {
 
     fn state(build: Option<Result<MetaBuild, String>>) -> MetaState {
         let q = Query { mode: "ranked", position: "ADC" };
-        MetaState { champion_id: 145, query: Ok(q), build, picks: Picks { build: 0, runes: 0, spells: 0, skills: 1 } }
+        MetaState { champion_id: 145, query: Ok(q), build, picks: Picks { skills: 1, ..Picks::default() } }
     }
 
     #[test]
@@ -1865,5 +1942,49 @@ mod tests {
         assert_eq!(probable_opponent(&cs, &positions, "MIDDLE"), Some(7));
         // No position of your own: no opponent.
         assert_eq!(probable_opponent(&cs, &positions, ""), None);
+    }
+
+    #[test]
+    fn opgg_pick_goes_to_the_client_when_auto_on_or_already_set_for_that_champion() {
+        let shared = Shared {
+            snap: Mutex::new(Snapshot::default()),
+            refresh: AtomicBool::new(false),
+            overlay_hidden: AtomicBool::new(false),
+            overlay_edit: AtomicBool::new(false),
+            overlay_layout_dirty: AtomicBool::new(false),
+            game_focused: AtomicBool::new(false),
+            quitting: AtomicBool::new(false),
+            settings: Mutex::new(Settings::default()),
+            actions: Mutex::new(Vec::new()),
+        };
+        let creds = lcu::Creds { pid: 0, port: 1, password: String::new(), client_exe: None, source: "test" };
+        let lcu = Lcu::new(net::public_agent(), &creds);
+        // Stands in for `apply_spells`: reports which recommended page it was given.
+        fn apply(shared: &Shared, _: &Lcu, i: usize, _: &ChampSelect) -> Result<String, String> {
+            Ok(format!("applied {}", shared.snap.lock().rec_pages[i].label))
+        }
+        let page = |label: String| RecPage { position: "BOTTOM".into(), primary_style: 0, sub_style: 0, perks: vec![], spells: [4, 7], label };
+        let in_cs = |champion_id| ChampSelect { my_team: vec![lcu::CsPlayer { champion_id, is_me: true, ..Default::default() }], ..Default::default() };
+        {
+            let mut s = shared.snap.lock();
+            s.rec_pages = vec![page("Riot".into()), page(format!("{OPGG_LABEL} ranked"))];
+            s.champ_select = Some(in_cs(145));
+        }
+        let push = |auto_on, set_for: &mut Option<i64>| push_pick(&shared, &lcu, 145, auto_on, set_for, apply, "picked".into());
+        // Auto-apply off and nothing set for this champion yet: only the panel changes.
+        let mut set = None;
+        assert_eq!(push(false, &mut set), Ok("picked".into()));
+        assert_eq!(set, None);
+        // Auto-apply on (before or after lock-in): the OP.GG page, not Riot's, goes to the client.
+        assert_eq!(push(true, &mut set), Ok(format!("picked; applied {OPGG_LABEL} ranked")));
+        assert_eq!(set, Some(145));
+        // Already set for this champion (by button or an earlier pick): applied with auto-apply off.
+        assert_eq!(push(false, &mut set), Ok(format!("picked; applied {OPGG_LABEL} ranked")));
+        // Set for another champion, or you are on another champion now, or champ select ended: left alone.
+        assert_eq!(push(false, &mut Some(62)), Ok("picked".into()));
+        shared.snap.lock().champ_select = Some(in_cs(62));
+        assert_eq!(push(true, &mut set), Ok("picked".into()));
+        shared.snap.lock().champ_select = None;
+        assert_eq!(push(true, &mut set), Ok("picked".into()));
     }
 }
