@@ -24,9 +24,18 @@ windows = { version = "0.62", features = ["Foundation", "Foundation_Collections"
 # Windows resources: the .exe icon and version info (build-time only).
 embed-resource = "3"
 
+# Shipped build. Fat LTO keeps the .exe small; codegen-units = 16 instead of 1 lets the
+# pre-LTO compile of riftlite itself run in parallel (rebuild 108 s -> 77 s for ~1% size).
 [profile.release]
 opt-level = "s"
 lto = true
-codegen-units = 1
+codegen-units = 16
 strip = true
 panic = "abort"
+
+# Local iteration: same opt-level, strip and panic as release, without whole-program LTO
+# and with incremental compilation. Larger .exe; `cargo build --profile fast`.
+[profile.fast]
+inherits = "release"
+lto = false
+incremental = true
