@@ -155,6 +155,28 @@ impl ItemWatch {
 }
 
 impl LiveGame {
+    /// The mode as League names it in the client ("ARAM Mayhem" for `KIWI`, …).
+    pub fn mode_name(&self) -> String {
+        match self.mode.as_str() {
+            "CLASSIC" if self.map == 11 => "Summoner's Rift".into(),
+            "CLASSIC" => "Classic".into(),
+            "KIWI" => "ARAM Mayhem".into(),
+            "ARAM" => "ARAM".into(),
+            "URF" | "ARURF" => "URF".into(),
+            "CHERRY" => "Arena".into(),
+            "SWIFTPLAY" => "Swiftplay".into(),
+            "ONEFORALL" => "One for All".into(),
+            "PRACTICETOOL" => "Practice Tool".into(),
+            "STRAWBERRY" => "Swarm".into(),
+            "NEXUSBLITZ" => "Nexus Blitz".into(),
+            "TUTORIAL" | "TUTORIAL_MODULE_1" | "TUTORIAL_MODULE_2" | "TUTORIAL_MODULE_3" => "Tutorial".into(),
+            m => {
+                let mut c = m.chars();
+                c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c.flat_map(char::to_lowercase)).collect())
+            }
+        }
+    }
+
     pub fn me(&self) -> Option<&LivePlayer> {
         self.players.iter().find(|p| p.is_me)
     }

@@ -96,7 +96,7 @@ impl Tab {
                 None => "Builds, runes and picks while you draft".into(),
             },
             Tab::Live => match &s.live {
-                Some(g) => format!("{} · {}", g.mode, stats::mmss(g.game_time)),
+                Some(g) => format!("{} · {}", g.mode_name(), stats::mmss(g.game_time)),
                 None => "Live Client Data during your game".into(),
             },
             Tab::PostGame => "Your last game next to your usual games".into(),
@@ -222,8 +222,13 @@ impl App {
         if placed {
             self.save_settings();
         }
-        let frame = s.augments.as_ref().map(|o| o.frame);
-        // The augment-card viewport covers the game; it must stay click-through.
+        // Augment cards, or a skill point to spend with the HUD scale known: cover the game.
+        let level_up = !edit
+            && self.settings.overlay_sections.skill_hint
+            && s.hud_scale.is_some()
+            && overlay_game(&s.live).is_some_and(|g| overlay::level_up_hint(s, g, self.shared.style_pick.lock().as_ref()).is_some());
+        let frame = s.augments.as_ref().map(|o| o.frame).or_else(|| level_up.then(crate::win::league_game_frame).flatten());
+        // The viewport over the game must stay click-through.
         Some(OverlayDecl { frame, edit: edit && frame.is_none(), pos, size: self.settings.overlay_size })
     }
 
@@ -260,7 +265,8 @@ fn loading_screen(s: &Snapshot) -> bool {
 /// How the overlay viewport is declared; a change needs a main pass to redeclare it.
 #[derive(Clone, Copy, PartialEq)]
 struct OverlayDecl {
-    /// Augment cards are up: the viewport covers this game client area (physical pixels).
+    /// Augment cards or the level-up ring are up: the viewport covers this game client
+    /// area (physical pixels).
     frame: Option<[i32; 4]>,
     /// Edit mode: not click-through, dragged and resized by the user.
     edit: bool,

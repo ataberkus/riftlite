@@ -196,6 +196,9 @@ pub struct Snapshot {
     /// `[General] WindowMode` from the game's `Config/game.cfg`: 0 fullscreen, 1 windowed,
     /// 2 borderless; `None` when unreadable.
     pub window_mode: Option<i64>,
+    /// `[HUD] GlobalScale` (the game's HUD scale, 0–1) from `Config/game.cfg`; places the
+    /// overlay's level-up highlight. `None` when unreadable.
+    pub hud_scale: Option<f32>,
     /// LP after ranked games riftlite saw end (`lp.json`).
     pub lp_log: Vec<LpEntry>,
     /// Ranked games still restricted by the leaver-buster system; 0 when none or unknown.
@@ -276,6 +279,7 @@ impl Default for Snapshot {
             champion_access: Vec::new(),
             post_game: None,
             window_mode: None,
+            hud_scale: None,
             lp_log: Vec::new(),
             ranked_restriction: 0,
             queue_penalty: None,
@@ -520,10 +524,13 @@ fn poll_loop(shared: &Shared, ctx: &eframe::egui::Context) {
             let installs = riot::scan_installs(shared.settings.lock().league_override().as_deref());
             changed |= set(&mut shared.snap.lock().installs, installs);
             let root = shared.snap.lock().league_root();
-            let mode = root.as_deref().and_then(window_mode);
+            let cfg = root.as_deref().and_then(|r| std::fs::read_to_string(r.join("Config").join("game.cfg")).ok());
+            let mode = cfg.as_deref().and_then(|c| cfg_value(c, "General", "WindowMode")).and_then(|v| v.parse().ok());
+            let hud_scale = cfg.as_deref().and_then(|c| cfg_value(c, "HUD", "GlobalScale")).and_then(|v| v.parse().ok());
             let replay_api = root.as_deref().and_then(replay::api_enabled);
             let mut s = shared.snap.lock();
             changed |= set(&mut s.window_mode, mode);
+            changed |= set(&mut s.hud_scale, hud_scale);
             changed |= set(&mut s.replay_api, replay_api);
             drop(s);
             last_install_scan = Some(Instant::now());
@@ -1912,15 +1919,14 @@ fn clock(t: f64) -> String {
     format!("{}:{:02}", t / 60, t % 60)
 }
 
-/// `[General] WindowMode` of the game's settings file.
-fn window_mode(league_root: &std::path::Path) -> Option<i64> {
-    let cfg = std::fs::read_to_string(league_root.join("Config").join("game.cfg")).ok()?;
-    let mut general = false;
-    for line in cfg.lines().map(str::trim) {
-        if line.starts_with('[') {
-            general = line.eq_ignore_ascii_case("[General]");
-        } else if let Some(v) = line.strip_prefix("WindowMode=").filter(|_| general) {
-            return v.trim().parse().ok();
+/// `key` under `[section]` of the game's settings file (`Config/game.cfg`).
+fn cfg_value<'a>(cfg: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let mut inside = false;
+    for line in cfg.lines().map(|l| l.trim_start_matches('\u{feff}').trim()) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = name.eq_ignore_ascii_case(section);
+        } else if let Some(v) = line.strip_prefix(key).and_then(|l| l.strip_prefix('=')).filter(|_| inside) {
+            return Some(v.trim());
         }
     }
     None
@@ -2027,5 +2033,13 @@ mod tests {
         assert_eq!(push(true, &mut set), Ok("picked".into()));
         shared.snap.lock().champ_select = None;
         assert_eq!(push(true, &mut set), Ok("picked".into()));
+    }
+
+    #[test]
+    fn game_cfg_values_come_from_their_own_section() {
+        let cfg = "\u{feff}[General]\r\nWindowMode=2\r\nWindowModeX=9\r\n[HUD]\r\nGlobalScale=0.6200\r\n[Other]\r\nGlobalScale=1\r\n";
+        assert_eq!(cfg_value(cfg, "General", "WindowMode"), Some("2"));
+        assert_eq!(cfg_value(cfg, "HUD", "GlobalScale"), Some("0.6200"));
+        assert_eq!(cfg_value(cfg, "General", "GlobalScale"), None);
     }
 }

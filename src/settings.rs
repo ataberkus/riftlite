@@ -43,7 +43,8 @@ pub struct OverlaySections {
     pub kills_gold: bool,
     /// Item value, team and lane.
     pub item_diff: bool,
-    /// "Level up X" from Blitz's skill order for the playstyle shown, else your last games on the champion.
+    /// "Level up X" from Blitz's skill order for the playstyle shown, else your last games on
+    /// the champion, and a ring around that ability's level-up button in the game's HUD.
     pub skill_hint: bool,
     /// The Blitz playstyle picked in the Live tab or the one you are building (completed items,
     /// max order), or the OP.GG build picked in champ select; items you own outlined.

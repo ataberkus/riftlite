@@ -89,7 +89,7 @@ impl App {
                      (else the one you are building) starting items, summoner spells, build order, completed, situational and \
                      boots items and the skill order with the next point to take; in ARAM Mayhem also Mayhem items and the best \
                      augments of each rarity on your champion. The overlay shows that playstyle's items and max order, and its \
-                     \"level up\" hint follows Blitz's skill order. Blitz has tables for ranked solo/duo by lane (used for every \
+                     \"level up\" hint (and the ring around the game's level-up button) follows Blitz's skill order. Blitz has tables for ranked solo/duo by lane (used for every \
                      Summoner's Rift game), ARAM (also used for ARAM Mayhem) and URF; in other modes, or off, the OP.GG build \
                      picked in champ select is used. Only the champion id, queue and lane are sent to data.v2.iesdev.com (in \
                      champ select once you pick, and in game); augment icons come from raw.communitydragon.org.",

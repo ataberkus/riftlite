@@ -254,7 +254,8 @@ impl App {
         if sample.is_some() {
             status_msg(ui, true, "Sample game: the overlay is in edit mode and no game is running.");
         }
-        live_header(ui, &g, s, game);
+        let pick = self.shared.style_pick.lock().clone();
+        live_header(ui, &g, s, game, pick.as_ref());
         if self.settings.overlay_enabled && s.window_mode == Some(0) {
             ui.add_space(6.0);
             error(ui, FULLSCREEN_WARNING);
@@ -559,8 +560,56 @@ pub(super) fn loadout(ui: &mut Ui, g: &Gfx, p: &LivePlayer, size: f32) {
     });
 }
 
-/// Your champion, level, timer and the headline numbers.
-fn live_header(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: &LiveGame) {
+/// Q, W, E, R with their ranks; the one to level next is lit in gold, as the overlay rings
+/// the game's own level-up button.
+fn ability_bar(ui: &mut Ui, game: &LiveGame, next: Option<&(char, String)>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (slot, key) in KEYS.into_iter().enumerate() {
+            let rank = game.abilities[slot].max(0) as usize;
+            let max = if slot == 3 { 3 } else { 5 }.max(rank);
+            let lit = next.is_some_and(|(k, _)| *k == key);
+            let (r, _) = ui.allocate_exact_size(vec2(40.0, 44.0), Sense::hover());
+            let p = ui.painter();
+            let tile = eframe::egui::Rect::from_min_size(r.min, vec2(40.0, 34.0));
+            let (fill, stroke) = if lit { (alpha(SOON, 0.16), Stroke::new(1.5, SOON)) } else { (alpha(TEXT, 0.04), Stroke::new(1.0, alpha(TEXT, 0.10))) };
+            p.rect(tile, 7, fill, stroke, StrokeKind::Inside);
+            let color = if lit { SOON } else if rank > 0 { TEXT } else { FAINT };
+            p.text(tile.center(), Align2::CENTER_CENTER, key, display(17.0), color);
+            // One pip per rank, filled up to the current one.
+            let gap = 6.0;
+            let x0 = tile.center().x - gap * (max as f32 - 1.0) / 2.0;
+            for i in 0..max {
+                let c = eframe::egui::pos2(x0 + gap * i as f32, r.max.y - 4.0);
+                if i < rank {
+                    p.circle_filled(c, 2.2, if lit { SOON } else { CYAN });
+                } else {
+                    p.circle_stroke(c, 2.0, Stroke::new(1.0, alpha(TEXT, 0.25)));
+                }
+            }
+        }
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            match next {
+                Some((k, source)) => {
+                    ui.horizontal(|ui| {
+                        icon(ui, Icon::Bolt, 14.0, SOON);
+                        ui.label(RichText::new(format!("Level up {k}")).font(semibold(14.0)).color(SOON));
+                    });
+                    ui.label(RichText::new(format!("{source} · ringed above your abilities in game")).size(11.5).color(MUTED));
+                }
+                None => {
+                    ui.label(RichText::new("No skill point to spend").font(semibold(13.0)).color(BODY));
+                    ui.label(RichText::new("The next one is lit here and ringed in game").size(11.5).color(MUTED));
+                }
+            }
+        });
+    });
+}
+
+/// Your champion, level, timer, the headline numbers and the abilities to level.
+fn live_header(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: &LiveGame, pick: Option<&(i64, String)>) {
     card(ui, |ui| {
         let me = game.me();
         ui.horizontal(|ui| {
@@ -573,13 +622,13 @@ fn live_header(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: &LiveGame) {
                         ui.label(RichText::new(&me.champion).font(display(28.0)).color(TEXT));
                         ui.horizontal(|ui| {
                             pill(ui, format!("Level {}", game.my_level), CYAN);
-                            pill(ui, &game.mode, MUTED);
+                            pill(ui, game.mode_name(), MUTED);
                         });
                     });
                 }
                 None => {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&game.mode).font(display(28.0)).color(TEXT));
+                        ui.label(RichText::new(game.mode_name()).font(display(28.0)).color(TEXT));
                         if game.mode == "TFT" {
                             ui.label(RichText::new(format!("TFT · level {} · {:.0} gold", game.my_level, game.my_gold)).color(BODY));
                         }
@@ -638,13 +687,17 @@ fn live_header(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: &LiveGame) {
                 stat_tile(ui, "Lane", signed(d), diff_color(d), Some(&format!("you {} vs {} {}", kilo(me.item_gold()), opp.champion, kilo(opp.item_gold()))));
             }
         });
-        if let Some(h) = &s.skill_hint {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                icon(ui, Icon::Bolt, 14.0, SOON);
-                ui.label(RichText::new(format!("Skill order this game: {} · your last game on {}: {}", h.current, me.champion, h.recorded)).color(BODY));
-            });
-        }
+        ui.add_space(8.0);
+        inset_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            overline(ui, "Abilities");
+            ui.add_space(2.0);
+            ability_bar(ui, game, overlay::level_up_hint(s, game, pick).as_ref());
+            if let Some(h) = &s.skill_hint {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("Skill order this game: {} · your last game on {}: {}", h.current, me.champion, h.recorded)).size(11.5).color(BODY));
+            }
+        });
     });
 }
 
@@ -777,10 +830,10 @@ impl App {
                         ui.label(RichText::new(max).font(display(18.0)).color(TEXT));
                         ui.add_space(8.0);
                         ui.label(RichText::new(sk.record.text()).size(11.5).color(MUTED));
-                        if let Some(k) = sk.next(game.abilities, game.my_level) {
+                        if sk.next(game.abilities, game.my_level).is_some() {
                             ui.add_space(12.0);
                             icon(ui, Icon::Bolt, 13.0, SOON);
-                            ui.label(RichText::new(format!("Level up {} next", KEYS[k])).font(semibold(13.0)).color(SOON));
+                            ui.label(RichText::new("next step lit below").size(11.5).color(SOON));
                         }
                     });
                     ui.add_space(4.0);

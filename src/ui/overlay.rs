@@ -1,6 +1,7 @@
 //! The click-through in-game overlay: a separate always-on-top viewport. While ARAM
-//! Mayhem augment cards are on screen it covers the game's client area, keeps the
-//! panel where the user put it, and draws each card's tier under it.
+//! Mayhem augment cards are on screen, or a skill point waits for the level-up hint, it
+//! covers the game's client area, keeps the panel where the user put it, and draws each
+//! card's tier under it and a ring around the level-up button to press.
 //!
 //! Edit mode (Ctrl+Shift+E, tray menu, Settings) makes it clickable: drag to move, the
 //! corner grip resizes, checkboxes pick the sections. The window itself is moved and
@@ -24,6 +25,7 @@ use crate::ddragon::StaticData;
 use crate::goals::{GoalKind, Goals, Pace};
 use crate::live::{FeedEvent, ItemCallout, LiveGame, LiveItem, LivePlayer, Objective};
 use crate::settings::{OVERLAY_MIN_SIZE, OverlaySections};
+use crate::styles::KEYS;
 use crate::worker::{Shared, Snapshot};
 
 /// The overlay lists enemy ranks while the game is this young (loading screen and laning start).
@@ -34,6 +36,61 @@ const INSET: f32 = 6.0;
 const GRIP: f32 = 18.0;
 /// Edit mode's sample game uses these when you have no goals for its role.
 const SAMPLE_GOALS: Goals = Goals { cs_per_min: Some(7.0), max_deaths: Some(4), vision_per_min: Some(1.0), control_wards: None };
+
+// The level-up buttons above Q, W, E, R in the game's player-frame layout
+// (`clientstates/gameplay/ux/lol/playerframe/uibase`, patch 16.21 on CommunityDragon):
+// a 1600×1200 layout anchored at the bottom center of the client area.
+const LAYOUT_WIDTH: f32 = 1600.0;
+const LAYOUT_HEIGHT: f32 = 1200.0;
+const LEVEL_UP_LEFT: [f32; 4] = [547.0, 621.0, 695.0, 768.0];
+const LEVEL_UP_TOP: f32 = 995.0;
+const LEVEL_UP_SIZE: [f32; 2] = [58.0, 56.0];
+/// Layout units per pixel of `client height / 1200` at HUD scale 0; HUD scale 1 is 1:1.
+/// Measured in game: at 1920×1080 and HUD scale 0.62 the ability icons (74 units apart)
+/// sit 58 px apart, 0.871 × 1080 / 1200 px per unit.
+const HUD_SCALE_MIN: f32 = 0.66;
+
+/// The level-up button above ability `slot` (0 = Q … 3 = R) in physical pixels from the
+/// client area's top left, for a client area `width`×`height` and the game's HUD scale.
+pub(super) fn level_up_button(width: f32, height: f32, hud_scale: f32, slot: usize) -> Rect {
+    let unit = height / LAYOUT_HEIGHT * (HUD_SCALE_MIN + (1.0 - HUD_SCALE_MIN) * hud_scale.clamp(0.0, 1.0));
+    let left = width / 2.0 + (LEVEL_UP_LEFT[slot] - LAYOUT_WIDTH / 2.0) * unit;
+    let top = height + (LEVEL_UP_TOP - LAYOUT_HEIGHT) * unit;
+    Rect::from_min_size(pos2(left, top), vec2(LEVEL_UP_SIZE[0], LEVEL_UP_SIZE[1]) * unit)
+}
+
+/// The ability to level next while a point is unspent: Blitz's order for the playstyle
+/// shown, else your own last games on the champion; with where the order comes from.
+pub(super) fn level_up_hint(s: &Snapshot, game: &LiveGame, pick: Option<&(i64, String)>) -> Option<(char, String)> {
+    let me = game.me()?;
+    if let Some((k, style)) = blitz_skill_hint(s, game, pick) {
+        return Some((k, format!("Blitz {style} order")));
+    }
+    s.skill_hint.as_ref().and_then(|h| h.next).map(|k| (k, format!("your last {} order", me.champion)))
+}
+
+/// A pulsing ring around the level-up button `button` (points) and a "NEXT" tag above it.
+fn level_up_highlight(ui: &Ui, button: Rect, key: char) {
+    let p = ui.painter();
+    let t = ui.input(|i| i.time) as f32;
+    let pulse = 0.65 + 0.35 * (t * std::f32::consts::TAU / 1.2).sin().abs();
+    let r = (button.width() * 0.12) as u8;
+    for (grow, width, a) in [(7.0, 6.0, 0.10), (4.0, 3.0, 0.25)] {
+        p.rect_stroke(button.expand(grow), r + grow as u8, Stroke::new(width, alpha(SOON, a * pulse)), StrokeKind::Middle);
+    }
+    p.rect_stroke(button.expand(1.5), r, Stroke::new(2.5, alpha(SOON, pulse)), StrokeKind::Middle);
+    // The tag: "NEXT Q" in a dark pill, with a notch pointing at the button.
+    let size = (button.height() * 0.30).clamp(10.0, 16.0);
+    let galley = p.layout_no_wrap(format!("NEXT {key}"), semibold(size), SOON);
+    let pad = vec2(size * 0.55, size * 0.25);
+    let bottom = button.top() - 9.0;
+    let tag = Rect::from_center_size(pos2(button.center().x, bottom - (galley.size().y + 2.0 * pad.y) / 2.0), galley.size() + 2.0 * pad);
+    p.rect(tag, tag.height() / 2.0, Color32::from_rgba_unmultiplied(10, 13, 19, 235), Stroke::new(1.5, alpha(SOON, pulse)), StrokeKind::Inside);
+    let notch = [pos2(tag.center().x - 5.0, tag.bottom()), pos2(tag.center().x + 5.0, tag.bottom()), pos2(tag.center().x, tag.bottom() + 5.0)];
+    p.add(egui::Shape::convex_polygon(notch.to_vec(), alpha(SOON, pulse), Stroke::NONE));
+    p.galley(tag.center() - galley.size() / 2.0, galley, SOON);
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+}
 
 impl App {
     /// Deferred viewport: it has its own callback and is repainted by the
@@ -71,8 +128,8 @@ impl App {
         }
         // egui-winit gives every undecorated window a DWM drop shadow on Windows, and no
         // builder option turns it off. Over the game that shadow outlines the otherwise
-        // invisible viewport (the panel box, or the whole client area while augment cards
-        // are up), so the overlay callback switches it off once per window.
+        // invisible viewport (the panel box, or the whole client area while it covers the
+        // game), so the overlay callback switches it off once per window.
         let shadow_off = Id::unique("riftlite-overlay-shadow-off");
         if created {
             ctx.data_mut(|d| d.remove::<bool>(shadow_off));
@@ -136,6 +193,14 @@ impl App {
             // Badges only once the viewport was declared over this exact frame.
             if let Some(offer) = snap.augments.as_ref().filter(|o| Some(o.frame) == decl.frame) {
                 augment_badges(ui, offer, ppp);
+            }
+            // The level-up ring, over the game's own button.
+            if let (Some([_, _, w, h]), Some(scale), Some(game)) = (decl.frame, snap.hud_scale, live.filter(|_| sections.skill_hint))
+                && let Some(slot) = level_up_hint(&snap, game, pick.as_ref()).and_then(|(k, _)| KEYS.iter().position(|&x| x == k))
+            {
+                let px = level_up_button(w as f32, h as f32, scale, slot);
+                let button = Rect::from_min_max((px.min.to_vec2() / ppp).to_pos2(), (px.max.to_vec2() / ppp).to_pos2());
+                level_up_highlight(ui, button, KEYS[slot]);
             }
         });
     }
@@ -322,14 +387,7 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
     let Some(me) = game.me() else { return };
     let mut above = show.clock;
     // Blitz's skill order for the playstyle shown, else your own last games on the champion.
-    let hint = if sample {
-        Some(('Q', "Blitz AP order".to_string()))
-    } else if let Some((k, style)) = blitz_skill_hint(s, game, pick) {
-        Some((k, format!("Blitz {style} order")))
-    } else {
-        s.skill_hint.as_ref().and_then(|h| h.next).map(|k| (k, format!("your last {} order", me.champion)))
-    }
-    .filter(|_| show.skill_hint);
+    let hint = if sample { Some(('Q', "Blitz AP order".to_string())) } else { level_up_hint(s, game, pick) }.filter(|_| show.skill_hint);
     let goals = if show.goals { overlay_goals(s, game, me, sample) } else { Vec::new() };
     if show.kda || !goals.is_empty() || show.kills_gold || show.item_diff || hint.is_some() {
         separate(ui, &mut above);
@@ -672,4 +730,25 @@ pub(super) fn sample_game(data: &StaticData) -> LiveGame {
     // Some vision so the sample goals show a rate.
     game.players[0].ward_score = 11.0;
     game
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_up_buttons_sit_over_the_measured_hud() {
+        // A 1920×1080 game at HUD scale 0.62: the ability icons' gold tops start at x 760
+        // (Q), 818 (W), 876 (E) and y 965 (layout x 545/619/693, y 1054).
+        let unit = 58.0 / 74.0;
+        for (slot, icon_left) in [(0, 760.0), (1, 818.0), (2, 876.0)] {
+            let b = level_up_button(1920.0, 1080.0, 0.62, slot);
+            assert!((b.left() - (icon_left + 2.0 * unit)).abs() < 1.0, "slot {slot}: {b:?}");
+            assert!(b.bottom() < 965.0 && b.bottom() > 960.0, "slot {slot}: {b:?}");
+        }
+        // Twice the resolution doubles every distance from the bottom center.
+        let (a, b) = (level_up_button(1920.0, 1080.0, 0.62, 3), level_up_button(3840.0, 2160.0, 0.62, 3));
+        assert!((b.left() - 1920.0 - 2.0 * (a.left() - 960.0)).abs() < 0.01);
+        assert!((b.top() - 2160.0 - 2.0 * (a.top() - 1080.0)).abs() < 0.01);
+    }
 }
