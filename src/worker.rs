@@ -228,6 +228,9 @@ pub struct Snapshot {
     pub augments: Option<Offer>,
     /// Why augment tiers are missing or incomplete during a Mayhem game.
     pub augment_error: Option<String>,
+    /// Blitz's builds per playstyle for your champion in the live game; `None` outside a game,
+    /// in modes Blitz has no table for, or with the setting off.
+    pub styles: Option<Result<crate::styles::StyleBuilds, String>>,
     pub skill_hint: Option<SkillHint>,
     pub lookup: Option<Result<Lookup, String>>,
     pub busy: Option<&'static str>,
@@ -290,6 +293,7 @@ impl Default for Snapshot {
             live: None,
             augments: None,
             augment_error: None,
+            styles: None,
             skill_hint: None,
             lookup: None,
             busy: None,
@@ -322,6 +326,9 @@ pub struct Shared {
     /// Set by the tray menu's Quit; otherwise the window's close button only hides it to the tray.
     pub quitting: AtomicBool,
     pub settings: Mutex<Settings>,
+    /// Blitz playstyle picked in the Live tab: champion id and the style's label. The overlay
+    /// and the skill hint follow it; not persisted.
+    pub style_pick: Mutex<Option<(i64, String)>>,
     actions: Mutex<Vec<Action>>,
 }
 
@@ -351,6 +358,7 @@ pub fn spawn(ctx: eframe::egui::Context, settings: Settings) -> Arc<Shared> {
         game_focused: AtomicBool::new(false),
         quitting: AtomicBool::new(false),
         settings: Mutex::new(settings),
+        style_pick: Mutex::new(None),
         actions: Mutex::new(Vec::new()),
     });
     let s = shared.clone();
@@ -376,7 +384,8 @@ pub fn spawn(ctx: eframe::egui::Context, settings: Settings) -> Arc<Shared> {
             move || poll_loop(&s, &ctx)
         })
         .expect("spawn poll thread");
-    crate::augments::spawn(shared.clone(), ctx);
+    crate::augments::spawn(shared.clone(), ctx.clone());
+    crate::styles::spawn(shared.clone(), ctx);
     shared
 }
 
@@ -1956,6 +1965,7 @@ mod tests {
             game_focused: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
             settings: Mutex::new(Settings::default()),
+            style_pick: Mutex::new(None),
             actions: Mutex::new(Vec::new()),
         };
         let creds = lcu::Creds { pid: 0, port: 1, password: String::new(), client_exe: None, source: "test" };

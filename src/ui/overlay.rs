@@ -13,7 +13,7 @@ use eframe::egui::{
 
 use super::live_tab::{
     build_items, counter_items, diff_color, feed_color, goal_pace, goal_value, item_color, loadout, note_champions, objective_text, pace_color,
-    picked_build, role_goals, scouts,
+    picked_build, role_goals, scouts, style_builds, active_style, blitz_skill_hint,
 };
 use super::stats::{cs_baseline, kilo, mmss, signed};
 use super::theme::*;
@@ -91,6 +91,7 @@ impl App {
                 ctx.data_mut(|d| d.remove::<bool>(moved_id()));
             }
             let sections = shared.settings.lock().overlay_sections;
+            let pick = shared.style_pick.lock().clone();
             let snap = shared.snap.lock();
             let live = overlay_game(&snap.live);
             let loading = loading_screen(&snap);
@@ -126,7 +127,7 @@ impl App {
                             ui.set_min_height(ui.available_height());
                             edit_bar(ui, &shared, sample.is_some());
                         }
-                        overlay_contents(ui, &g, &snap, game, sections, sample.is_some());
+                        overlay_contents(ui, &g, &snap, game, sections, sample.is_some(), pick.as_ref());
                     });
                 if let Some(area) = move_area {
                     move_and_resize(ui, &area, panel_rect);
@@ -226,7 +227,7 @@ fn edit_bar(ui: &mut Ui, shared: &Shared, sample: bool) {
     rule(ui);
 }
 
-fn augment_tier_color(t: Option<Tier>) -> Color32 {
+pub(super) fn augment_tier_color(t: Option<Tier>) -> Color32 {
     match t {
         Some(Tier::S) => SOON,
         Some(Tier::A) => ACCENT,
@@ -236,24 +237,34 @@ fn augment_tier_color(t: Option<Tier>) -> Color32 {
     }
 }
 
-/// One tier badge under each offered card ("?" when Blitz has no tier for it).
+/// One tier badge under each offered card ("?" when Blitz has no tier for it). Once your
+/// champion's tiers are loaded the large badge is the tier on your champion ("–" when Blitz
+/// does not rate the augment on it) and a small one left of it the tier over all champions.
 fn augment_badges(ui: &Ui, offer: &Offer, ppp: f32) {
     let painter = ui.painter();
     let size = offer.badge_size() / ppp;
     let origin = Pos2::new(offer.frame[0] as f32, offer.frame[1] as f32);
-    for card in &offer.cards {
-        let center = pos2((card.at[0] - origin.x) / ppp, (card.at[1] - origin.y) / ppp);
+    let badge = |center: Pos2, size: f32, tier: Option<Tier>, empty: &'static str| {
         let r = Rect::from_center_size(center, vec2(size, size));
-        let color = augment_tier_color(card.tier);
+        let color = augment_tier_color(tier);
         painter.rect(
             r,
             CornerRadius::same((size * 0.22) as u8),
             Color32::from_rgba_unmultiplied(10, 13, 19, 235),
-            Stroke::new(2.0, color),
+            Stroke::new(if size > 20.0 { 2.0 } else { 1.5 }, color),
             StrokeKind::Inside,
         );
-        let letter = card.tier.map_or("?", Tier::letter);
-        painter.text(center, Align2::CENTER_CENTER, letter, display(size * 0.6), color);
+        painter.text(center, Align2::CENTER_CENTER, tier.map_or(empty, Tier::letter), display(size * 0.6), color);
+    };
+    for card in &offer.cards {
+        let center = pos2((card.at[0] - origin.x) / ppp, (card.at[1] - origin.y) / ppp);
+        if offer.champion.is_some() {
+            badge(center, size, card.champion_tier, "–");
+            let small = size * 0.55;
+            badge(center - vec2(size / 2.0 + small / 2.0 + size * 0.12, 0.0), small, card.tier, "?");
+        } else {
+            badge(center, size, card.tier, "?");
+        }
     }
 }
 
@@ -286,7 +297,8 @@ fn separate(ui: &mut Ui, above: &mut bool) {
 }
 
 /// `sample`: `game` is `sample_game()`; sections fed by the snapshot get sample rows too.
-fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>, show: OverlaySections, sample: bool) {
+/// `pick`: the Blitz playstyle picked in the Live tab (champion id, label).
+fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>, show: OverlaySections, sample: bool, pick: Option<&(i64, String)>) {
     ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
     let Some(game) = game else {
         if show.clock {
@@ -298,7 +310,7 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             overlay_scouts(ui, g, s, None);
         }
         if show.build {
-            overlay_build(ui, g, s, None, &[]);
+            overlay_build(ui, g, s, None, &[], None);
         }
         return;
     };
@@ -309,7 +321,15 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
     }
     let Some(me) = game.me() else { return };
     let mut above = show.clock;
-    let hint = if sample { Some('Q') } else { s.skill_hint.as_ref().and_then(|h| h.next) }.filter(|_| show.skill_hint);
+    // Blitz's skill order for the playstyle shown, else your own last games on the champion.
+    let hint = if sample {
+        Some(('Q', "Blitz AP order".to_string()))
+    } else if let Some((k, style)) = blitz_skill_hint(s, game, pick) {
+        Some((k, format!("Blitz {style} order")))
+    } else {
+        s.skill_hint.as_ref().and_then(|h| h.next).map(|k| (k, format!("your last {} order", me.champion)))
+    }
+    .filter(|_| show.skill_hint);
     let goals = if show.goals { overlay_goals(s, game, me, sample) } else { Vec::new() };
     if show.kda || !goals.is_empty() || show.kills_gold || show.item_diff || hint.is_some() {
         separate(ui, &mut above);
@@ -375,23 +395,25 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
             }
         });
     }
-    if let Some(next) = hint {
+    if let Some((next, source)) = hint {
         ui.horizontal(|ui| {
             icon(ui, Icon::Bolt, 13.0, SOON);
-            ui.label(RichText::new(format!("Level up {next} (your last {} order)", me.champion)).font(semibold(12.0)).color(SOON));
+            ui.label(RichText::new(format!("Level up {next} ({source})")).font(semibold(12.0)).color(SOON));
         });
     }
     if show.build {
         let owned: Vec<i64> = me.items.iter().map(|it| it.id).collect();
         if sample {
             separate(ui, &mut above);
-            ui.label(RichText::new("BUILD · AP").font(semibold(9.5)).color(MUTED));
-            build_items(ui, g, &[6655, 3020, 4645, 3089, 3157, 3135], &[6655, 3020], 22.0);
+            ui.label(RichText::new("AP · 48% · 1,268 GAMES").font(semibold(9.5)).color(MUTED));
+            build_items(ui, g, &[3152, 3020, 3157, 4645, 4646, 3089], &[3152, 3020], 18.0);
+            ui.label(RichText::new("MAX Q › W › E").font(semibold(9.5)).color(BODY));
+            ui.label(RichText::new("ALSO: BRUISER").font(semibold(9.5)).color(FAINT));
         } else if let Some(champ) = g.data.champion_by_key(&me.champion_key) {
-            if picked_build(s, Some(champ)).is_some() {
+            if style_builds(s, Some(champ)).is_some() || picked_build(s, Some(champ)).is_some() {
                 separate(ui, &mut above);
             }
-            overlay_build(ui, g, s, Some(champ), &owned);
+            overlay_build(ui, g, s, Some(champ), &owned, pick);
         }
     }
     if show.counters && !game.counters.is_empty() {
@@ -487,6 +509,8 @@ fn overlay_contents(ui: &mut Ui, g: &Gfx, s: &Snapshot, game: Option<&LiveGame>,
     if show.augment_line && (game.mode == "KIWI" || sample) {
         if let Some(e) = s.augment_error.as_ref().filter(|_| !sample) {
             ui.label(RichText::new(format!("Augment tiers: {e}")).size(11.0).color(LOSS));
+        } else if let Some(champ) = s.augments.as_ref().and_then(|o| o.champion.as_deref()) {
+            ui.label(RichText::new(format!("Augment tiers: Blitz · large {champ}, small all champions")).size(11.0).color(MUTED));
         } else if s.augments.is_some() || sample {
             ui.label(RichText::new("Augment tiers: Blitz").size(11.0).color(MUTED));
         }
@@ -513,8 +537,26 @@ fn overlay_notes(s: &Snapshot, game: &LiveGame, sample: bool) -> Vec<(String, St
     notes
 }
 
-/// The OP.GG build picked in champ select for `champ`: full build in order, owned items outlined.
-fn overlay_build(ui: &mut Ui, g: &Gfx, s: &Snapshot, champ: Option<i64>, owned: &[i64]) {
+/// Blitz's build for `champ` in the playstyle picked in the Live tab, else the one you are
+/// building (completed items and max order; the other playstyles named), else the OP.GG
+/// build picked in champ select; owned items outlined.
+fn overlay_build(ui: &mut Ui, g: &Gfx, s: &Snapshot, champ: Option<i64>, owned: &[i64], pick: Option<&(i64, String)>) {
+    if let Some(b) = style_builds(s, champ) {
+        let Some((i, st)) = active_style(b, pick, owned) else { return };
+        let rate = st.record.win_rate.map(|w| format!(" · {:.0}%", w * 100.0)).unwrap_or_default();
+        let head = format!("{}{rate} · {} games", st.label(), crate::styles::thousands(st.record.games)).to_uppercase();
+        ui.label(RichText::new(head).font(semibold(9.5)).color(MUTED));
+        build_items(ui, g, &st.completed, owned, 18.0);
+        if let Some(sk) = &st.skills {
+            let max = sk.max_order().iter().map(char::to_string).collect::<Vec<_>>().join(" › ");
+            ui.label(RichText::new(format!("MAX {max}")).font(semibold(9.5)).color(BODY));
+        }
+        let others: Vec<String> = b.styles.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, o)| o.label()).collect();
+        if !others.is_empty() {
+            ui.label(RichText::new(format!("ALSO: {}", others.join(", "))).font(semibold(9.5)).color(FAINT));
+        }
+        return;
+    }
     let Some((b, sel)) = picked_build(s, champ) else { return };
     ui.label(RichText::new(format!("BUILD · {}", b.cores[sel].label())).font(semibold(9.5)).color(MUTED));
     build_items(ui, g, &b.full_build(sel, &s.data), owned, 22.0);

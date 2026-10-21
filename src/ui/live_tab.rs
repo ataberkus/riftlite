@@ -13,6 +13,7 @@ use crate::ddragon::StaticData;
 use crate::goals::{self, GoalKind, Goals, Pace, Stats};
 use crate::live::{FeedEvent, LiveGame, LivePlayer, Objective};
 use crate::meta::MetaBuild;
+use crate::styles::{KEYS, Rarity, SkillOrder, Style, StyleBuilds};
 use crate::notes;
 use crate::worker::{Action, Clip, Snapshot};
 
@@ -89,6 +90,62 @@ pub(super) fn picked_build(s: &Snapshot, champion: Option<i64>) -> Option<(&Meta
     let m = s.meta.as_ref().filter(|m| champion.is_none_or(|c| c == m.champion_id))?;
     let Some(Ok(b)) = &m.build else { return None };
     Some((b, m.picks.build.min(b.cores.len() - 1)))
+}
+
+/// Blitz's playstyle builds for `champion`, when it has any.
+pub(super) fn style_builds(s: &Snapshot, champion: Option<i64>) -> Option<&StyleBuilds> {
+    let Some(Ok(b)) = &s.styles else { return None };
+    Some(b).filter(|b| Some(b.champion_id) == champion && !b.styles.is_empty())
+}
+
+/// The Blitz style shown for `b`: the one picked in the Live tab (`pick`: champion id and
+/// label), else the one you are building.
+pub(super) fn active_style<'a>(b: &'a StyleBuilds, pick: Option<&(i64, String)>, owned: &[i64]) -> Option<(usize, &'a Style)> {
+    let label = pick.filter(|(c, _)| *c == b.champion_id).map(|(_, l)| l.as_str());
+    b.active(label, owned).map(|i| (i, &b.styles[i]))
+}
+
+/// The ability (`Q`…`R`) to level next by the active Blitz style's skill order, with the style's label.
+pub(super) fn blitz_skill_hint(s: &Snapshot, game: &LiveGame, pick: Option<&(i64, String)>) -> Option<(char, String)> {
+    let me = game.me()?;
+    let b = style_builds(s, s.data.champion_by_key(&me.champion_key))?;
+    let owned: Vec<i64> = me.items.iter().map(|it| it.id).collect();
+    let (_, st) = active_style(b, pick, &owned)?;
+    let k = st.skills.as_ref()?.next(game.abilities, game.my_level)?;
+    Some((KEYS[k], st.label()))
+}
+
+/// Blitz's 18-level skill grid: one row per ability, the level number in the cell of the
+/// ability taken there. Levels below `taken` are dimmed in; `next` (an index into the order) is highlighted.
+fn skill_grid(ui: &mut Ui, sk: &SkillOrder, taken: usize, next: Option<usize>) {
+    const CELL: f32 = 22.0;
+    const GAP: f32 = 3.0;
+    const KEY: f32 = 20.0;
+    let step = CELL + GAP;
+    let size = vec2(KEY + sk.order.len() as f32 * step, 4.0 * step - GAP);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let p = ui.painter();
+    for (row, key) in KEYS.iter().enumerate() {
+        let y = rect.top() + row as f32 * step;
+        let key_color = if row == 3 { SOON } else { TEXT };
+        p.text(eframe::egui::pos2(rect.left() + KEY / 2.0 - 2.0, y + CELL / 2.0), Align2::CENTER_CENTER, key, semibold(12.0), key_color);
+        for (i, &k) in sk.order.iter().enumerate() {
+            let cell = eframe::egui::Rect::from_min_size(eframe::egui::pos2(rect.left() + KEY + i as f32 * step, y), vec2(CELL, CELL));
+            if k != row {
+                p.rect_filled(cell, 4, alpha(BORDER, 0.6));
+                continue;
+            }
+            let (fill, text) = if Some(i) == next {
+                (SOON, Color32::BLACK)
+            } else if i < taken {
+                (alpha(ACCENT, 0.55), TEXT)
+            } else {
+                (alpha(ACCENT, 0.18), BODY)
+            };
+            p.rect_filled(cell, 4, fill);
+            p.text(cell.center(), Align2::CENTER_CENTER, (i + 1).to_string(), semibold(11.0), text);
+        }
+    }
 }
 
 /// Item tiles in build order; the ones in `owned` are outlined green.
@@ -207,8 +264,11 @@ impl App {
         if let Some(me) = me {
             live_goals(ui, s, game, me);
         }
-        if let Some((b, sel)) = picked_build(s, me.and_then(|p| s.data.champion_by_key(&p.champion_key))) {
-            let owned: Vec<i64> = me.map(|p| p.items.iter().map(|it| it.id).collect()).unwrap_or_default();
+        let champ = me.and_then(|p| s.data.champion_by_key(&p.champion_key));
+        let owned: Vec<i64> = me.map(|p| p.items.iter().map(|it| it.id).collect()).unwrap_or_default();
+        if let Some(b) = style_builds(s, champ) {
+            self.blitz_builds(ui, &g, s, game, b, &owned);
+        } else if let Some((b, sel)) = picked_build(s, champ) {
             let core = &b.cores[sel];
             section(ui, "Your build");
             card(ui, |ui| {
@@ -226,6 +286,15 @@ impl App {
                         build_items(ui, &g, &situational, &owned, 22.0);
                     });
                 }
+                if let Some(Err(e)) = &s.styles {
+                    ui.add_space(2.0);
+                    note(ui, &format!("Playstyle builds unavailable: {e}"));
+                }
+            });
+        } else if let Some(Err(e)) = &s.styles {
+            section(ui, "Builds by playstyle");
+            card(ui, |ui| {
+                error(ui, e);
             });
         }
         if !game.counters.is_empty() {
@@ -610,4 +679,138 @@ fn loading_players(ui: &mut Ui, g: &Gfx, s: &Snapshot) {
             }
         }
     });
+}
+
+/// A captioned group in the playstyle detail.
+fn labeled(ui: &mut Ui, caption: &str, add: impl FnOnce(&mut Ui)) {
+    ui.vertical(|ui| {
+        overline(ui, caption);
+        ui.add_space(2.0);
+        add(ui);
+    });
+}
+
+/// Item tiles with `›` between them, wrapping.
+fn item_chain(ui: &mut Ui, g: &Gfx, ids: &[i64], owned: &[i64], size: f32) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (i, &id) in ids.iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("›").color(FAINT));
+            }
+            build_items(ui, g, &[id], owned, size);
+        }
+    });
+}
+
+impl App {
+    /// Blitz's builds for your champion, laid out like blitz.gg: the playstyles to pick from,
+    /// then the picked one's starting items, spells, build order, completed and situational
+    /// items and skill order; ARAM Mayhem adds the champion's augments.
+    fn blitz_builds(&self, ui: &mut Ui, g: &Gfx, s: &Snapshot, game: &LiveGame, b: &StyleBuilds, owned: &[i64]) {
+        let pick = self.shared.style_pick.lock().clone();
+        let Some((active, st)) = active_style(b, pick.as_ref(), owned) else { return };
+        let patch = if b.patch.is_empty() { String::new() } else { format!(" · patch {}", b.patch) };
+        section_with(ui, "Builds by playstyle", |ui| {
+            small_note(ui, format!("Blitz {}{patch}", b.query.label()));
+        });
+        card(ui, |ui| {
+            for (i, other) in b.styles.iter().enumerate() {
+                let row = option_row(ui, i == active, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(other.label()).font(semibold(13.0)).color(TEXT));
+                        build_items(ui, g, &other.completed[..other.completed.len().min(2)], owned, 20.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(other.record.text()).size(11.5).color(MUTED));
+                        });
+                    });
+                });
+                if row.on_hover_text("Show this playstyle here and on the overlay").clicked() {
+                    *self.shared.style_pick.lock() = Some((b.champion_id, other.label()));
+                    ui.ctx().request_repaint_of(super::overlay_id());
+                }
+            }
+            ui.add_space(10.0);
+            ui.horizontal_top(|ui| {
+                if !st.starting.is_empty() {
+                    labeled(ui, "Starting items", |ui| build_items(ui, g, &st.starting, owned, 30.0));
+                    ui.add_space(24.0);
+                }
+                if let Some((spells, record)) = &st.spells {
+                    labeled(ui, "Summoner spells", |ui| {
+                        ui.horizontal(|ui| {
+                            for &id in spells {
+                                g.spell(ui, id, 30.0);
+                            }
+                            ui.label(RichText::new(record.text()).size(11.5).color(MUTED));
+                        });
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            labeled(ui, "Build order", |ui| item_chain(ui, g, &st.build_order, owned, 30.0));
+            ui.add_space(8.0);
+            labeled(ui, "Completed items", |ui| build_items(ui, g, &st.completed, owned, 34.0));
+            let mayhem_items: Vec<i64> = b.mayhem.as_ref().map(|m| m.items.iter().map(|&(id, _)| id).collect()).unwrap_or_default();
+            if !st.situational.is_empty() || !mayhem_items.is_empty() {
+                ui.add_space(8.0);
+                labeled(ui, "Situational items", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        build_items(ui, g, &st.situational, owned, 28.0);
+                        if !mayhem_items.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("MAYHEM").font(semibold(10.5)).color(SOON)).on_hover_text("ARAM Mayhem items Blitz rates on this champion");
+                            build_items(ui, g, &mayhem_items, owned, 28.0);
+                        }
+                    });
+                });
+            }
+            if let Some(sk) = &st.skills {
+                ui.add_space(10.0);
+                labeled(ui, "Ability max order", |ui| {
+                    ui.horizontal(|ui| {
+                        let max = sk.max_order().iter().map(char::to_string).collect::<Vec<_>>().join(" › ");
+                        ui.label(RichText::new(max).font(display(18.0)).color(TEXT));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(sk.record.text()).size(11.5).color(MUTED));
+                        if let Some(k) = sk.next(game.abilities, game.my_level) {
+                            ui.add_space(12.0);
+                            icon(ui, Icon::Bolt, 13.0, SOON);
+                            ui.label(RichText::new(format!("Level up {} next", KEYS[k])).font(semibold(13.0)).color(SOON));
+                        }
+                    });
+                    ui.add_space(4.0);
+                    let taken = game.abilities.iter().sum::<i64>().max(0) as usize;
+                    skill_grid(ui, sk, taken, sk.next_step(game.abilities, game.my_level));
+                });
+            }
+            ui.add_space(6.0);
+            note(ui, "Most played first; picks the playstyle you are building until you choose one. Items you hold are outlined.");
+        });
+        let Some(m) = &b.mayhem else { return };
+        section(ui, &format!("Augments for {}", s.data.champion_name(b.champion_id)));
+        card(ui, |ui| match &m.augments {
+            Err(e) => {
+                error(ui, e);
+            }
+            Ok(_) => {
+                ui.columns(3, |cols| {
+                    for (ui, rarity) in cols.iter_mut().zip(Rarity::ORDER) {
+                        overline(ui, rarity.label());
+                        ui.add_space(2.0);
+                        for a in m.best(rarity) {
+                            ui.horizontal(|ui| {
+                                g.augment(ui, a.icon.as_deref(), &a.name, 28.0);
+                                let color = overlay::augment_tier_color(Some(a.tier));
+                                ui.label(RichText::new(a.tier.letter()).font(display(15.0)).color(color));
+                                ui.add(eframe::egui::Label::new(RichText::new(&a.name).size(12.5).color(BODY)).truncate());
+                            });
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                note(ui, "Blitz's tier for each augment on this champion, best first.");
+            }
+        });
+    }
 }

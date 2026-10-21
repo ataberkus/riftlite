@@ -76,6 +76,22 @@ impl App {
                      recent game in this mode.",
                 ),
             );
+            changed |= toggle(
+                ui,
+                &mut self.settings.style_builds,
+                "In game: Blitz builds for each playstyle",
+                Some(
+                    "In a game, the Live tab shows Blitz's builds for your champion like blitz.gg: the playstyles (AP, Bruiser, \
+                     Crit / On-Hit, …) with games and win rate to pick from, and for the picked one (else the one you are \
+                     building) starting items, summoner spells, build order, completed and situational items and the skill \
+                     order with the next point to take; in ARAM Mayhem also Mayhem items and the best augments of each rarity \
+                     on your champion. The overlay shows that playstyle's items and max order, and its \"level up\" hint follows \
+                     Blitz's skill order. Blitz has tables for ranked solo/duo by lane (used for every Summoner's Rift game), \
+                     ARAM (also used for ARAM Mayhem) and URF; in other modes, or off, the OP.GG build picked in champ select is \
+                     shown. Only the champion id, queue and lane are sent to data.v2.iesdev.com; augment icons come from \
+                     raw.communitydragon.org.",
+                ),
+            );
         });
 
         section(ui, "Overlay");
@@ -180,7 +196,8 @@ impl App {
                     "Riot's game and client APIs do not list the offered augments, so riftlite copies the card titles' strip \
                      of the screen (like a screenshot, about five times a second, only while a Mayhem game is focused) and reads it \
                      with Windows' built-in OCR in the client's language. The S–D tiers come from Blitz \
-                     (data.v2.iesdev.com, the data behind blitz.gg's augment tier list); no game data is sent. \
+                     (data.v2.iesdev.com, the data behind blitz.gg's augment tier list and champion pages): the large \
+                     badge is the tier on your champion, the small one over all champions; no game data is sent. \
                      Riot's developer policy disallows augment win rates in overlays; use at your own discretion.",
                 ),
             );

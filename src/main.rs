@@ -20,6 +20,7 @@ mod replay;
 mod riot;
 mod settings;
 mod skills;
+mod styles;
 mod timeline;
 mod tray;
 mod ui;

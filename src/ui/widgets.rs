@@ -1131,6 +1131,11 @@ impl<'a> Gfx<'a> {
         self.tile(ui, || self.data.spell_icon(id), size, 5, 0.0, Fallback::Text(&name)).on_hover_text(name)
     }
 
+    /// An augment icon from its CommunityDragon URL; hover shows the name.
+    pub fn augment(&self, ui: &mut Ui, icon: Option<&str>, name: &str, size: f32) -> Response {
+        self.tile(ui, || icon.map(str::to_string), size, 6, 0.0, Fallback::Text(name)).on_hover_text(name)
+    }
+
     /// Rune or rune path icon on a dark disc.
     pub fn perk(&self, ui: &mut Ui, id: i64, size: f32) -> Response {
         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());

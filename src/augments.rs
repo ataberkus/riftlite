@@ -7,8 +7,9 @@
 //! device context (like a screenshot; the game process is never opened) and read
 //! with Windows' built-in OCR in the client's language. Titles are matched to ids
 //! through the client's own `/lol-game-data/assets/v1/cherry-augments.json` names,
-//! and ids to Blitz's tier (S–D) from `data.v2.iesdev.com`, the JSON behind
-//! blitz.gg's ARAM Mayhem augment tier list (undocumented, may change).
+//! and ids to Blitz's tiers (S–D) from `data.v2.iesdev.com`, the JSON behind
+//! blitz.gg's ARAM Mayhem augment tier list and champion pages (undocumented, may
+//! change): the overall tier and, where Blitz rates it, the tier on your champion.
 
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
@@ -29,6 +30,8 @@ use crate::worker::{Shared, set};
 use crate::{net, win};
 
 const TIERS_URL: &str = "https://data.v2.iesdev.com/api/v1/query_objects/prod/lol/aram_mayhem_augments";
+/// One champion's Mayhem page on blitz.gg (`?champion_id=`): its own augment tiers.
+pub(crate) const CHAMPION_TIERS_URL: &str = "https://data.v2.iesdev.com/api/v1/query_objects/prod/lol/aram_mayhem_champion";
 /// Blitz updates its tiers about daily.
 const TIERS_TTL: Duration = Duration::from_secs(6 * 3600);
 const RETRY: Duration = Duration::from_secs(300);
@@ -68,7 +71,7 @@ pub enum Tier {
 
 impl Tier {
     /// Blitz ranks 1 (best) to 5; checked against the letters on blitz.gg's tier list page.
-    fn from_blitz(rank: i64) -> Option<Tier> {
+    pub(crate) fn from_blitz(rank: i64) -> Option<Tier> {
         Some(match rank {
             1 => Tier::S,
             2 => Tier::A,
@@ -94,8 +97,10 @@ impl Tier {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Card {
     pub id: i64,
-    /// `None` when Blitz has no tier for it or its tiers could not be loaded.
+    /// Over all champions; `None` when Blitz has no tier for it or its tiers could not be loaded.
     pub tier: Option<Tier>,
+    /// On your champion; `None` when Blitz does not rate it there (or has no data for it).
+    pub champion_tier: Option<Tier>,
     /// Badge center on screen, physical pixels.
     pub at: [f32; 2],
 }
@@ -107,6 +112,8 @@ pub struct Offer {
     pub frame: [i32; 4],
     /// Left to right.
     pub cards: Vec<Card>,
+    /// Your champion's name, when its own tiers are loaded.
+    pub champion: Option<String>,
 }
 
 impl Offer {
@@ -137,42 +144,76 @@ struct Name {
 
 type Tiers = Result<HashMap<i64, Tier>, String>;
 
+enum Fetched {
+    Overall(Tiers),
+    Champion(i64, Tiers),
+}
+
+/// Whether a fetch made `at` is due again.
+fn stale(at: Instant, r: &Tiers) -> bool {
+    at.elapsed() > if r.is_ok() { TIERS_TTL } else { RETRY }
+}
+
 fn run(shared: &Shared, ctx: &egui::Context) {
     let public = net::public_agent();
     let local = net::riot_local_agent();
-    // Blitz is asked on its own thread: a slow or unreachable server (up to the agent's
+    // Blitz is asked on its own threads: a slow or unreachable server (up to the agent's
     // timeouts, again every RETRY) must not hold up screen reads.
-    let (tiers_tx, tiers_rx) = mpsc::channel::<Tiers>();
+    let (tiers_tx, tiers_rx) = mpsc::channel::<Fetched>();
     let mut tiers: Option<(Instant, Tiers)> = None;
     let mut fetching = false;
+    let mut champ_tiers: Option<(i64, Instant, Tiers)> = None;
+    let mut fetching_champ: Option<i64> = None;
     let mut client: Option<Client> = None;
     let mut client_error: Option<(Instant, u16, String)> = None;
+    let spawn_fetch = |f: Box<dyn FnOnce() -> Fetched + Send>| {
+        let tx = tiers_tx.clone();
+        std::thread::Builder::new()
+            .name("riftlite-augment-tiers".into())
+            .spawn(move || {
+                let _ = tx.send(f());
+            })
+            .expect("spawn augment tiers thread");
+    };
     loop {
-        if let Ok(r) = tiers_rx.try_recv() {
-            tiers = Some((Instant::now(), r));
-            fetching = false;
+        while let Ok(f) = tiers_rx.try_recv() {
+            match f {
+                Fetched::Overall(r) => {
+                    tiers = Some((Instant::now(), r));
+                    fetching = false;
+                }
+                Fetched::Champion(id, r) => {
+                    champ_tiers = Some((id, Instant::now(), r));
+                    fetching_champ = None;
+                }
+            }
         }
-        let (wanted, active, creds) = {
+        let (wanted, active, creds, champion) = {
             let s = shared.snap.lock();
             let settings = shared.settings.lock();
             let mayhem = s.live.as_ref().is_some_and(|g| g.mode == "KIWI");
             let wanted = mayhem && settings.overlay_enabled && settings.augment_tiers;
             let active =
                 wanted && !shared.overlay_hidden.load(Ordering::Relaxed) && shared.game_focused.load(Ordering::Relaxed);
-            (wanted, active, s.creds.clone())
+            let me = s.live.as_ref().and_then(|g| g.me());
+            let champion = me.and_then(|p| Some((s.data.champion_by_key(&p.champion_key)?, p.champion.clone())));
+            (wanted, active, s.creds.clone(), champion)
         };
         // Asked as soon as a Mayhem game is up, focused or not, so the tiers are in before
         // the first augment choice.
-        let stale = tiers.as_ref().is_none_or(|(at, r)| at.elapsed() > if r.is_ok() { TIERS_TTL } else { RETRY });
-        if wanted && stale && !fetching {
+        if wanted && !fetching && tiers.as_ref().is_none_or(|(at, r)| stale(*at, r)) {
             fetching = true;
-            let (agent, tx) = (public.clone(), tiers_tx.clone());
-            std::thread::Builder::new()
-                .name("riftlite-augment-tiers".into())
-                .spawn(move || {
-                    let _ = tx.send(fetch_tiers(&agent));
-                })
-                .expect("spawn augment tiers thread");
+            let agent = public.clone();
+            spawn_fetch(Box::new(move || Fetched::Overall(fetch_tiers(&agent))));
+        }
+        if let Some((id, _)) = champion.as_ref().filter(|_| wanted) {
+            let id = *id;
+            let due = champ_tiers.as_ref().is_none_or(|(c, at, r)| *c != id || stale(*at, r));
+            if due && fetching_champ != Some(id) {
+                fetching_champ = Some(id);
+                let agent = public.clone();
+                spawn_fetch(Box::new(move || Fetched::Champion(id, fetch_champion_tiers(&agent, id))));
+            }
         }
         if !active {
             publish(shared, ctx, None, None);
@@ -210,16 +251,30 @@ fn run(shared: &Shared, ctx: &egui::Context) {
             std::thread::sleep(IDLE_CHECK);
             continue;
         };
-        let (tier_map, tier_error) = match tier_result {
+        let (tier_map, mut tier_error) = match tier_result {
             Ok(m) => (Some(m), None),
             Err(e) => (None, Some(e.clone())),
         };
+        // Your champion's tiers once they are in; the overall badges show meanwhile.
+        let mut champ_map = None;
+        if let (Some((id, name)), Some((c_id, _, r))) = (&champion, &champ_tiers) {
+            if id == c_id {
+                match r {
+                    // Blitz has no page for this champion (new, or too few games).
+                    Ok(m) if m.is_empty() => {}
+                    Ok(m) => champ_map = Some((m, name.clone())),
+                    Err(e) => tier_error = Some(tier_error.map_or_else(|| e.clone(), |t| format!("{t}; {e}"))),
+                }
+            }
+        }
         match detect(c) {
             Ok(offer) => {
                 let offer = offer.map(|mut o| {
                     for card in &mut o.cards {
                         card.tier = tier_map.and_then(|m| m.get(&card.id).copied());
+                        card.champion_tier = champ_map.as_ref().and_then(|(m, _)| m.get(&card.id).copied());
                     }
+                    o.champion = champ_map.as_ref().map(|(_, n)| n.clone());
                     o
                 });
                 publish(shared, ctx, offer, tier_error);
@@ -241,17 +296,15 @@ fn publish(shared: &Shared, ctx: &egui::Context, offer: Option<Offer>, error: Op
     }
 }
 
-fn fetch_tiers(agent: &ureq::Agent) -> Result<HashMap<i64, Tier>, String> {
-    let v: Value = agent
-        .get(TIERS_URL)
-        .call()
-        .map_err(|e| format!("Blitz tiers: {e}"))?
-        .into_json()
-        .map_err(|e| format!("Blitz tiers: {e}"))?;
-    parse_tiers(&v)
+pub(crate) fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value, String> {
+    agent.get(url).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())
 }
 
-fn parse_tiers(v: &Value) -> Result<HashMap<i64, Tier>, String> {
+fn fetch_tiers(agent: &ureq::Agent) -> Tiers {
+    parse_tiers(&get_json(agent, TIERS_URL).map_err(|e| format!("Blitz tiers: {e}"))?)
+}
+
+fn parse_tiers(v: &Value) -> Tiers {
     let m: HashMap<i64, Tier> = v["data"]
         .as_array()
         .into_iter()
@@ -259,6 +312,23 @@ fn parse_tiers(v: &Value) -> Result<HashMap<i64, Tier>, String> {
         .filter_map(|x| Some((x["augment_id"].as_str()?.parse().ok()?, Tier::from_blitz(x["stats"]["tier"].as_i64()?)?)))
         .collect();
     if m.is_empty() { Err("Blitz tiers: the data format changed".into()) } else { Ok(m) }
+}
+
+fn fetch_champion_tiers(agent: &ureq::Agent, champion: i64) -> Tiers {
+    let url = format!("{CHAMPION_TIERS_URL}?champion_id={champion}");
+    parse_champion_tiers(&get_json(agent, &url).map_err(|e| format!("Blitz champion tiers: {e}"))?)
+}
+
+/// Empty when Blitz has no page for the champion.
+pub(crate) fn parse_champion_tiers(v: &Value) -> Tiers {
+    let format_changed = || "Blitz champion tiers: the data format changed".to_string();
+    let rows = v["data"].as_array().ok_or_else(format_changed)?;
+    let Some(row) = rows.first() else { return Ok(HashMap::new()) };
+    let augments = row["data"]["augments"].as_object().ok_or_else(format_changed)?;
+    Ok(augments
+        .iter()
+        .filter_map(|(id, x)| Some((id.parse().ok()?, Tier::from_blitz(x["tier"].as_i64()?)?)))
+        .collect())
 }
 
 fn load_client(agent: &ureq::Agent, creds: &Creds) -> Result<Client, String> {
@@ -348,14 +418,14 @@ fn read_band(c: &Client, frame: [i32; 4], [x0, y0, bw, bh]: [i32; 4], bgra: &[u8
         }
         let cx = left as f32 + x0 as f32 + seg.cx / scale;
         let cy = top as f32 + y0 as f32 + seg.cy / scale;
-        cards.push(Card { id, tier: None, at: [cx - BADGE_LEFT_OF_CENTER * h, cy + BADGE_BELOW_TITLE * h] });
+        cards.push(Card { id, tier: None, champion_tier: None, at: [cx - BADGE_LEFT_OF_CENTER * h, cy + BADGE_BELOW_TITLE * h] });
     }
     // One stray match is not a card choice (an item or chat line can read like a name).
     if cards.len() < 2 {
         return Ok(None);
     }
     cards.sort_by(|a, b| a.at[0].total_cmp(&b.at[0]));
-    Ok(Some(Offer { frame, cards }))
+    Ok(Some(Offer { frame, cards, champion: None }))
 }
 
 struct Word {
@@ -509,5 +579,17 @@ mod tests {
         let m = parse_tiers(&v).unwrap();
         assert_eq!((m.get(&1205), m.get(&1056), m.len()), (Some(&Tier::S), Some(&Tier::D), 2));
         assert!(parse_tiers(&serde_json::json!({"data": []})).is_err());
+    }
+
+    #[test]
+    fn champion_tiers_map_per_augment_and_an_unrated_champion_is_empty() {
+        let v = serde_json::json!({"data": [{"champion_id": "68", "data": {"tier": 3, "augments": {
+            "1156": {"tier": 1}, "2063": {"tier": 5}, "x": {"tier": 2}, "1314": {"tier": 0}
+        }}}]});
+        let m = parse_champion_tiers(&v).unwrap();
+        assert_eq!((m.get(&1156), m.get(&2063), m.len()), (Some(&Tier::S), Some(&Tier::D), 2));
+        assert!(parse_champion_tiers(&serde_json::json!({"data": []})).unwrap().is_empty());
+        assert!(parse_champion_tiers(&serde_json::json!({"data": [{"data": {}}]})).is_err());
+        assert!(parse_champion_tiers(&serde_json::json!({"error": "x"})).is_err());
     }
 }

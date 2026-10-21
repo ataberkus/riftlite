@@ -43,9 +43,10 @@ pub struct OverlaySections {
     pub kills_gold: bool,
     /// Item value, team and lane.
     pub item_diff: bool,
-    /// "Level up X" from your last games on the champion.
+    /// "Level up X" from Blitz's skill order for the playstyle shown, else your last games on the champion.
     pub skill_hint: bool,
-    /// The OP.GG build picked in champ select, items you own outlined.
+    /// The Blitz playstyle picked in the Live tab or the one you are building (completed items,
+    /// max order), or the OP.GG build picked in champ select; items you own outlined.
     pub build: bool,
     /// Items that answer what the enemies build (healing, shields, armor/MR stacking).
     pub counters: bool,
@@ -151,6 +152,8 @@ pub struct Settings {
     /// Fetch OP.GG's aggregated builds for the pick: written as the lock-in item set
     /// (with your best game as an extra block) and offered as a rune page.
     pub meta_builds: bool,
+    /// In game: fetch Blitz's builds per playstyle for your champion, mode and lane.
+    pub style_builds: bool,
     /// League install folder chosen by hand; empty = detect automatically.
     pub league_folder: String,
 }
@@ -173,6 +176,7 @@ impl Default for Settings {
             page_source: PageSource::Riot,
             auto_item_set: true,
             meta_builds: true,
+            style_builds: true,
             league_folder: String::new(),
         }
     }

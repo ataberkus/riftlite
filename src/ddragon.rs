@@ -428,17 +428,19 @@ fn shop_item(id: i64, i: &Value, items: &HashMap<i64, &Value>) -> ShopItem {
     }
 }
 
-/// Bytes of one Data Dragon image (`path` from the `StaticData` image helpers),
-/// from the patch cache or the CDN. Cached next to the patch's JSON, so pruning
-/// an old patch drops its images too.
+/// Bytes of one Data Dragon image (`path` from the `StaticData` image helpers, or an absolute
+/// `https://` URL such as a CommunityDragon icon), from the patch cache or the network.
+/// Cached next to the patch's JSON, so pruning an old patch drops its images too.
 pub fn fetch_image(agent: &ureq::Agent, version: &str, path: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
     const MAX: u64 = 4 << 20;
-    let file = cache_dir().join(version).join("img").join(path.replace('/', "_"));
+    let name: String = path.trim_start_matches("https://").chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' }).collect();
+    let file = cache_dir().join(version).join("img").join(name);
     if let Ok(b) = std::fs::read(&file) {
         return Ok(b);
     }
-    let resp = agent.get(&format!("{CDN}/{path}")).call().map_err(|e| e.to_string())?;
+    let url = if path.starts_with("https://") { path.to_string() } else { format!("{CDN}/{path}") };
+    let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
     resp.into_reader().take(MAX).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if let Some(dir) = file.parent() {
