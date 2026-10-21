@@ -765,6 +765,10 @@ impl App {
                     });
                 });
             }
+            if !st.boots.is_empty() {
+                ui.add_space(8.0);
+                labeled(ui, "Boots options", |ui| build_items(ui, g, &st.boots, owned, 28.0));
+            }
             if let Some(sk) = &st.skills {
                 ui.add_space(10.0);
                 labeled(ui, "Ability max order", |ui| {

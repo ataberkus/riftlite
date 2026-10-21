@@ -36,11 +36,52 @@ const CDRAGON: &str = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol
 const TTL: Duration = Duration::from_secs(6 * 3600);
 const RETRY: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_secs(1);
-/// Completed items listed (blitz.gg shows six).
-const COMPLETED: usize = 6;
-/// Situational items: bought in at least this share of the style's games.
-const SITUATIONAL_MIN_PICK_RATE: f64 = 0.03;
+/// Blitz's item tables (blitz-desktop `CfOGcc_p.js`, build 3.0.0-beta.1787885272).
+mod blitz_items {
+    /// Boots, every tier and mode variant.
+    pub const BOOTS: &[i64] = &[
+        1001, 3158, 3006, 3008, 3009, 3020, 3047, 3111, 3117, 2422, 3005, 3010, 3013, 223005, 223111, 223047, 223006, 223008, 223009, 223020,
+        223158, 773006, 773009, 771001, 773020, 773047, 773111, 773117, 773158,
+    ];
+    pub const BASIC_BOOTS: i64 = 1001;
+    /// Potions and elixirs a start may hold.
+    pub const CONSUMABLES: &[i64] = &[2003, 2031, 2139, 2138, 2140];
+    /// Starter items (Doran's, Dark Seal, Cull, Tear-free starters, Arena variants).
+    pub const STARTERS: &[i64] = &[1054, 1055, 1056, 1086, 1120, 2049, 2050, 222051, 223112, 223177, 223184, 223185];
+    pub const TEAR: i64 = 3070;
+    /// Tear and what it becomes.
+    pub const TEAR_FAMILY: &[i64] = &[3070, 3004, 3043, 3003, 3040, 3119, 3121, 2526];
+    /// Transformed items never listed from situational stats.
+    pub const NOT_SITUATIONAL: &[i64] = &[6657, 3003, 3040, 3119, 3121, 3004, 3043];
+    pub const SUPPORT_QUEST: &[i64] = &[3869, 3870, 3871, 3876, 3877];
+    pub const JUNGLE_PETS: &[i64] = &[1101, 1102, 1103];
+    pub const GUSTWALKER: i64 = 1102;
+    pub const HEALTH_POTION: i64 = 2003;
+    pub const HEARTSTEEL: i64 = 3084;
+    /// Skipped in build orders.
+    pub const NOT_IN_ORDER: i64 = 3867;
+    /// Items sharing a unique passive: a later one is dropped when an earlier one has it.
+    pub const GROUPS: &[&[i64]] = &[
+        &[3003, 3004, 3042, 3040, 3119, 3121, 2526, 2530],
+        &[6673, 3053, 3156, 3155, 3040, 2525],
+        &[6694, 3036, 3035, 3033],
+        &[6035, 3139],
+        &[3748, 3074, 6698, 6631],
+        &[3100, 6632, 3078, 6662, 2510, 3508],
+        &[6694, 3071, 3036, 3033, 3302],
+        &[3135, 3137],
+        &[3068, 6664],
+    ];
+}
+use blitz_items as bi;
+/// Situational items Blitz lists after the final build.
 const SITUATIONAL_LIMIT: usize = 7;
+/// Blitz's playstyle tags with an English title; other tags are not shown.
+const TAGS: &[&str] = &[
+    "Tank", "Crit", "On-Hit", "Mobility", "Utility", "Scaling", "Bruiser", "Fighter", "Burst", "Lethality", "Heal & Shield", "CC", "AP", "AD", "Hybrid",
+    "Sustain", "Burn", "Poke", "Defensive",
+];
+const JACK_OF_ALL_TRADES: i64 = 8316;
 /// Augments listed per rarity (blitz.gg's page shows six before "Show all").
 pub const AUGMENTS_PER_RARITY: usize = 6;
 pub const KEYS: [char; 4] = ['Q', 'W', 'E', 'R'];
@@ -75,6 +116,20 @@ impl Query {
             _ => None,
         };
         Some(Query { queue, position, mayhem: mode == "KIWI" })
+    }
+
+    /// The Blitz table for champ select (queue id, map id, your assigned position), `None`
+    /// when Blitz has none. Matches `for_game` for the game that follows.
+    pub fn for_queue(queue_id: i64, map: i64, position: &str) -> Option<Query> {
+        let mode = match (queue_id, map) {
+            (2400, _) => "KIWI",
+            (900 | 1900 | 1010, _) => "URF",
+            (450, _) | (_, 12) => "ARAM",
+            (1300 | 1700 | 1710 | 1810..=1840, _) => return None,
+            (_, 11) => "CLASSIC",
+            _ => return None,
+        };
+        Query::for_game(mode, if mode == "KIWI" || mode == "ARAM" { 12 } else { 11 }, &position.to_uppercase())
     }
 
     pub fn label(&self) -> String {
@@ -196,20 +251,24 @@ fn can_level(k: usize, levels: [i64; 4], champion_level: i64) -> bool {
     }
 }
 
-/// One playstyle's build.
+/// One playstyle's build, assembled the way the Blitz app assembles it.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Style {
-    /// Blitz's tags, e.g. `["Crit", "On-Hit"]`.
-    pub tags: Vec<String>,
+    /// Blitz's title: its tags joined with " / " (e.g. "Crit / On-Hit"), "Jack of All Trades" or
+    /// "Well Rounded" for uncategorized builds, "Blitz Build" without tags.
+    pub title: String,
     pub record: Record,
-    /// Most played starting items.
+    /// Blitz's start: the most picked starting set made of potions, starters and core components.
     pub starting: Vec<i64>,
-    /// The most played core with each item's most played components before it, in buy order.
+    /// The first three items of the final build, each after its most picked component order.
     pub build_order: Vec<i64>,
-    /// The most played core, the items bought after it, then the most bought other finished items.
+    /// The most played core (picked by more than 5% of games), the items bought after it, then
+    /// the most bought items; six (seven for bot lane), boots included.
     pub completed: Vec<i64>,
-    /// Other finished items bought in this style, most bought first.
+    /// The next most bought items (up to seven).
     pub situational: Vec<i64>,
+    /// Boots in core builds and boots bought in more than 10% of games.
+    pub boots: Vec<i64>,
     /// Most played summoner spell pair.
     pub spells: Option<(Vec<i64>, Record)>,
     /// Most played skill order.
@@ -218,7 +277,7 @@ pub struct Style {
 
 impl Style {
     pub fn label(&self) -> String {
-        self.tags.join(" / ")
+        self.title.clone()
     }
 
     /// Items worth comparing with what you hold: build order, completed and situational.
@@ -315,34 +374,43 @@ pub fn spawn(shared: Arc<Shared>, ctx: egui::Context) {
         .expect("spawn styles thread");
 }
 
+/// What the styles thread fetches for: your champion and Blitz table in a live game, else
+/// in champ select once your champion is picked.
+fn wanted(shared: &Shared) -> Option<((i64, Query), Arc<StaticData>, Option<Creds>)> {
+    if !shared.settings.lock().style_builds {
+        return None;
+    }
+    let s = shared.snap.lock();
+    let key = if let Some(g) = &s.live {
+        let me = g.me()?;
+        (s.data.champion_by_key(&me.champion_key)?, Query::for_game(&g.mode, g.map, &me.position)?)
+    } else {
+        let cs = s.champ_select.as_ref()?;
+        let map = s.session.as_ref().map_or(0, |g| g.map_id);
+        (cs.my_champion()?, Query::for_queue(cs.queue_id, map, &cs.me()?.position)?)
+    };
+    Some((key, s.data.clone(), s.creds.clone()))
+}
+
 fn run(shared: &Shared, ctx: &egui::Context) {
     let public = net::public_agent();
     let local = net::riot_local_agent();
-    let mut last: Option<((i64, Query), Instant, bool)> = None;
+    // The last answer, kept across the gap between champ select and the game.
+    let mut last: Option<((i64, Query), Instant, bool, Result<StyleBuilds, String>)> = None;
     loop {
-        let want = {
-            let s = shared.snap.lock();
-            let on = shared.settings.lock().style_builds;
-            s.live.as_ref().filter(|_| on).and_then(|g| {
-                let me = g.me()?;
-                let key = (s.data.champion_by_key(&me.champion_key)?, Query::for_game(&g.mode, g.map, &me.position)?);
-                Some((key, s.data.clone(), s.creds.clone()))
-            })
-        };
-        let Some((key, data, creds)) = want else {
-            last = None;
+        let Some((key, data, creds)) = wanted(shared) else {
             publish(shared, ctx, None);
             std::thread::sleep(POLL);
             continue;
         };
-        let due = last.is_none_or(|(k, at, ok)| k != key || at.elapsed() > if ok { TTL } else { RETRY });
+        let due = last.as_ref().is_none_or(|(k, at, ok, _)| *k != key || at.elapsed() > if *ok { TTL } else { RETRY });
         if due {
             let r = fetch(&public, &local, creds.as_ref(), key.0, key.1, &data);
             // A Mayhem extra that failed is fetched again sooner, like a failed build.
             let ok = r.as_ref().is_ok_and(|b| b.mayhem.as_ref().is_none_or(|m| m.augments.is_ok()));
-            last = Some((key, Instant::now(), ok));
-            publish(shared, ctx, Some(r));
+            last = Some((key, Instant::now(), ok, r));
         }
+        publish(shared, ctx, last.as_ref().map(|(.., r)| r.clone()));
         std::thread::sleep(POLL);
     }
 }
@@ -447,7 +515,7 @@ fn most_played(v: &Value) -> Option<&Value> {
 
 fn parse(champion_id: i64, query: Query, v: &Value, data: &StaticData) -> Result<StyleBuilds, String> {
     let rows = v["data"].as_array().ok_or("Blitz builds: the data format changed")?;
-    let mut styles: Vec<Style> = rows.iter().filter_map(|r| style(r, data)).collect();
+    let mut styles: Vec<Style> = rows.iter().filter_map(|r| style(r, query, data)).collect();
     if styles.is_empty() && !rows.is_empty() {
         return Err("Blitz builds: the data format changed".into());
     }
@@ -456,72 +524,331 @@ fn parse(champion_id: i64, query: Query, v: &Value, data: &StaticData) -> Result
     Ok(StyleBuilds { champion_id, query, patch, styles, mayhem: None })
 }
 
-fn style(r: &Value, data: &StaticData) -> Option<Style> {
-    let tags: Vec<String> = r["name_tags"].as_array()?.iter().filter_map(|t| Some(t.as_str()?.to_string())).collect();
-    let core = ids(&most_played(&r["coreItems"])?["itemIds"]);
-    if tags.is_empty() || core.is_empty() {
-        return None;
+/// Blitz's playstyle title for a row (`name_tags`, runes).
+fn title(r: &Value) -> String {
+    let tags: Vec<&str> = r["name_tags"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if tags.is_empty() {
+        return "Blitz Build".into();
     }
-    let starting = most_played(&r["startingItems"]).map(|s| ids(&s["itemIds"])).unwrap_or_default();
+    if tags.contains(&"Uncategorized") {
+        let jack = r["runes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|x| x["pick_rate"].as_f64().is_some_and(|p| p >= 0.2) && x["runeId"].as_i64() == Some(JACK_OF_ALL_TRADES));
+        return if jack { "Jack of All Trades" } else { "Well Rounded" }.into();
+    }
+    tags.into_iter().filter(|t| TAGS.contains(t)).collect::<Vec<_>>().join(" / ")
+}
 
-    // Each core item after its most played components (those not already bought).
-    let mut build_order: Vec<i64> = Vec::new();
-    for &item in &core {
-        let components = most_played(&r["itemOrders"][item.to_string().as_str()]).map(|o| ids(&o["items_order"])).unwrap_or_default();
-        for c in components {
-            if !starting.contains(&c) && !build_order.contains(&c) {
-                build_order.push(c);
+fn pick_rate(v: &Value) -> f64 {
+    v["pick_rate"].as_f64().unwrap_or(0.0)
+}
+
+fn boots(id: i64) -> bool {
+    bi::BOOTS.contains(&id)
+}
+
+/// Blitz's core: the most played core build picked in more than 5% of games, else the first listed.
+fn core(rows: &Value) -> Vec<i64> {
+    let list = rows.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut best: Option<&Value> = None;
+    for c in list.iter().filter(|c| pick_rate(c) > 0.05) {
+        if best.is_none_or(|b| games(c) > games(b)) {
+            best = Some(c);
+        }
+    }
+    best.or(list.first()).map(|c| ids(&c["itemIds"])).unwrap_or_default()
+}
+
+/// Situational stats, most bought first: items in ≥ 2.5% of games (`primary`), in ≥ 0.2%
+/// (`secondary`), boots in > 10%, the first support quest item and each item's average slot.
+struct Situational {
+    average_index: HashMap<i64, f64>,
+    primary: Vec<i64>,
+    secondary: Vec<i64>,
+    boots: Vec<i64>,
+    support_item: Option<i64>,
+}
+
+fn situational(rows: &Value) -> Situational {
+    let mut list: Vec<&Value> = rows.as_array().into_iter().flatten().collect();
+    list.sort_by_key(|x| std::cmp::Reverse(games(x)));
+    let mut s = Situational { average_index: HashMap::new(), primary: Vec::new(), secondary: Vec::new(), boots: Vec::new(), support_item: None };
+    for x in list {
+        let Some(id) = x["itemId"].as_i64() else { continue };
+        let avg = x["averageIndex"].as_f64().filter(|&a| a != 0.0).unwrap_or(99.0);
+        s.average_index.insert(id, avg);
+        let p = pick_rate(x);
+        if boots(id) {
+            if p > 0.1 {
+                s.boots.push(id);
             }
-        }
-        build_order.push(item);
-    }
-
-    // After the core: Blitz's items-after-core (keyed by the core's ids in ascending order,
-    // then by slot "1", "2", …), then the most bought other finished items.
-    let mut key_ids = core.clone();
-    key_ids.sort_unstable();
-    let key = key_ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-    let mut slots: Vec<(u32, i64)> = r["itemsAfterCore"][key.as_str()]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(slot, options)| Some((slot.parse().ok()?, *ids(&most_played(options)?["itemIds"]).first()?)))
-        .collect();
-    slots.sort_unstable();
-    let mut completed = core.clone();
-    for (_, id) in slots {
-        if !completed.contains(&id) {
-            completed.push(id);
-        }
-    }
-    let mut others: Vec<&Value> = r["situationalItems"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|s| s["pick_rate"].as_f64().is_some_and(|p| p >= SITUATIONAL_MIN_PICK_RATE))
-        .collect();
-    others.sort_by_key(|s| std::cmp::Reverse(games(s)));
-    let boots = |id: i64| data.item_stats.get(&id).is_some_and(|s| s.boots);
-    let finished = |id: i64| data.completed_items.is_empty() || data.completed_items.contains(&id) || boots(id);
-    let mut situational = Vec::new();
-    for id in others.into_iter().filter_map(|s| s["itemId"].as_i64()) {
-        let has_boots = completed.iter().any(|&c| boots(c));
-        if completed.contains(&id) || situational.contains(&id) || !finished(id) || (boots(id) && has_boots) {
             continue;
         }
-        if completed.len() < COMPLETED {
-            completed.push(id);
-        } else if situational.len() < SITUATIONAL_LIMIT {
-            situational.push(id);
+        if bi::SUPPORT_QUEST.contains(&id) && s.support_item.is_none() {
+            s.support_item = Some(id);
+        }
+        if !bi::NOT_SITUATIONAL.contains(&id) && p >= 0.002 {
+            s.secondary.push(id);
+            if p >= 0.025 {
+                s.primary.push(id);
+            }
         }
     }
+    s
+}
+
+/// Blitz's items after the core: the after-core table keyed by exactly the core's items (the
+/// most played one), else by the smallest superset; its single most played option, boots
+/// dropped when the core has some, ordered by average slot.
+fn after_core(table: &Value, core: &[i64], average_index: &HashMap<i64, f64>, core_has_boots: bool) -> Vec<i64> {
+    use std::collections::BTreeSet;
+    let want: BTreeSet<i64> = core.iter().copied().collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    fn options(v: &Value) -> Vec<&Value> {
+        v.as_object().into_iter().flatten().flat_map(|(_, o)| o.as_array().into_iter().flatten()).collect()
+    }
+    let max_games = |v: &Value| options(v).iter().map(|o| games(o)).max().unwrap_or(0);
+    let mut exact: Vec<&Value> = Vec::new();
+    let mut supersets: Vec<(usize, &Value)> = Vec::new();
+    for (key, v) in table.as_object().into_iter().flatten() {
+        let set: BTreeSet<i64> = key.split(',').filter_map(|x| x.parse().ok()).collect();
+        if set == want {
+            exact.push(v);
+        } else if want.is_subset(&set) {
+            supersets.push((set.len(), v));
+        }
+    }
+    let chosen = if !exact.is_empty() {
+        exact.into_iter().max_by_key(|v| max_games(v))
+    } else {
+        supersets.sort_by(|a, b| a.0.cmp(&b.0).then(max_games(b.1).cmp(&max_games(a.1))));
+        supersets.first().map(|(_, v)| *v)
+    };
+    let Some(best) = chosen.and_then(|v| options(v).into_iter().reduce(|a, b| if games(b) > games(a) { b } else { a })) else { return Vec::new() };
+    let mut items: Vec<i64> = ids(&best["itemIds"]).into_iter().filter(|&i| !(core_has_boots && boots(i))).collect();
+    let slot = |i: &i64| average_index.get(i).copied().unwrap_or(99.0);
+    items.sort_by(|a, b| slot(a).total_cmp(&slot(b)));
+    items
+}
+
+/// Drops each item sharing a unique-passive group with an earlier item.
+fn drop_group_conflicts(items: Vec<i64>) -> Vec<i64> {
+    let mut seen: Vec<usize> = Vec::new();
+    let mut dropped: Vec<i64> = Vec::new();
+    for &id in &items {
+        let mut conflict = false;
+        for (g, members) in bi::GROUPS.iter().enumerate() {
+            if members.contains(&id) {
+                if seen.contains(&g) {
+                    conflict = true;
+                } else {
+                    seen.push(g);
+                }
+            }
+        }
+        if conflict {
+            dropped.push(id);
+        }
+    }
+    items.into_iter().filter(|i| !dropped.contains(i)).collect()
+}
+
+/// Blitz's start: the most picked starting set made only of potions, starters and core
+/// components (no Tear outside Tear builds), highest id first; junglers get a pet.
+fn starting(rows: &Value, core: &[i64], tear_build: bool, support: bool, jungle: bool, data: &StaticData) -> Vec<i64> {
+    let components: Vec<i64> = core.iter().filter_map(|c| data.shop.get(c)).flat_map(|s| s.from.iter().copied()).collect();
+    let allowed = |i: &i64| bi::CONSUMABLES.contains(i) || bi::STARTERS.contains(i) || components.contains(i);
+    let (mut best, mut best_pet, mut best_no_pet): (Option<&Value>, bool, Option<&Value>) = (None, false, None);
+    for r in rows.as_array().into_iter().flatten() {
+        let items = ids(&r["itemIds"]);
+        if (!tear_build && items.contains(&bi::TEAR)) || !items.iter().all(allowed) {
+            continue;
+        }
+        let pet = items.iter().any(|i| bi::JUNGLE_PETS.contains(i));
+        if best.is_none_or(|b| pick_rate(r) > pick_rate(b)) {
+            best = Some(r);
+            best_pet = pet;
+        }
+        if !pet && best_no_pet.is_none_or(|b| pick_rate(r) > pick_rate(b)) {
+            best_no_pet = Some(r);
+        }
+    }
+    let sorted = |r: Option<&Value>| {
+        let mut v = r.map(|r| ids(&r["itemIds"])).unwrap_or_default();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v
+    };
+    if jungle && !best_pet {
+        return vec![bi::HEALTH_POTION, bi::GUSTWALKER];
+    }
+    if !jungle && best_pet {
+        let v = sorted(best_no_pet);
+        return if !v.is_empty() {
+            v
+        } else if support {
+            vec![bi::HEALTH_POTION, 3854]
+        } else {
+            vec![bi::HEALTH_POTION, 1054]
+        };
+    }
+    sorted(best)
+}
+
+/// An item's components the way Blitz orders them without order stats: the dearer first.
+fn components(id: i64, data: &StaticData) -> Vec<i64> {
+    let from: Vec<i64> = data.shop.get(&id).map(|s| s.from.clone()).unwrap_or_default();
+    let gold = |i: &i64| data.shop.get(i).map_or(0, |s| s.gold);
+    if from.len() == 2 {
+        let (a, b) = (from[0], from[1]);
+        return match (data.shop.contains_key(&a), data.shop.contains_key(&b)) {
+            (true, true) if gold(&a) < gold(&b) => vec![b, a],
+            (ka, kb) => [(ka, a), (kb, b)].into_iter().filter(|(k, _)| *k).map(|(_, i)| i).collect(),
+        };
+    }
+    let mut v: Vec<i64> = from.into_iter().filter(|i| data.shop.contains_key(i)).collect();
+    v.sort_by_key(|i| std::cmp::Reverse(gold(i)));
+    v
+}
+
+/// Blitz's build order: the first three items of the final build (Tear added in Tear builds),
+/// each after its most picked component order (Data Dragon components without one), skipping
+/// basic boots when the start has boots and starting items among the first two entries.
+fn build_order(final_build: &[i64], orders: &Value, starting: &[i64], tear_build: bool, data: &StaticData) -> Vec<i64> {
+    if data.shop.is_empty() {
+        return Vec::new();
+    }
+    let mut first: Vec<i64> = final_build.iter().take(3).copied().filter(|i| data.shop.contains_key(i)).collect();
+    let has_tear_item = first.iter().any(|i| bi::TEAR_FAMILY.contains(i));
+    if tear_build && data.shop.contains_key(&bi::TEAR) {
+        first.insert(if has_tear_item { 0 } else { 1.min(first.len()) }, bi::TEAR);
+    }
+    let mut steps: Vec<i64> = Vec::new();
+    for &item in &first {
+        let picked = orders[item.to_string().as_str()]
+            .as_array()
+            .and_then(|o| o.iter().min_by_key(|x| x["pick_rate_rank"].as_i64().unwrap_or(i64::MAX)))
+            .map(|o| ids(&o["items_order"]));
+        match picked {
+            Some(order) => steps.extend(order),
+            None => steps.extend(components(item, data)),
+        }
+        steps.push(item);
+    }
+    let start_boots = starting.iter().any(|&i| boots(i));
+    let start_tear = starting.contains(&bi::TEAR);
+    let mut tear_listed = false;
+    let mut out = Vec::new();
+    for (i, &id) in steps.iter().enumerate() {
+        if start_boots && id == bi::BASIC_BOOTS {
+            continue;
+        }
+        let tear = id == bi::TEAR;
+        if tear && (tear_listed || start_tear) {
+            continue;
+        }
+        if tear {
+            tear_listed = true;
+        } else if id == bi::NOT_IN_ORDER {
+            continue;
+        }
+        if !(i < 2 && starting.contains(&id)) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// One playstyle row, assembled like the Blitz app's item import (blitz-desktop `CxnY7q5R.js`
+/// `Se`, "Common" sort: most played wins).
+fn style(r: &Value, query: Query, data: &StaticData) -> Option<Style> {
+    let core = core(&r["coreItems"]);
+    if core.is_empty() {
+        return None;
+    }
+    let (jungle, adc, support) = match query.position {
+        Some("JUNGLE") => (true, false, false),
+        Some("BOTTOM") => (false, true, false),
+        Some("UTILITY") => (false, false, true),
+        _ => (false, false, false),
+    };
+    let core_has_boots = core.iter().any(|&i| boots(i));
+    let sit = situational(&r["situationalItems"]);
+    let after = after_core(&r["itemsAfterCore"], &core, &sit.average_index, core_has_boots);
+    let mut all: Vec<i64> = Vec::new();
+    for id in core.iter().chain(&after).chain(&sit.primary).chain(&sit.secondary) {
+        if !all.contains(id) {
+            all.push(*id);
+        }
+    }
+    let mut all: Vec<i64> = drop_group_conflicts(all).into_iter().filter(|i| !bi::SUPPORT_QUEST.contains(i)).collect();
+    let tear_build = core.iter().filter_map(|c| data.shop.get(c)).any(|s| s.from.contains(&bi::TEAR));
+    if !tear_build {
+        all.retain(|i| !bi::TEAR_FAMILY.contains(i));
+    }
+    if !core.contains(&bi::HEARTSTEEL) {
+        all.retain(|&i| i != bi::HEARTSTEEL);
+    }
+    let size = if adc { 7 } else { 6 };
+    let mut final_build: Vec<i64> = all.iter().take(size).copied().collect();
+    let mut rest: Vec<i64> = all.iter().skip(size).copied().collect();
+    let start = starting(&r["startingItems"], &core, tear_build, support, jungle, data);
+    if final_build.len() < size {
+        let fill: Vec<i64> = rest.iter().copied().filter(|&i| !boots(i)).take(size - final_build.len()).collect();
+        final_build.extend(&fill);
+        rest.retain(|i| !fill.contains(i));
+    }
+    let mut boot_options: Vec<i64> = Vec::new();
+    for c in r["coreItems"].as_array().into_iter().flatten() {
+        if let Some(b) = ids(&c["itemIds"]).into_iter().find(|&i| boots(i)) {
+            if !boot_options.contains(&b) {
+                boot_options.push(b);
+            }
+        }
+    }
+    for &b in &sit.boots {
+        if !boot_options.contains(&b) {
+            boot_options.push(b);
+        }
+    }
+    // Blitz splices boots in second and the support quest item third, each pushing the last
+    // item out to the situational list.
+    if !final_build.iter().any(|&i| boots(i)) {
+        if let Some(&b) = boot_options.first() {
+            final_build.insert(1.min(final_build.len()), b);
+            let last = final_build.pop().expect("just inserted");
+            rest.insert(0, last);
+        }
+    }
+    if let Some(quest) = sit.support_item.filter(|_| support) {
+        final_build.insert(2.min(final_build.len()), quest);
+        let last = final_build.pop().expect("just inserted");
+        rest.retain(|&i| i != quest);
+        rest.insert(0, last);
+    }
+    let order = build_order(&final_build, &r["itemOrders"], &start, tear_build, data);
+    let mut situational: Vec<i64> = rest.into_iter().take(SITUATIONAL_LIMIT).collect();
+    situational.extend(ids(&r["additionalSituationalItems"]));
 
     let spells = most_played(&r["summonerSpells"]).map(|s| (ids(&s["summonerSpellIds"]), Record::of(s))).filter(|(ids, _)| !ids.is_empty());
     let skills = most_played(&r["skillOrders"]).and_then(|s| {
         let order: Vec<usize> = s["skillOrder"].as_array()?.iter().filter_map(|k| Some(k.as_u64()?.checked_sub(1)? as usize)).filter(|&k| k < 4).collect();
         (!order.is_empty()).then(|| SkillOrder { order, record: Record::of(s) })
     });
-    Some(Style { tags, record: Record::of(r), starting, build_order, completed, situational, spells, skills })
+    Some(Style {
+        title: title(r),
+        record: Record::of(r),
+        starting: start,
+        build_order: order,
+        completed: final_build,
+        situational,
+        boots: boot_options,
+        spells,
+        skills,
+    })
 }
 
 #[cfg(test)]
@@ -572,30 +899,103 @@ mod tests {
 
     fn data() -> StaticData {
         let mut d = StaticData::default();
-        d.completed_items = [3152, 3020, 3157, 4645, 4646, 3089, 3118, 3135, 3158, 3075].into_iter().collect();
-        for boots in [1001, 3020, 3158] {
-            d.item_stats.insert(boots, crate::ddragon::ItemStats { boots: true, ..Default::default() });
+        // Gold and components (Data Dragon 16.21) of the items in the crit fixtures.
+        for (id, gold, from) in [
+            (6672, 3100, &[1043, 1042][..]),
+            (3031, 3450, &[1038, 1037]),
+            (3006, 1100, &[1001, 1042]),
+            (3036, 3000, &[1037, 3035]),
+            (1038, 1300, &[]),
+            (1037, 875, &[]),
+            (1043, 700, &[]),
+            (1042, 300, &[]),
+            (1001, 300, &[]),
+            (3035, 1450, &[]),
+            (3072, 3400, &[]),
+            (3139, 3000, &[]),
+            (3046, 2600, &[]),
+            (3094, 2700, &[]),
+            (3047, 1100, &[]),
+            (1055, 450, &[]),
+            (2003, 50, &[]),
+            (1036, 350, &[]),
+        ] {
+            d.shop.insert(id, crate::ddragon::ShopItem { gold, from: from.to_vec(), ..Default::default() });
         }
         d
     }
 
+    /// A crit row exercising Blitz's rules. Expected values are what the Blitz app's own
+    /// build function (`Se`, 3.0.0-beta.1787885272) returns for the same row and items.
+    fn crit() -> Value {
+        serde_json::json!({"name_tags": ["Crit", "Uncategorized?"], "games": 1000, "win_rate": 0.51,
+            "coreItems": [{"games": 900, "pick_rate": 0.04, "itemIds": "3031,3087,3094"}, {"games": 400, "pick_rate": 0.3, "itemIds": "6672,3006,3031"}],
+            "startingItems": [{"itemIds": ["1055", "2003"], "pick_rate": 0.5, "games": 500}, {"itemIds": ["1036", "2003"], "pick_rate": 0.7, "games": 700}],
+            "itemOrders": {
+                "6672": [{"items_order": [1042, 1043], "pick_rate_rank": 2}, {"items_order": [1043, 1042], "pick_rate_rank": 1}],
+                "3006": [{"items_order": [1001, 1042], "pick_rate_rank": 1}]},
+            "itemsAfterCore": {"3006,3031,6672": {"1": [{"itemIds": "3036", "games": 50}, {"itemIds": "3072", "games": 80}], "2": [{"itemIds": "3139", "games": 120}]}},
+            "situationalItems": [
+                {"itemId": 3036, "games": 800, "pick_rate": 0.5, "averageIndex": 0.4},
+                {"itemId": 3033, "games": 700, "pick_rate": 0.4, "averageIndex": 0.5},
+                {"itemId": 3072, "games": 600, "pick_rate": 0.3, "averageIndex": 0.6},
+                {"itemId": 3047, "games": 500, "pick_rate": 0.3, "averageIndex": 0.2},
+                {"itemId": 3139, "games": 400, "pick_rate": 0.2, "averageIndex": 0.7},
+                {"itemId": 6035, "games": 300, "pick_rate": 0.1, "averageIndex": 0.7},
+                {"itemId": 3046, "games": 200, "pick_rate": 0.03, "averageIndex": 0.8},
+                {"itemId": 3094, "games": 100, "pick_rate": 0.01, "averageIndex": 0.8},
+                {"itemId": 3004, "games": 90, "pick_rate": 0.05, "averageIndex": 0.5}]})
+    }
+
     #[test]
-    fn a_style_reads_like_blitzs_page() {
-        let q = Query::for_game("KIWI", 12, "").unwrap();
-        let b = parse(85, q, &kennen(), &data()).unwrap();
-        assert_eq!(b.styles.iter().map(Style::label).collect::<Vec<_>>(), ["AP", "Bruiser"]);
-        let s = &b.styles[0];
-        assert_eq!(s.starting, [1001, 3145]);
-        // Components before each core item; the starting items are not bought again.
-        assert_eq!(s.build_order, [3067, 1028, 3152, 3020, 2420, 1058, 3157]);
-        // The core, then the most bought finished items up to six.
-        assert_eq!(s.completed, [3152, 3020, 3157, 4645, 4646, 3089]);
-        // Then the rest, most bought first: no second pair of boots, no components, nothing rare.
-        assert_eq!(s.situational, [3118, 3135]);
-        assert_eq!(s.spells.as_ref().map(|(ids, r)| (ids.clone(), r.games)), Some((vec![4, 32], 1121)));
-        assert_eq!(s.record.text(), "48% · 1,268 games");
-        let skills = s.skills.as_ref().unwrap();
-        assert_eq!(skills.max_order(), ['Q', 'W', 'E']);
+    fn a_style_is_assembled_like_the_blitz_app() {
+        let aram = Query::for_game("ARAM", 12, "").unwrap();
+        let s = style(&crit(), aram, &data()).unwrap();
+        // Unknown tags are not shown.
+        assert_eq!(s.label(), "Crit");
+        // The 900-game core is picked by too few (4%); the start holding a non-component is skipped.
+        assert_eq!(s.starting, [2003, 1055]);
+        // Lowest pick-rate rank order first; Data Dragon components (dearer first) without one.
+        assert_eq!(s.build_order, [1043, 1042, 6672, 1001, 1042, 3006, 1038, 1037, 3031]);
+        // Core, the most played after-core option, then the most bought: Lord Dominik's (3033)
+        // and Maw (6035) share a passive with earlier items; Manamune (3004) needs a Tear build.
+        assert_eq!(s.completed, [6672, 3006, 3031, 3139, 3036, 3072]);
+        assert_eq!(s.situational, [3046, 3094]);
+        assert_eq!(s.boots, [3006, 3047]);
+
+        // Bot lane gets seven; boots missing from the core go in second.
+        let mut row = crit();
+        row["coreItems"] = serde_json::json!([{"games": 400, "pick_rate": 0.3, "itemIds": "6672,3031,3036"}]);
+        row["itemOrders"] = serde_json::json!({});
+        row["itemsAfterCore"] = serde_json::json!({});
+        row["startingItems"] = serde_json::json!([{"itemIds": ["1055", "2003"], "pick_rate": 0.5}]);
+        row["situationalItems"] = serde_json::json!([
+            {"itemId": 3072, "games": 600, "pick_rate": 0.3}, {"itemId": 3006, "games": 550, "pick_rate": 0.6},
+            {"itemId": 3139, "games": 400, "pick_rate": 0.2}, {"itemId": 3046, "games": 200, "pick_rate": 0.03},
+            {"itemId": 3094, "games": 100, "pick_rate": 0.01}]);
+        let s = style(&row, Query::for_game("CLASSIC", 11, "BOTTOM").unwrap(), &data()).unwrap();
+        assert_eq!(s.completed, [6672, 3006, 3031, 3036, 3072, 3139, 3046]);
+        assert_eq!(s.situational, [3094]);
+        assert_eq!(s.build_order, [1043, 1042, 6672, 1001, 1042, 3006, 1038, 1037, 3031]);
+    }
+
+    #[test]
+    fn titles_follow_blitz() {
+        let t = |v: Value| title(&v);
+        assert_eq!(t(serde_json::json!({"name_tags": ["Crit", "On-Hit"]})), "Crit / On-Hit");
+        assert_eq!(t(serde_json::json!({"name_tags": []})), "Blitz Build");
+        assert_eq!(t(serde_json::json!({"name_tags": ["Uncategorized"], "runes": [{"runeId": 8316, "pick_rate": 0.3}]})), "Jack of All Trades");
+        assert_eq!(t(serde_json::json!({"name_tags": ["Uncategorized"], "runes": [{"runeId": 8316, "pick_rate": 0.1}]})), "Well Rounded");
+    }
+
+    #[test]
+    fn champ_select_queues_match_the_game_tables() {
+        assert_eq!(Query::for_queue(2400, 12, ""), Query::for_game("KIWI", 12, ""));
+        assert_eq!(Query::for_queue(450, 12, ""), Query::for_game("ARAM", 12, ""));
+        assert_eq!(Query::for_queue(900, 11, ""), Query::for_game("URF", 11, ""));
+        assert_eq!(Query::for_queue(420, 11, "middle"), Query::for_game("CLASSIC", 11, "MIDDLE"));
+        assert_eq!(Query::for_queue(1700, 30, ""), None);
+        assert_eq!(Query::for_queue(1300, 11, ""), None);
     }
 
     #[test]
@@ -620,6 +1020,10 @@ mod tests {
         assert_eq!(b.active(None, &[6653, 4633]), Some(1));
         assert_eq!(b.active(Some("Bruiser"), &[3152]), Some(1));
         assert_eq!(b.active(Some("Gone"), &[3152]), Some(0));
+        let ap = &b.styles[0];
+        assert_eq!(ap.spells.as_ref().map(|(ids, r)| (ids.clone(), r.games)), Some((vec![4, 32], 1121)));
+        assert_eq!(ap.record.text(), "48% · 1,268 games");
+        assert_eq!(ap.skills.as_ref().unwrap().max_order(), ['Q', 'W', 'E']);
     }
 
     #[test]

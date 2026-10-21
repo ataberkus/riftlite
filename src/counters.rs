@@ -375,7 +375,7 @@ mod tests {
     fn item(d: &mut StaticData, id: i64, name: &str, gold: i64, maps: &[i64], completed: bool, s: ItemStats) {
         d.items.insert(id, name.into());
         d.item_stats.insert(id, s);
-        d.shop.insert(id, ShopItem { gold, maps: maps.to_vec(), purchasable: true, boots_tier: if s.boots { 2 } else { 0 } });
+        d.shop.insert(id, ShopItem { gold, maps: maps.to_vec(), purchasable: true, boots_tier: if s.boots { 2 } else { 0 }, from: Vec::new() });
         if completed {
             d.completed_items.insert(id);
         }

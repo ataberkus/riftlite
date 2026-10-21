@@ -146,13 +146,15 @@ pub struct Settings {
     pub auto_spells: bool,
     /// Runes and spells for `auto_runes` / `auto_spells`.
     pub page_source: PageSource,
-    /// On lock-in, write an item set: OP.GG's build when `meta_builds` is on and it has
-    /// one, otherwise the build from your best recent game on the champion in this mode.
+    /// On lock-in, write item sets: Blitz's playstyles when `style_builds` is on and Blitz has
+    /// them, else OP.GG's build when `meta_builds` is on and it has one, otherwise the build
+    /// from your best recent game on the champion in this mode.
     pub auto_item_set: bool,
-    /// Fetch OP.GG's aggregated builds for the pick: written as the lock-in item set
+    /// Fetch OP.GG's aggregated builds for the pick: the lock-in item set when Blitz has none
     /// (with your best game as an extra block) and offered as a rune page.
     pub meta_builds: bool,
-    /// In game: fetch Blitz's builds per playstyle for your champion, mode and lane.
+    /// From champ select on: fetch Blitz's builds per playstyle for your champion, mode and
+    /// lane, written as the lock-in item sets and shown in the Live tab and overlay.
     pub style_builds: bool,
     /// League install folder chosen by hand; empty = detect automatically.
     pub league_folder: String,

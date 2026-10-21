@@ -1,10 +1,11 @@
 //! Writes League item sets as JSON files in
 //! `<League>/Config/Champions/<ChampionId>/Recommended/`, the same location and
-//! schema the client reads for recommended sets. Contents come from the player's
-//! own match history (local LCU data) and, optionally, OP.GG's aggregated builds
-//! (`meta.rs`). Every file riftlite writes starts with `riftlite_`. Writing a set also deletes
-//! Blitz's leftover sets (`Config/Global/Recommended/!!!blitz-<n>.json`, titled "Blitz: …"),
-//! which the client would otherwise list next to riftlite's.
+//! schema the client reads for recommended sets. Contents come from Blitz's builds
+//! (`styles.rs`, written the way the Blitz app writes them), the player's own match history
+//! (local LCU data) and, optionally, OP.GG's aggregated builds (`meta.rs`). Every file riftlite
+//! writes starts with `riftlite_`. Writing a set also deletes Blitz's leftover sets
+//! (`Config/Global/Recommended/!!!blitz-<n>.json`, titled "Blitz: …"), which the client would
+//! otherwise list next to riftlite's.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,7 @@ use serde_json::{Value, json};
 use crate::ddragon::StaticData;
 use crate::lcu::LolGame;
 use crate::meta::{self, MetaBuild, Picks};
+use crate::styles::StyleBuilds;
 
 const PREFIX: &str = "riftlite_";
 /// File-name prefix of Blitz's sets in `Config/Global/Recommended/` (`!!!blitz-0.json`, …).
@@ -86,6 +88,74 @@ pub fn write_meta(
     write_set(league_root, data, build.champion_id, &format!("meta_{}_{}", build.champion_id, q.mode), &title, maps, blocks)
 }
 
+/// Blitz's block titles, in Blitz's order (blitz-desktop 3.0.0-beta.1787885272 strings 314,
+/// 2757, 2758, 2759, 2756).
+const BLITZ_BLOCKS: [&str; 5] = ["Starting Items", "Core Build Order", "Core Final Build", "Situational items that are also good", "Boots Options"];
+/// Blitz's `sortrank` for the selected set; the others get `BLITZ_OTHERS - index`.
+const BLITZ_SELECTED: i64 = 1_000_000;
+const BLITZ_OTHERS: i64 = 500_000;
+
+/// Blitz's builds as the Blitz app imports them: one set per playstyle titled
+/// "Blitz: {playstyle} {champion}" with Starting Items / Core Build Order / Core Final Build /
+/// Situational items that are also good / Boots Options blocks (empty ones left out), every set
+/// `priority`, the `selected` playstyle sorted first. Replaces riftlite's earlier Blitz sets for
+/// the champion and its OP.GG set for the same map. Returns how many sets were written.
+pub fn write_blitz(league_root: &Path, data: &StaticData, builds: &StyleBuilds, selected: usize) -> Result<usize, String> {
+    let champion_id = builds.champion_id;
+    let champ = data.champions.get(&champion_id).ok_or("unknown champion (Data Dragon not loaded?)")?;
+    let dir = league_root.join("Config").join("Champions").join(&champ.id).join("Recommended");
+    let maps: &[i64] = if builds.query.queue == "HOWLING_ABYSS_ARAM" { &[12] } else { &[11] };
+    let replaced: &[&str] = match builds.query.queue {
+        "HOWLING_ABYSS_ARAM" => &["aram"],
+        "SUMMONERS_RIFT_URF" => &["urf"],
+        _ => &["ranked", "flex"],
+    };
+    let ours = format!("{PREFIX}blitz_{champion_id}_");
+    if let Ok(files) = std::fs::read_dir(&dir) {
+        for f in files.flatten() {
+            let name = f.file_name().to_string_lossy().into_owned();
+            let meta_set = replaced.iter().any(|m| name == format!("{PREFIX}meta_{champion_id}_{m}.json"));
+            if name.starts_with(&ours) || meta_set {
+                std::fs::remove_file(f.path()).map_err(|e| format!("{}: {e}", f.path().display()))?;
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..builds.styles.len()).collect();
+    if selected < order.len() {
+        order.remove(selected);
+        order.insert(0, selected);
+    }
+    for (rank, &i) in order.iter().enumerate() {
+        let st = &builds.styles[i];
+        let lists = [&st.starting, &st.build_order, &st.completed, &st.situational, &st.boots];
+        let blocks = BLITZ_BLOCKS
+            .iter()
+            .zip(lists)
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(title, ids)| {
+                json!({
+                    "recMath": false,
+                    "minSummonerLevel": -1,
+                    "maxSummonerLevel": -1,
+                    "showIfSummonerSpell": "",
+                    "hideIfSummonerSpell": "",
+                    "type": title,
+                    "items": ids.iter().map(|id| json!({"id": id.to_string(), "count": 1})).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let title = match st.label() {
+            l if l.is_empty() => format!("Blitz: {}", champ.name),
+            l => format!("Blitz: {l} {}", champ.name),
+        };
+        let mut set = item_set_json(champion_id, &title, maps, blocks);
+        set["priority"] = json!(true);
+        set["sortrank"] = json!(if rank == 0 { BLITZ_SELECTED } else { BLITZ_OTHERS - rank as i64 });
+        write_file(league_root, &dir, &format!("blitz_{champion_id}_{rank}"), &set)?;
+    }
+    Ok(order.len())
+}
+
 fn personal_block(game: &LolGame) -> Option<Value> {
     let items: Vec<i64> = game.items[..6].iter().copied().filter(|&i| i > 0).collect();
     (!items.is_empty()).then(|| {
@@ -145,13 +215,16 @@ fn write_set(
     blocks: Vec<Value>,
 ) -> Result<PathBuf, String> {
     let champ = data.champions.get(&champion_id).ok_or("unknown champion (Data Dragon not loaded?)")?;
-    remove_blitz_sets(league_root)?;
-    let set = item_set_json(champion_id, title, maps, blocks);
     let dir = league_root.join("Config").join("Champions").join(&champ.id).join("Recommended");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    write_file(league_root, &dir, stem, &item_set_json(champion_id, title, maps, blocks))
+}
+
+/// Writes `<dir>/riftlite_<stem>.json` after deleting Blitz's global sets.
+fn write_file(league_root: &Path, dir: &Path, stem: &str, set: &Value) -> Result<PathBuf, String> {
+    remove_blitz_sets(league_root)?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{PREFIX}{stem}.json"));
-    std::fs::write(&path, serde_json::to_vec_pretty(&set).expect("item set serializes"))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::write(&path, serde_json::to_vec_pretty(set).expect("item set serializes")).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
 

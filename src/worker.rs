@@ -920,7 +920,9 @@ fn champ_select_automation(shared: &Shared, lcu: &Lcu, auto: &mut Auto, cs: &Cha
         } else {
             let meta_on = shared.settings.lock().meta_builds;
             let ready = lockin_meta(shared.snap.lock().meta.as_ref().filter(|_| meta_on), job.champion, job.since.elapsed());
-            if let Some(meta) = ready {
+            let map = shared.snap.lock().session.as_ref().map_or(auto.map_id, |g| g.map_id);
+            let blitz_wait = job.items && job.since.elapsed() < META_WAIT && blitz_pending(shared, cs, map, job.champion);
+            if let Some(meta) = ready.filter(|_| !blitz_wait) {
                 if job.runes || job.spells {
                     apply_opgg_pages(shared, lcu, cs, job, &meta);
                 }
@@ -1061,15 +1063,43 @@ fn apply_opgg_pages(shared: &Shared, lcu: &Lcu, cs: &ChampSelect, job: LockIn, m
     }
 }
 
-/// Writes the lock-in item set from OP.GG's build, else from your best game on the champion
-/// in `mode` (the OP.GG mode of this queue).
+/// Blitz has a table for this champ select and its answer for `champion` is not in yet.
+fn blitz_pending(shared: &Shared, cs: &ChampSelect, map: i64, champion: i64) -> bool {
+    if !shared.settings.lock().style_builds {
+        return false;
+    }
+    let position = cs.me().map(|p| p.position.clone()).unwrap_or_default();
+    if crate::styles::Query::for_queue(cs.queue_id, map, &position).is_none() {
+        return false;
+    }
+    match &shared.snap.lock().styles {
+        Some(Ok(b)) => b.champion_id != champion,
+        Some(Err(_)) => false,
+        None => true,
+    }
+}
+
+/// Writes the lock-in item sets from Blitz's builds (one per playstyle, as the Blitz app
+/// writes them), else from OP.GG's build, else from your best game on the champion in `mode`
+/// (the OP.GG mode of this queue).
 fn lock_in_item_set(shared: &Shared, champ: i64, meta: MetaUse, mode: Option<&str>) {
     let s = shared.snap.lock();
     let name = s.data.champion_name(champ);
     let history = s.lol_history.as_deref().unwrap_or(&[]);
     let best = itemset::best_game(history, champ, mode);
+    let blitz = match &s.styles {
+        Some(Ok(b)) if b.champion_id == champ && !b.styles.is_empty() => Some(b),
+        _ => None,
+    };
     let r = match (s.league_root(), meta) {
         (None, _) => Err("League install not found; set it in Settings".to_string()),
+        (Some(root), _) if blitz.is_some() => {
+            let b = blitz.expect("checked");
+            itemset::write_blitz(&root, &s.data, b, 0).map(|n| {
+                let styles: Vec<String> = b.styles.iter().map(|st| st.label()).collect();
+                format!("{n} Blitz item sets for {name} written ({}): {}", b.query.label(), styles.join(", "))
+            })
+        }
         (Some(root), Some(Ok((b, picks)))) => itemset::write_meta(&root, &s.data, &b, picks, best).map(|_| {
             let own = if best.is_some() { " + your best game" } else { "" };
             let c = &b.cores[picks.build];

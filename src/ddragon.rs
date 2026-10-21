@@ -83,6 +83,8 @@ pub struct ShopItem {
     /// Boots upgrade level: 1 basic boots, 2 built from them (Plated Steelcaps), 3 their
     /// upgrades; 0 for other items.
     pub boots_tier: u8,
+    /// Ids of the items it is built from (`from`), in Data Dragon's order.
+    pub from: Vec<i64>,
 }
 
 impl ShopItem {
@@ -425,6 +427,7 @@ fn shop_item(id: i64, i: &Value, items: &HashMap<i64, &Value>) -> ShopItem {
             && unset("requiredChampion")
             && unset("requiredAlly"),
         boots_tier: boots_tier(id, items),
+        from: i["from"].as_array().into_iter().flatten().filter_map(|f| f.as_str()?.parse().ok()).collect(),
     }
 }
 
