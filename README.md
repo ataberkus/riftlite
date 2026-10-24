@@ -110,4 +110,8 @@ Embedded assets: `assets/logo.png`, `assets/banner.jpg` and `assets/riftlite.ico
 
 ## License
 
+Copyright (C) 2026 ataberkus
+
 riftlite is licensed under the [GNU General Public License v3.0](LICENSE). The bundled fonts keep their own SIL Open Font License 1.1.
+
+Additional term under GPL-3.0 section 7(b): copies and modified versions of riftlite must preserve the author attribution "ataberkus" and a link to https://github.com/ataberkus/riftlite in the README or equivalent documentation and in the application's about information, if it has one.
