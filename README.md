@@ -107,3 +107,7 @@ cargo build --profile fast
 The output is `target\fast\riftlite.exe`; `build.bat fast` runs the same build.
 
 Embedded assets: `assets/logo.png`, `assets/banner.jpg` and `assets/riftlite.ico` (made for riftlite; `build.rs` embeds the icon and version info into the .exe with `embed-resource`, which needs the Windows SDK's `rc.exe`), and the Inter and Barlow Semi Condensed fonts in `assets/fonts/` (SIL Open Font License 1.1, license texts alongside). Rank emblems and UI icons are drawn in code.
+
+## License
+
+riftlite is licensed under the [GNU General Public License v3.0](LICENSE). The bundled fonts keep their own SIL Open Font License 1.1.

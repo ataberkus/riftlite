@@ -3,7 +3,7 @@ name = "riftlite"
 version = "0.1.0"
 edition = "2024"
 description = "Lightweight League of Legends / TFT desktop companion"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
